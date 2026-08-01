@@ -1,0 +1,42 @@
+name: Quest API smoke
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  read-only-smoke:
+    runs-on: ubuntu-latest
+    environment: quest-smoke
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: bot/.node-version
+          cache: npm
+          cache-dependency-path: bot/package-lock.json
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-fund --no-audit
+
+      - name: Rebuild trusted native dependency
+        run: npm rebuild better-sqlite3 --foreground-scripts
+
+      - name: Validate sanitized fixture
+        run: npm run validate:quest-fixture
+
+      - name: Run read-only Discord Quest smoke test
+        env:
+          DISCORD_USER_TOKEN: ${{ secrets.DISCORD_USER_TOKEN }}
+          EXPECTED_DISCORD_ACCOUNT_ID: ${{ secrets.EXPECTED_DISCORD_ACCOUNT_ID }}
+        run: npm run smoke:quest

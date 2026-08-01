@@ -1,0 +1,192 @@
+name: CI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, aa]
+  push:
+    branches: [main, ss, aa, aa.1]
+
+jobs:
+  repository-shape:
+    name: Repository shape
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Verify bot-only repository and runtime data safety
+        shell: bash
+        run: |
+          test ! -d src
+          test ! -d src-tauri
+          test ! -d src-runner
+          test ! -d src-cdp-launcher
+          test -f bot/fixtures/quest-api.sample.json
+          test -f bot/scripts/validate-quest-fixture.mjs
+          test -z "$(grep -R 'panel_\(add\|done\|edit\|delete\)_modal' bot/src/index.js || true)"
+          test -z "$(grep -R 'getAllQuests\|addQuest\|editQuest\|markDone\|removeQuest' bot/src || true)"
+          test -z "$(git ls-files | grep -E '(^|/)backups/|\.(db|sqlite)(-(wal|shm|journal))?$' || true)"
+          git diff --check
+
+  bot-checks:
+    name: Bot checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: bot/.node-version
+          cache: npm
+          cache-dependency-path: bot/package-lock.json
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts --no-fund --no-audit
+
+      - name: Rebuild trusted native dependency
+        run: npm rebuild better-sqlite3 --foreground-scripts
+
+      - name: Validate sanitized Quest API fixture
+        run: npm run validate:quest-fixture
+
+      - name: Enforce approved database backup destinations
+        shell: bash
+        run: |
+          node --test test/backup-paths.node-test.js
+          node --test test/backup-operation-consistency.node-test.js
+          if grep -R 'backupDatabase(destination' src test; then
+            echo "Unsupported arbitrary backup destination API detected"
+            exit 1
+          fi
+          if grep -R 'DATABASE_BACKUP_DIR' src scripts .env.example; then
+            echo "Unsupported DATABASE_BACKUP_DIR runtime/config usage detected"
+            exit 1
+          fi
+          test ! -f src/path-safety.js
+          test ! -f test/path-safety.node-test.js
+
+      - name: Enforce incident and storage architecture boundaries
+        shell: bash
+        run: |
+          test -f src/bootstrap.js
+          test -f src/bootstrap-reporter.js
+          test -f src/incident-catalog.js
+          test -f src/legacy-incident-policy.js
+          test -f src/storage-profile.js
+          test -f src/webhook-delivery.js
+          test -f test-support/fake-webhook.js
+          test -f INCIDENT-DESIGN.md
+          test -z "$(grep -R -E 'process\.env\.DATABASE_PATH\s*=' src || true)"
+          test -z "$(grep -R -E 'allowed_mentions:\s*\{\s*parse:\s*\[[^]]' src || true)"
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          function sourceFiles(directory) {
+            return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+              const candidate = path.join(directory, entry.name);
+              if (entry.isDirectory()) return sourceFiles(candidate);
+              return entry.isFile() && candidate.endsWith('.js') ? [candidate] : [];
+            });
+          }
+
+          for (const file of sourceFiles('src')) {
+            const source = fs.readFileSync(file, 'utf8');
+            for (const match of source.matchAll(/allowed_mentions\s*:\s*\{([\s\S]*?)\}/g)) {
+              const parse = /parse\s*:\s*\[([\s\S]*?)\]/.exec(match[1]);
+              if (!parse || parse[1].trim() !== '') {
+                console.error(`Unsafe allowed_mentions configuration in ${file}`);
+                process.exit(1);
+              }
+            }
+          }
+          NODE
+          if grep -R -E 'https://(canary\.|ptb\.)?discord(app)?\.com/api/webhooks/[0-9]{17,20}/' src test test-support scripts; then
+            echo "Credential-shaped Discord webhook literal detected in source, test, or script code"
+            exit 1
+          fi
+          grep -q "redirect: 'error'" src/webhook-delivery.js
+          grep -q 'BACKUP_FAILURE_THRESHOLD = 3' src/worker.js
+          grep -q 'BACKUP_MAX_AGE_MS = 26' src/worker.js
+
+      - name: Run recursive tests with coverage gate
+        id: tests
+        shell: bash
+        run: |
+          set +e
+          npm run test:coverage 2>&1 | tee test-output.log
+          status=${PIPESTATUS[0]}
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Run critical mutation safety gate
+        id: mutations
+        shell: bash
+        run: |
+          set +e
+          npm run test:mutation-safety 2>&1 | tee mutation-output.log
+          status=${PIPESTATUS[0]}
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Confirm mutation gate restored all sources
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: git diff --exit-code
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bot-test-output-${{ github.run_id }}
+          path: |
+            bot/test-output.log
+            bot/mutation-output.log
+            bot/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Syntax check all source and script modules
+        run: npm run check
+
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Detect Sonar token
+        id: sonar-token
+        shell: bash
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          if [ -n "$SONAR_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "SONAR_TOKEN is not configured; skipping CI-based Sonar scan"
+          fi
+
+      - name: SonarQube Cloud scan
+        if: steps.sonar-token.outputs.available == 'true'
+        uses: SonarSource/sonarqube-scan-action@c7ee0f9df90b7aa20e8dcf9695dcfe2e7da5b4f2 # nosemgrep: generic.secrets.security.detected-sonarqube-docs-api-key.detected-sonarqube-docs-api-key -- pinned v7 commit
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

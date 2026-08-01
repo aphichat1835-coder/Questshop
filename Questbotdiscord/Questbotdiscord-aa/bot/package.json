@@ -1,0 +1,28 @@
+{
+  "name": "neverdie-quest-bot",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "start:control": "QUEST_PROCESS_ROLE=control node src/index.js",
+    "start:worker": "QUEST_PROCESS_ROLE=worker node src/index.js",
+    "dev": "node --watch src/index.js",
+    "register": "node src/register-commands.js",
+    "test": "node --import ./test/setup-env.js --test --test-concurrency=1",
+    "test:mutation-safety": "bash scripts/mutation-baseline.sh && bash scripts/mutation-safety.sh && bash scripts/mutation-completion-reporter-safety.sh && bash scripts/mutation-review-findings-safety.sh && bash scripts/mutation-recovery-metadata-safety.sh",
+    "check": "find src scripts \\( -name '*.js' -o -name '*.mjs' \\) -print0 | xargs -0 -n1 node --check && bash -n scripts/mutation-baseline.sh scripts/mutation-safety.sh scripts/mutation-completion-reporter-safety.sh scripts/mutation-review-findings-safety.sh scripts/mutation-recovery-metadata-safety.sh",
+    "validate:quest-fixture": "node scripts/validate-quest-fixture.mjs",
+    "smoke:quest": "node scripts/smoke-quest-api.mjs",
+    "test:coverage": "rm -f coverage/lcov.raw.info coverage/lcov.info && mkdir -p coverage && node --import ./test/setup-env.js --test --test-concurrency=1 --experimental-test-coverage --test-coverage-lines=60 --test-reporter=spec --test-reporter=lcov --test-reporter-destination=stdout --test-reporter-destination=coverage/lcov.raw.info && node scripts/filter-lcov-source.mjs coverage/lcov.raw.info coverage/lcov.info && rm coverage/lcov.raw.info"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2"
+  }
+}

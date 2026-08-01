@@ -1,0 +1,1 @@
+- [Discord runner live-message throttle](discord-runner-render-throttle.md) — render() must never silently drop an update inside its throttle window; always defer/flush, or bot looks frozen.

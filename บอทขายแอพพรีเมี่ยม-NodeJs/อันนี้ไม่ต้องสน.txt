@@ -1,0 +1,28 @@
+youtube_premium_myemail_30d | YouTube Premium /30วัน (เมลตัวเอง)
+youtube_premium_shopemail_30d | YouTube Premium /30วัน (เมลร้าน)
+netflix_4k_private_1d | Netflix 4K /1วัน (จอส่วนตัว)
+netflix_4k_tv_private_1d | Netflix 4K /1วัน (TV) (จอส่วนตัว)
+netflix_4k_tv_private_7d | Netflix 4K /7วัน (TV) (จอส่วนตัว)
+netflix_4k_private_30d | Netflix 4K /30วัน (จอส่วนตัว)
+netflix_4k_tv_private_30d | Netflix 4K /30วัน (TV) (จอส่วนตัว)
+iqiyi_gold_30d | IQIYI GOLD /30วัน
+bilibili_30d | Bilibili /30วัน
+viu_premium_7d | VIU Premium /7วัน
+viu_premium_30d | VIU Premium /30วัน
+wetv_vip_30d | WeTV VIP /30วัน
+disneyplus_private_alldevice_30d | Disney+ /30วัน (จอส่วนตัว) (ทุกอุปกรณ์)
+monomax_private_30d | MONOMAX /30วัน (จอส่วนตัว)
+monomax_private_premierleague_30d | MONOMAX /30วัน (จอส่วนตัว + พรีเมียร์ลีก)
+hbomax_hd_private_30d | HBO MAX /30วัน (HD) (จอส่วนตัว)
+hbomax_4k_private_30d | HBO MAX /30วัน (4K) (จอส่วนตัว)
+ch3plus_share_30d | CH3 Plus /30วัน (จอแชร์)
+ch3plus_private_30d | CH3 Plus /30วัน (จอส่วนตัว)
+amazonprimevideo_30d | Amazon Prime Video /30วัน
+trueidplus_30d | TrueID+ /30วัน
+youku_vip_30d | YOUKU VIP /30วัน
+oned_30d | oneD /30วัน
+crunchyroll_premium_30d | Crunchyroll Premium /30วัน
+
+อันนี้ผมทำไว้กันปัญหาลืมม 
+
+

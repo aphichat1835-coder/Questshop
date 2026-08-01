@@ -1,0 +1,172 @@
+{
+    "youtube_premium_myemail_30d": {
+        "category": "youtube",
+        "price": 29,
+        "stock": 1,
+        "sold": 0,
+        "accounts": [
+            "lemon.email@gmail.com:password123"
+        ]
+    },
+    "youtube_premium_shopemail_30d": {
+        "category": "youtube",
+        "price": 45,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "netflix_4k_private_1d": {
+        "category": "netflix",
+        "price": 15,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "netflix_4k_tv_private_1d": {
+        "category": "netflix",
+        "price": 29,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "netflix_4k_tv_private_7d": {
+        "category": "netflix",
+        "price": 69,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "netflix_4k_private_30d": {
+        "category": "netflix",
+        "price": 129,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "netflix_4k_tv_private_30d": {
+        "category": "netflix",
+        "price": 179,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "iqiyi_gold_30d": {
+        "category": "iqiyi",
+        "price": 29,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "bilibili_30d": {
+        "category": "bilibili",
+        "price": 32,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "viu_premium_7d": {
+        "category": "viu",
+        "price": 19,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "viu_premium_30d": {
+        "category": "viu",
+        "price": 25,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "wetv_vip_30d": {
+        "category": "wetv",
+        "price": 28,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "disneyplus_private_alldevice_30d": {
+        "category": "disney",
+        "price": 109,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "monomax_private_30d": {
+        "category": "monomax",
+        "price": 75,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "monomax_private_premierleague_30d": {
+        "category": "monomax",
+        "price": 219,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "hbomax_hd_private_30d": {
+        "category": "hbomax",
+        "price": 75,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "hbomax_4k_private_30d": {
+        "category": "hbomax",
+        "price": 96,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "ch3plus_share_30d": {
+        "category": "ch3 plus",
+        "price": 59,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "ch3plus_private_30d": {
+        "category": "ch3 plus",
+        "price": 89,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "amazonprimevideo_30d": {
+        "category": "amazon prime video",
+        "price": 55,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "trueidplus_30d": {
+        "category": "trueid",
+        "price": 39,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "youku_vip_30d": {
+        "category": "youku",
+        "price": 49,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "oned_30d": {
+        "category": "oned",
+        "price": 59,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    },
+    "crunchyroll_premium_30d": {
+        "category": "crunchyroll",
+        "price": 39,
+        "stock": 0,
+        "sold": 0,
+        "accounts": []
+    }
+}
