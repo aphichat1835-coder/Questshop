@@ -213,7 +213,9 @@ export async function releaseReservationInTransaction(client, { orderItemId, ter
       WHERE r.order_item_id = $1 FOR UPDATE OF r, i
     `, [orderItemId])).rows[0];
   if (!reservation) throw new QuestshopError('RESERVATION_NOT_FOUND', 'ไม่พบยอดจอง');
-    if (reservation.state === 'RELEASED') return reservation;
+    if (reservation.state === 'RELEASED') {
+      return reservation;
+    }
     if (reservation.state !== 'RESERVED') throw new QuestshopError('RESERVATION_CAPTURED', 'ยอดจองถูกคิดค่าบริการแล้ว');
     assertTransition(ORDER_ITEM_TRANSITIONS, reservation.item_state, terminalState);
     const wallet = await lockWallet(client, reservation.discord_user_id);
