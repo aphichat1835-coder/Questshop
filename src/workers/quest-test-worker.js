@@ -208,6 +208,69 @@ async function executeTestQuest({ pool, run, monitor, env, runnerConcurrency, te
       runnerConcurrency }, context, { pool });
 }
 
+function monitorFailureState(error, failures) {
+  if (error.fatalAuth || failures >= 5) return 'QUARANTINED';
+  if (failures >= 3) return 'COOLDOWN';
+  return 'ACTIVE';
+}
+
+async function finishFailedTestRun(pool, run, error, context) {
+  const nextTestState = error.fatalAuth ? 'MANUAL_REVIEW' : 'TEST_FAILED';
+  await updateOwned(pool, run, `UPDATE quest_test_runs SET state=$4,state_version=state_version+1,
+    error_class=$5,evidence=$6,completed_at=clock_timestamp(),lease_owner=NULL,
+    lease_expires_at=NULL,updated_at=clock_timestamp() WHERE true`, [
+    nextTestState, error.code ?? error.name,
+    { accountSpecific: Boolean(error.fatalAuth || error.accountSpecific), traceId: context.traceId },
+  ], nextTestState, error.code ?? error.name, context);
+}
+
+async function updateMonitorForFailure(pool, monitor, error, context) {
+  if (!(error.fatalAuth || error.retryable || error.category === 'NETWORK')) return;
+  const failures = Number(monitor.consecutive_failures) + 1;
+  const state = monitorFailureState(error, failures);
+  await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
+    cooldown_until=CASE WHEN $2='COOLDOWN' THEN clock_timestamp()+interval '15 minutes'
+      ELSE cooldown_until END,updated_at=clock_timestamp() WHERE id=$1`, [monitor.id, state, failures]);
+  if (state !== 'QUARANTINED') return;
+  await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
+    VALUES(gen_random_uuid(),'MONITOR_QUARANTINED',$1,'OPEN','ERROR',$2,$3)
+    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
+    DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
+  [monitor.id, { errorCode: error.code ?? error.name }, context.traceId]);
+}
+
+async function queueAlternativeMonitorTest(pool, run, monitor, error) {
+  if (!error.accountSpecific) return;
+  const alternate = Number((await pool.query(`SELECT count(*)::integer AS count FROM monitor_accounts
+    WHERE id<>$1 AND state='ACTIVE' AND 'TEST'=ANY(capabilities)`, [monitor.id])).rows[0].count);
+  if (!alternate) return;
+  await pool.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,
+    executor_version,contract_version,trace_id) VALUES(gen_random_uuid(),$1,'TEST_QUEUED',$2,$3,$4,$5)`,
+  [run.quest_id, run.engine_version, run.executor_version, run.contract_version, run.trace_id]);
+}
+
+async function pauseQuestForTestFailure(pool, run, error, context) {
+  const globalFailure = !error.accountSpecific && !error.fatalAuth
+    && ['TEST_CONTRACT_UNSUPPORTED', 'TEST_MUTATION_NOT_VERIFIED', 'TEST_COMPLETION_NOT_VERIFIED'].includes(error.code);
+  if (!globalFailure) return;
+  await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
+    const quest = (await client.query(`UPDATE quests SET sale_state='PAUSED',
+      sale_version=sale_version+1,updated_at=clock_timestamp()
+      WHERE quest_id=$1 AND sale_state='OPEN' RETURNING *`, [run.quest_id])).rows[0];
+    if (!quest) return;
+    await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: run.quest_id,
+      fromState: 'OPEN', toState: 'PAUSED', stateVersion: quest.sale_version,
+      reasonCode: error.code, context });
+  });
+}
+
+async function handleTestFailure(pool, run, monitor, error, context) {
+  await finishFailedTestRun(pool, run, error, context);
+  await updateMonitorForFailure(pool, monitor, error, context);
+  await queueAlternativeMonitorTest(pool, run, monitor, error);
+  await pauseQuestForTestFailure(pool, run, error, context);
+}
+
 export async function testQuest({ env, pool, signal, holder, runnerConcurrency = env.RUNNER_CONCURRENCY }) {
   const acquired = await acquireTestRun({ holder, pool });
   if (!acquired) return false;
@@ -218,47 +281,7 @@ export async function testQuest({ env, pool, signal, holder, runnerConcurrency =
     await executeTestQuest({ pool, run, monitor, env, runnerConcurrency, testSignal: heartbeat.testSignal, context });
   } catch (error) {
     if (error.code === 'FENCING_LOST') throw error;
-    const nextTestState = error.fatalAuth ? 'MANUAL_REVIEW' : 'TEST_FAILED';
-    await updateOwned(pool, run, `UPDATE quest_test_runs SET state=$4,state_version=state_version+1,
-      error_class=$5,evidence=$6,completed_at=clock_timestamp(),lease_owner=NULL,
-      lease_expires_at=NULL,updated_at=clock_timestamp() WHERE true`, [
-      nextTestState, error.code ?? error.name,
-      { accountSpecific: Boolean(error.fatalAuth || error.accountSpecific), traceId: context.traceId },
-    ], nextTestState, error.code ?? error.name, context);
-    const monitorFailure = error.fatalAuth || error.retryable || error.category === 'NETWORK';
-    if (monitorFailure) {
-      const failures = Number(monitor.consecutive_failures) + 1;
-      const monitorState = error.fatalAuth || failures >= 5 ? 'QUARANTINED'
-        : failures >= 3 ? 'COOLDOWN' : 'ACTIVE';
-      await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
-        cooldown_until=CASE WHEN $2='COOLDOWN' THEN clock_timestamp()+interval '15 minutes'
-          ELSE cooldown_until END,updated_at=clock_timestamp() WHERE id=$1`,
-      [monitor.id, monitorState, failures]);
-      if (monitorState === 'QUARANTINED') await pool.query(`INSERT INTO incidents(id,incident_code,
-        scope,state,severity,evidence,trace_id) VALUES(gen_random_uuid(),'MONITOR_QUARANTINED',$1,
-        'OPEN','ERROR',$2,$3) ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
-        DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-      [monitor.id, { errorCode: error.code ?? error.name }, context.traceId]);
-    }
-    if (error.accountSpecific) {
-      const alternate = Number((await pool.query(`SELECT count(*)::integer AS count FROM monitor_accounts
-        WHERE id<>$1 AND state='ACTIVE' AND 'TEST'=ANY(capabilities)`, [monitor.id])).rows[0].count);
-      if (alternate > 0) await pool.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,
-        executor_version,contract_version,trace_id) VALUES(gen_random_uuid(),$1,'TEST_QUEUED',$2,$3,$4,$5)`,
-      [run.quest_id, run.engine_version, run.executor_version, run.contract_version, run.trace_id]);
-    }
-    if (!error.accountSpecific && !error.fatalAuth
-      && ['TEST_CONTRACT_UNSUPPORTED', 'TEST_MUTATION_NOT_VERIFIED',
-        'TEST_COMPLETION_NOT_VERIFIED'].includes(error.code)) {
-      await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
-        const quest = (await client.query(`UPDATE quests SET sale_state='PAUSED',
-          sale_version=sale_version+1,updated_at=clock_timestamp()
-          WHERE quest_id=$1 AND sale_state='OPEN' RETURNING *`, [run.quest_id])).rows[0];
-        if (quest) await recordTransition(client, { aggregateType: 'QUEST_SALE',
-          aggregateId: run.quest_id, fromState: 'OPEN', toState: 'PAUSED',
-          stateVersion: quest.sale_version, reasonCode: error.code, context });
-      });
-    }
+    await handleTestFailure(pool, run, monitor, error, context);
   } finally {
     await heartbeat.stop();
   }

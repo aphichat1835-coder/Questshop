@@ -212,16 +212,20 @@ export async function releaseReservationInTransaction(client, { orderItemId, ter
       FROM wallet_reservations r JOIN order_items i ON i.id = r.order_item_id
       WHERE r.order_item_id = $1 FOR UPDATE OF r, i
     `, [orderItemId])).rows[0];
-  if (!reservation) throw new QuestshopError('RESERVATION_NOT_FOUND', 'ไม่พบยอดจอง');
-    if (reservation.state === 'RELEASED') {
-      return reservation;
-    }
-    if (reservation.state !== 'RESERVED') throw new QuestshopError('RESERVATION_CAPTURED', 'ยอดจองถูกคิดค่าบริการแล้ว');
-    assertTransition(ORDER_ITEM_TRANSITIONS, reservation.item_state, terminalState);
-    const wallet = await lockWallet(client, reservation.discord_user_id);
-    const amount = BigInt(reservation.amount_cents);
-    const balances = walletBalances(wallet, amount, -amount);
-    await updateWallet(client, wallet, balances);
+  if (!reservation) {
+    throw new QuestshopError('RESERVATION_NOT_FOUND', 'ไม่พบยอดจอง');
+  }
+  if (reservation.state === 'RELEASED') {
+    return reservation;
+  }
+  if (reservation.state !== 'RESERVED') {
+    throw new QuestshopError('RESERVATION_CAPTURED', 'ยอดจองถูกคิดค่าบริการแล้ว');
+  }
+  assertTransition(ORDER_ITEM_TRANSITIONS, reservation.item_state, terminalState);
+  const wallet = await lockWallet(client, reservation.discord_user_id);
+  const amount = BigInt(reservation.amount_cents);
+  const balances = walletBalances(wallet, amount, -amount);
+  await updateWallet(client, wallet, balances);
     await client.query(`
       UPDATE wallet_reservations SET state = 'RELEASED', state_version = state_version + 1,
         settled_at = transaction_timestamp() WHERE id = $1 AND state = 'RESERVED'

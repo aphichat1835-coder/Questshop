@@ -118,6 +118,29 @@ function renderSelection(page) {
   )] };
 }
 
+function orderConfirmationContent(orderId, historyLink) {
+  const history = historyLink ? `\nติดตามความคืบหน้า: ${historyLink}` : '';
+  return `สร้าง Order สำเร็จ \`${orderId}\`${history}`;
+}
+
+function listRows(rows, formatter, empty = 'ไม่มี') {
+  const content = rows.map(formatter).join('\n');
+  return content || empty;
+}
+
+function backupSummary(backups, drills) {
+  const backupRows = listRows(backups, (row) => `• ${row.backup_type} • ${row.state} • ${row.completed_at?.toISOString?.() ?? row.started_at.toISOString()}`);
+  const drillRows = listRows(drills, (row) => `• ${row.state} • ${row.completed_at?.toISOString?.() ?? row.started_at.toISOString()}`);
+  return `**Backups**\n${backupRows}\n\n**Restore drills**\n${drillRows}\n\nการ Restore drill สร้างฐานข้อมูลชั่วคราวผ่านสคริปต์ \`npm run restore:drill\` เพื่อไม่ให้ Interaction ถือ process ยาว`;
+}
+
+function brandingSummary(runtime) {
+  const values = runtime.config.values ?? {};
+  const adminRole = values.adminRoleId ? `<@&${values.adminRoleId}>` : 'ยังไม่ตั้ง';
+  const questRole = values.questAnnouncementRoleId ? `<@&${values.questAnnouncementRoleId}>` : 'ปิด';
+  return `Config version: **${runtime.config.version}**\nRunner concurrency: **${runnerConcurrency(runtime)}** / ${runtime.env.RUNNER_CONCURRENCY_HARD_MAX}\nAdmin role: ${adminRole}\nQuest announcement role: ${questRole}\nBranding: ${JSON.stringify(values.branding ?? {})}`;
+}
+
 async function handleSurfaceCommand(interaction, runtime) {
   if (!interaction.isChatInputCommand()) return false;
   const surface = SURFACE_COMMANDS[interaction.commandName];
@@ -317,7 +340,7 @@ if (route.route === 'quest_confirm') {
     env: runtime.env, runnerConcurrency: runnerConcurrency(runtime) }, contextFor(interaction, 'confirm'), { pool: runtime.pool });
   const history = (await runtime.pool.query("SELECT * FROM surfaces WHERE surface_key='QUEST_HISTORY' AND state='ACTIVE'")).rows[0];
   const historyLink = history ? `https://discord.com/channels/${interaction.guildId}/${history.channel_id}` : null;
-  return interaction.editReply({ content: `สร้าง Order สำเร็จ \`${order.orderId}\`${historyLink ? `\nติดตามความคืบหน้า: ${historyLink}` : ''}`, embeds: [], components: [] });
+  return interaction.editReply({ content: orderConfirmationContent(order.orderId, historyLink), embeds: [], components: [] });
 }
 }
 
@@ -359,7 +382,7 @@ if (route.route === 'admin') {
     const breaker = (await runtime.pool.query("SELECT * FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
     return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xf0b232)
       .setTitle('Payments และ Manual Review')
-      .setDescription(`Circuit: **${breaker.state}** v${breaker.state_version} • ${breaker.reason ?? 'ปกติ'}\n\n${reviews.map((row) => `• \`${row.id}\` • **${row.subject_type}** • ${row.state}${row.owner_only ? ' • Owner-only' : ''}`).join('\n') || 'ไม่มี Review ค้าง'}`)],
+      .setDescription(`Circuit: **${breaker.state}** v${breaker.state_version} • ${breaker.reason ?? 'ปกติ'}\n\n${listRows(reviews, (row) => `• \`${row.id}\` • **${row.subject_type}** • ${row.state}${row.owner_only ? ' • Owner-only' : ''}`, 'ไม่มี Review ค้าง')}`)],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(customId('review_resolve')).setLabel('ตัดสิน Manual Review')
         .setStyle(ButtonStyle.Danger).setDisabled(!reviews.length),
@@ -438,11 +461,11 @@ if (route.route === 'admin') {
       runtime.pool.query('SELECT * FROM restore_drills ORDER BY started_at DESC LIMIT 5'),
     ]);
     return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Backup / Restore')
-      .setDescription(`**Backups**\n${backups.rows.map((row) => `• ${row.backup_type} • ${row.state} • ${row.completed_at?.toISOString?.() ?? row.started_at.toISOString()}`).join('\n') || 'ไม่มี'}\n\n**Restore drills**\n${drills.rows.map((row) => `• ${row.state} • ${row.completed_at?.toISOString?.() ?? row.started_at.toISOString()}`).join('\n') || 'ไม่มี'}\n\nการ Restore drill สร้างฐานข้อมูลชั่วคราวผ่านสคริปต์ \`npm run restore:drill\` เพื่อไม่ให้ Interaction ถือ process ยาว`) ] });
+      .setDescription(backupSummary(backups.rows, drills.rows))] });
   }
   if (interaction.values?.[0] === 'branding') {
     return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Branding / Config')
-      .setDescription(`Config version: **${runtime.config.version}**\nRunner concurrency: **${runnerConcurrency(runtime)}** / ${runtime.env.RUNNER_CONCURRENCY_HARD_MAX}\nAdmin role: ${runtime.config.values?.adminRoleId ? `<@&${runtime.config.values.adminRoleId}>` : 'ยังไม่ตั้ง'}\nQuest announcement role: ${runtime.config.values?.questAnnouncementRoleId ? `<@&${runtime.config.values.questAnnouncementRoleId}>` : 'ปิด'}\nBranding: ${JSON.stringify(runtime.config.values?.branding ?? {})}`)],
+      .setDescription(brandingSummary(runtime))],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(customId('config_branding')).setLabel('แก้ Branding').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId(customId('config_concurrency')).setLabel('Runner concurrency').setStyle(ButtonStyle.Secondary),
@@ -461,7 +484,7 @@ if (route.route === 'admin') {
     const activeIncidents = (await runtime.pool.query(`SELECT * FROM incidents WHERE state<>'RESOLVED'
       ORDER BY severity DESC,opened_at DESC LIMIT 10`)).rows;
     return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xf23f43).setTitle('DLQ และ Incidents')
-      .setDescription(`**DLQ**\n${dlq.map((row) => `• \`${row.id}\` • ${row.category} • ${row.state} • ${row.error_code}`).join('\n') || 'ไม่มี'}\n\n**Incidents**\n${activeIncidents.map((row) => `• ${row.severity} • **${row.incident_code}** / ${row.scope}`).join('\n') || 'ไม่มี'}`)],
+      .setDescription(`**DLQ**\n${listRows(dlq, (row) => `• \`${row.id}\` • ${row.category} • ${row.state} • ${row.error_code}`)}\n\n**Incidents**\n${listRows(activeIncidents, (row) => `• ${row.severity} • **${row.incident_code}** / ${row.scope}`)}`)],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(customId('dlq_replay')).setLabel('Replay DLQ').setStyle(ButtonStyle.Primary).setDisabled(!dlq.length),
       new ButtonBuilder().setCustomId(customId('dlq_discard')).setLabel('Discard non-financial').setStyle(ButtonStyle.Danger)
