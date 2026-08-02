@@ -141,6 +141,218 @@ function brandingSummary(runtime) {
   return `Config version: **${runtime.config.version}**\nRunner concurrency: **${runnerConcurrency(runtime)}** / ${runtime.env.RUNNER_CONCURRENCY_HARD_MAX}\nAdmin role: ${adminRole}\nQuest announcement role: ${questRole}\nBranding: ${JSON.stringify(values.branding ?? {})}`;
 }
 
+function paymentReviewLine(row) {
+  const ownerOnly = row.owner_only ? ' • Owner-only' : '';
+  return `• \`${row.id}\` • **${row.subject_type}** • ${row.state}${ownerOnly}`;
+}
+
+function paymentSummary(breaker, reviews) {
+  const header = `Circuit: **${breaker.state}** v${breaker.state_version} • ${breaker.reason ?? 'ปกติ'}`;
+  return [header, listRows(reviews, paymentReviewLine, 'ไม่มี Review ค้าง')].join('\n\n');
+}
+
+function deadLetterLine(row) {
+  return `• \`${row.id}\` • ${row.category} • ${row.state} • ${row.error_code}`;
+}
+
+function blocklistLine(row) {
+  return `• \`${row.discord_user_id}\` • **${row.block_type}** • ${row.reason}`;
+}
+
+function incidentLine(row) {
+  return `• ${row.severity} • **${row.incident_code}** / ${row.scope}`;
+}
+
+function dlqSummary(dlq, incidents) {
+  return ['**DLQ**', listRows(dlq, deadLetterLine), '', '**Incidents**', listRows(incidents, incidentLine)].join('\n');
+}
+
+function ownerOnly(interaction, runtime, message) {
+  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', message);
+}
+
+function panelEmbed(color, title, description) {
+  return new EmbedBuilder().setColor(color).setTitle(title).setDescription(description);
+}
+
+async function renderGatePanel(interaction, runtime) {
+  ownerOnly(interaction, runtime, 'Feature Gates ใช้ได้เฉพาะ Owner');
+  const rows = (await runtime.pool.query('SELECT * FROM feature_gates ORDER BY gate')).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Store และ Feature Gates',
+    listRows(rows, (row) => `${row.enabled ? '🟢' : '🔴'} **${row.gate}** — v${row.version}\n${row.reason}`))],
+  components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(customId('admin_gate_pick'))
+    .setPlaceholder('เลือก Gate ที่ต้องการแก้').addOptions(FEATURE_GATES.map((gate) => ({ label: gate, value: gate }))))] });
+}
+
+function renderWalletPanel(interaction) {
+  return interaction.editReply({ embeds: [panelEmbed(0xf0b232, 'Wallet / Refund / Adjustment',
+    'การแก้ยอดใช้ Compensating ledger เท่านั้น ต้องดู Before/After และยืนยันซ้ำภายใน 5 นาที\nReserved balance แก้ตรงจากเมนูนี้ไม่ได้')],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('wallet_adjust')).setLabel('ปรับ Available balance').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(customId('refund_prepare')).setLabel('คืนเงิน Item ที่ Capture แล้ว').setStyle(ButtonStyle.Primary),
+  )] });
+}
+
+async function renderBlocklistPanel(interaction, runtime) {
+  const blocks = (await runtime.pool.query(`SELECT * FROM blocklist_entries WHERE revoked_at IS NULL
+    AND (expires_at IS NULL OR expires_at>clock_timestamp()) ORDER BY created_at DESC LIMIT 10`)).rows;
+  const blockRows = listRows(blocks, blocklistLine, 'ยังไม่มีรายการ Block ที่ใช้งานอยู่');
+  const description = [blockRows, 'Block ไม่ริบ Wallet และไม่หยุดงานเดิม'].join('\n\n');
+  return interaction.editReply({ embeds: [panelEmbed(0xf0b232, 'Blocklist', description)],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('block_add')).setLabel('Block').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(customId('block_remove')).setLabel('Unblock').setStyle(ButtonStyle.Secondary),
+  )] });
+}
+
+async function renderPaymentsPanel(interaction, runtime) {
+  const reviews = (await runtime.pool.query(`SELECT * FROM manual_reviews WHERE state<>'RESOLVED'
+    ORDER BY financial DESC,created_at LIMIT 10`)).rows;
+  const breaker = (await runtime.pool.query("SELECT * FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
+  return interaction.editReply({ embeds: [panelEmbed(0xf0b232, 'Payments และ Manual Review', paymentSummary(breaker, reviews))],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('review_resolve')).setLabel('ตัดสิน Manual Review')
+      .setStyle(ButtonStyle.Danger).setDisabled(!reviews.length),
+    new ButtonBuilder().setCustomId(customId('breaker_prepare')).setLabel('Recovery probe / Close circuit')
+      .setStyle(ButtonStyle.Secondary).setDisabled(interaction.user.id !== runtime.env.OWNER_ID),
+  )] });
+}
+
+async function renderSurfacesPanel(interaction, runtime) {
+  const surfaces = (await runtime.pool.query('SELECT * FROM surfaces ORDER BY surface_key')).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Surfaces และ Permission Drift',
+    listRows(surfaces, (surface) => `${surface.state === 'ACTIVE' ? '🟢' : '🔴'} **${surface.surface_key}** • <#${surface.channel_id}> • v${surface.state_version}`, 'ยังไม่ได้ติดตั้ง Surface'))],
+  components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('perm_repair'))
+    .setLabel('Preview / Repair Permission').setStyle(ButtonStyle.Danger)
+    .setDisabled(interaction.user.id !== runtime.env.OWNER_ID || !surfaces.some((row) => row.state === 'DRIFTED')))] });
+}
+
+async function renderPricingPanel(interaction, runtime) {
+  const rules = (await runtime.pool.query(`SELECT * FROM price_rules ORDER BY enabled DESC, created_at DESC LIMIT 10`)).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Pricing',
+    listRows(rules, (rule) => `• \`${rule.id}\` • **${rule.rule_type}** ${rule.quest_id ?? rule.task_type ?? 'ทั้งหมด'} — ${money(rule.amount_cents)} • ${rule.enabled ? '🟢 ON' : '🔴 OFF'}`, 'ยังไม่มีกฎราคา'))],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('price_create')).setLabel('สร้าง Price rule').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(customId('price_manage')).setLabel('เปิด / ปิด Rule').setStyle(ButtonStyle.Secondary).setDisabled(!rules.length),
+  )] });
+}
+
+async function renderPromotionsPanel(interaction, runtime) {
+  const promotions = (await runtime.pool.query('SELECT * FROM promotions ORDER BY version DESC LIMIT 10')).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Promotions',
+    listRows(promotions, (promotion) => `• \`${promotion.id}\` • v${promotion.version} **${promotion.name}** • ${promotion.state} • <t:${Math.floor(new Date(promotion.ends_at).getTime() / 1000)}:R>`, 'ยังไม่มี Promotion'))],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('promo_create')).setLabel('สร้าง Promotion').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(customId('promo_manage')).setLabel('เปิด / ปิด Promotion').setStyle(ButtonStyle.Secondary).setDisabled(!promotions.length),
+  )] });
+}
+
+async function renderReceiversPanel(interaction, runtime) {
+  ownerOnly(interaction, runtime, 'Receiver Versions ใช้ได้เฉพาะ Owner');
+  const receivers = (await runtime.pool.query('SELECT * FROM receiver_versions ORDER BY version DESC LIMIT 10')).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Receiver Versions',
+    listRows(receivers, (receiver) => `• v${receiver.version} • ***-***-${receiver.phone_last4} • **${receiver.state}**`, 'ยังไม่ได้ตั้ง Receiver'))],
+  components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('receiver_activate'))
+    .setLabel('เปิด Receiver version ใหม่').setStyle(ButtonStyle.Danger))] });
+}
+
+async function renderMonitorsPanel(interaction, runtime) {
+  ownerOnly(interaction, runtime, 'Monitor Accounts ใช้ได้เฉพาะ Owner');
+  const monitors = (await runtime.pool.query('SELECT * FROM monitor_accounts ORDER BY priority DESC,created_at')).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Monitor Accounts',
+    listRows(monitors, (monitor) => `• **${monitor.username}** (\`${monitor.account_id}\`) • ${monitor.state} • ${monitor.capabilities.join(', ')}`, 'ยังไม่มี Monitor'))],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('monitor_add')).setLabel('เพิ่ม Monitor').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(customId('monitor_manage')).setLabel('State / Rotate token').setStyle(ButtonStyle.Secondary).setDisabled(!monitors.length),
+  )] });
+}
+
+async function renderCatalogPanel(interaction, runtime) {
+  const quests = (await runtime.pool.query('SELECT * FROM quests ORDER BY updated_at DESC LIMIT 10')).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Quest Catalog',
+    listRows(quests, (quest) => `• \`${quest.quest_id}\` • **${quest.name ?? 'ไม่ระบุ'}** • ${quest.analysis_state}/${quest.sale_state}`, 'ยังไม่มี Quest'))],
+  components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('catalog_sale'))
+    .setLabel('เปลี่ยนสถานะขาย Quest').setStyle(ButtonStyle.Primary))] });
+}
+
+async function renderOrdersPanel(interaction, runtime) {
+  const items = (await runtime.pool.query(`SELECT i.*,o.account_username FROM order_items i
+    JOIN orders o ON o.id=i.order_id WHERE i.state NOT IN ('READY_TO_CLAIM','EXPIRED_RELEASED',
+    'EXTERNAL_COMPLETED_RELEASED','STOPPED_RELEASED','FAILED_RELEASED') ORDER BY i.updated_at LIMIT 10`)).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Orders และ Runner',
+    listRows(items, (item) => `• \`${item.id}\` • **${item.quest_name}** • ${item.state} • ${item.progress_bucket}%`, 'ไม่มี Item ที่กำลังทำงาน'))],
+  components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('adminorder_review'))
+    .setLabel('เปิด Manual Review / Stop / Retry').setStyle(ButtonStyle.Danger).setDisabled(!items.length))] });
+}
+
+async function renderBackupPanel(interaction, runtime) {
+  const [backups, drills] = await Promise.all([
+    runtime.pool.query('SELECT * FROM backup_runs ORDER BY started_at DESC LIMIT 5'),
+    runtime.pool.query('SELECT * FROM restore_drills ORDER BY started_at DESC LIMIT 5'),
+  ]);
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Backup / Restore', backupSummary(backups.rows, drills.rows))] });
+}
+
+function renderBrandingPanel(interaction, runtime) {
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Branding / Config', brandingSummary(runtime))],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('config_branding')).setLabel('แก้ Branding').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(customId('config_concurrency')).setLabel('Runner concurrency').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(customId('config_roles')).setLabel('Admin / Announcement Roles').setStyle(ButtonStyle.Danger)
+      .setDisabled(interaction.user.id !== runtime.env.OWNER_ID),
+  )], allowedMentions: { parse: [] } });
+}
+
+function renderSecretsPanel(interaction, runtime) {
+  ownerOnly(interaction, runtime, 'Secret status ใช้ได้เฉพาะ Owner');
+  const keys = runtime.env;
+  const description = [
+    `Data encryption key: **v${keys.DATA_ENCRYPTION_KEYS_JSON.current}** (${Object.keys(keys.DATA_ENCRYPTION_KEYS_JSON.keys).length} retained)`,
+    `Voucher HMAC key: **v${keys.VOUCHER_HMAC_KEYS_JSON.current}** (${Object.keys(keys.VOUCHER_HMAC_KEYS_JSON.keys).length} retained)`,
+    `Backup key: **v${keys.BACKUP_ENCRYPTION_KEYS_JSON.current}** (${Object.keys(keys.BACKUP_ENCRYPTION_KEYS_JSON.keys).length} retained)`,
+    'ค่าจริงไม่ถูกอ่านกลับหรือแสดงใน Discord และ Rotation ต้องเปลี่ยนผ่าน Environment/Secret manager',
+  ].join('\n');
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Secret / Key version status', description)] });
+}
+
+async function renderDlqPanel(interaction, runtime) {
+  const dlq = (await runtime.pool.query(`SELECT * FROM dead_letter_items
+    WHERE state IN ('DEAD_LETTER','PENDING') ORDER BY created_at DESC LIMIT 10`)).rows;
+  const activeIncidents = (await runtime.pool.query(`SELECT * FROM incidents WHERE state<>'RESOLVED'
+    ORDER BY severity DESC,opened_at DESC LIMIT 10`)).rows;
+  return interaction.editReply({ embeds: [panelEmbed(0xf23f43, 'DLQ และ Incidents', dlqSummary(dlq, activeIncidents))],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('dlq_replay')).setLabel('Replay DLQ').setStyle(ButtonStyle.Primary).setDisabled(!dlq.length),
+    new ButtonBuilder().setCustomId(customId('dlq_discard')).setLabel('Discard non-financial').setStyle(ButtonStyle.Danger)
+      .setDisabled(interaction.user.id !== runtime.env.OWNER_ID || !dlq.length),
+  )] });
+}
+
+async function renderOverviewPanel(interaction, runtime) {
+  const [wallets, queue, reviews, incidents, backup] = await Promise.all([
+    runtime.pool.query('SELECT count(*)::integer AS users,COALESCE(sum(available_cents),0)::bigint AS available,COALESCE(sum(reserved_cents),0)::bigint AS reserved FROM wallets'),
+    runtime.pool.query("SELECT count(*)::integer AS count FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')"),
+    runtime.pool.query("SELECT count(*)::integer AS count FROM manual_reviews WHERE state<>'RESOLVED'"),
+    runtime.pool.query("SELECT count(*)::integer AS count FROM incidents WHERE state<>'RESOLVED'"),
+    runtime.pool.query("SELECT completed_at FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
+  ]);
+  const row = wallets.rows[0];
+  const selected = interaction.values?.[0] ?? 'overview';
+  const description = [
+    `Wallet users: **${row.users}**`, `Available: **${money(row.available)}**`, `Reserved: **${money(row.reserved)}**`,
+    `Queue: **${queue.rows[0].count}**`, `Reviews: **${reviews.rows[0].count}**`, `Incidents: **${incidents.rows[0].count}**`,
+    `Backup ล่าสุด: **${backup.rows[0]?.completed_at?.toISOString?.() ?? 'ยังไม่มี'}**`,
+  ].join('\n');
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, `Admin • ${selected}`, description)] });
+}
+
+const ADMIN_PANEL_RENDERERS = Object.freeze({
+  gates: renderGatePanel, wallet: renderWalletPanel, blocklist: renderBlocklistPanel, payments: renderPaymentsPanel,
+  surfaces: renderSurfacesPanel, pricing: renderPricingPanel, promotions: renderPromotionsPanel, receivers: renderReceiversPanel,
+  monitors: renderMonitorsPanel, catalog: renderCatalogPanel, orders: renderOrdersPanel, backup: renderBackupPanel,
+  branding: renderBrandingPanel, secrets: renderSecretsPanel, dlq: renderDlqPanel,
+});
+
 async function handleSurfaceCommand(interaction, runtime) {
   if (!interaction.isChatInputCommand()) return false;
   const surface = SURFACE_COMMANDS[interaction.commandName];
@@ -345,163 +557,11 @@ if (route.route === 'quest_confirm') {
 }
 
 async function handleAdminPanel({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'admin') {
+  if (route.route !== 'admin') return;
   if (!isBackoffice(interaction, runtime)) throw new QuestshopError('ADMIN_ONLY', 'เมนูนี้ใช้ได้เฉพาะ Owner/Admin');
   await interaction.deferReply({ ephemeral: true });
-  if (interaction.values?.[0] === 'gates') {
-    if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Feature Gates ใช้ได้เฉพาะ Owner');
-    const rows = (await runtime.pool.query('SELECT * FROM feature_gates ORDER BY gate')).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Store และ Feature Gates')
-      .setDescription(rows.map((row) => `${row.enabled ? '🟢' : '🔴'} **${row.gate}** — v${row.version}\n${row.reason}`).join('\n'))],
-    components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(customId('admin_gate_pick'))
-      .setPlaceholder('เลือก Gate ที่ต้องการแก้').addOptions(FEATURE_GATES.map((gate) => ({ label: gate, value: gate }))))] });
-  }
-  if (interaction.values?.[0] === 'wallet') {
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xf0b232)
-      .setTitle('Wallet / Refund / Adjustment')
-      .setDescription('การแก้ยอดใช้ Compensating ledger เท่านั้น ต้องดู Before/After และยืนยันซ้ำภายใน 5 นาที\nReserved balance แก้ตรงจากเมนูนี้ไม่ได้')],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(customId('wallet_adjust')).setLabel('ปรับ Available balance').setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId(customId('refund_prepare')).setLabel('คืนเงิน Item ที่ Capture แล้ว').setStyle(ButtonStyle.Primary),
-    )] });
-  }
-  if (interaction.values?.[0] === 'blocklist') {
-    const blocks = (await runtime.pool.query(`SELECT * FROM blocklist_entries WHERE revoked_at IS NULL
-      AND (expires_at IS NULL OR expires_at>clock_timestamp()) ORDER BY created_at DESC LIMIT 10`)).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xf0b232).setTitle('Blocklist')
-      .setDescription((blocks.map((row) => `• \`${row.discord_user_id}\` • **${row.block_type}** • ${row.reason}`).join('\n')
-        || 'ยังไม่มีรายการ Block ที่ใช้งานอยู่') + '\n\nBlock ไม่ริบ Wallet และไม่หยุดงานเดิม')],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(customId('block_add')).setLabel('Block').setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId(customId('block_remove')).setLabel('Unblock').setStyle(ButtonStyle.Secondary),
-    )] });
-  }
-  if (interaction.values?.[0] === 'payments') {
-    const reviews = (await runtime.pool.query(`SELECT * FROM manual_reviews WHERE state<>'RESOLVED'
-      ORDER BY financial DESC,created_at LIMIT 10`)).rows;
-    const breaker = (await runtime.pool.query("SELECT * FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xf0b232)
-      .setTitle('Payments และ Manual Review')
-      .setDescription(`Circuit: **${breaker.state}** v${breaker.state_version} • ${breaker.reason ?? 'ปกติ'}\n\n${listRows(reviews, (row) => `• \`${row.id}\` • **${row.subject_type}** • ${row.state}${row.owner_only ? ' • Owner-only' : ''}`, 'ไม่มี Review ค้าง')}`)],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(customId('review_resolve')).setLabel('ตัดสิน Manual Review')
-        .setStyle(ButtonStyle.Danger).setDisabled(!reviews.length),
-      new ButtonBuilder().setCustomId(customId('breaker_prepare')).setLabel('Recovery probe / Close circuit')
-        .setStyle(ButtonStyle.Secondary).setDisabled(interaction.user.id !== runtime.env.OWNER_ID),
-    )] });
-  }
-  if (interaction.values?.[0] === 'surfaces') {
-    const surfaces = (await runtime.pool.query('SELECT * FROM surfaces ORDER BY surface_key')).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2)
-      .setTitle('Surfaces และ Permission Drift')
-      .setDescription(surfaces.map((surface) => `${surface.state === 'ACTIVE' ? '🟢' : '🔴'} **${surface.surface_key}** • <#${surface.channel_id}> • v${surface.state_version}`).join('\n') || 'ยังไม่ได้ติดตั้ง Surface')],
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('perm_repair'))
-      .setLabel('Preview / Repair Permission').setStyle(ButtonStyle.Danger)
-      .setDisabled(interaction.user.id !== runtime.env.OWNER_ID || !surfaces.some((row) => row.state === 'DRIFTED')))] });
-  }
-  if (interaction.values?.[0] === 'pricing') {
-    const rules = (await runtime.pool.query(`SELECT * FROM price_rules
-      ORDER BY enabled DESC, created_at DESC LIMIT 10`)).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Pricing')
-      .setDescription(rules.map((rule) => `• \`${rule.id}\` • **${rule.rule_type}** ${rule.quest_id ?? rule.task_type ?? 'ทั้งหมด'} — ${money(rule.amount_cents)} • ${rule.enabled ? '🟢 ON' : '🔴 OFF'}`).join('\n') || 'ยังไม่มีกฎราคา')],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(customId('price_create')).setLabel('สร้าง Price rule').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(customId('price_manage')).setLabel('เปิด / ปิด Rule').setStyle(ButtonStyle.Secondary)
-        .setDisabled(!rules.length),
-    )] });
-  }
-  if (interaction.values?.[0] === 'promotions') {
-    const promotions = (await runtime.pool.query('SELECT * FROM promotions ORDER BY version DESC LIMIT 10')).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Promotions')
-      .setDescription(promotions.map((promotion) => `• \`${promotion.id}\` • v${promotion.version} **${promotion.name}** • ${promotion.state} • <t:${Math.floor(new Date(promotion.ends_at).getTime() / 1000)}:R>`).join('\n') || 'ยังไม่มี Promotion')],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(customId('promo_create')).setLabel('สร้าง Promotion').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(customId('promo_manage')).setLabel('เปิด / ปิด Promotion').setStyle(ButtonStyle.Secondary)
-        .setDisabled(!promotions.length),
-    )] });
-  }
-  if (interaction.values?.[0] === 'receivers') {
-    if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Receiver Versions ใช้ได้เฉพาะ Owner');
-    const receivers = (await runtime.pool.query('SELECT * FROM receiver_versions ORDER BY version DESC LIMIT 10')).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Receiver Versions')
-      .setDescription(receivers.map((receiver) => `• v${receiver.version} • ***-***-${receiver.phone_last4} • **${receiver.state}**`).join('\n') || 'ยังไม่ได้ตั้ง Receiver')],
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('receiver_activate'))
-      .setLabel('เปิด Receiver version ใหม่').setStyle(ButtonStyle.Danger))] });
-  }
-  if (interaction.values?.[0] === 'monitors') {
-    if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Monitor Accounts ใช้ได้เฉพาะ Owner');
-    const monitors = (await runtime.pool.query('SELECT * FROM monitor_accounts ORDER BY priority DESC,created_at')).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Monitor Accounts')
-      .setDescription(monitors.map((monitor) => `• **${monitor.username}** (\`${monitor.account_id}\`) • ${monitor.state} • ${monitor.capabilities.join(', ')}`).join('\n') || 'ยังไม่มี Monitor')],
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('monitor_add'))
-      .setLabel('เพิ่ม Monitor').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(customId('monitor_manage')).setLabel('State / Rotate token')
-      .setStyle(ButtonStyle.Secondary).setDisabled(!monitors.length))] });
-  }
-  if (interaction.values?.[0] === 'catalog') {
-    const quests = (await runtime.pool.query(`SELECT * FROM quests ORDER BY updated_at DESC LIMIT 10`)).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Quest Catalog')
-      .setDescription(quests.map((quest) => `• \`${quest.quest_id}\` • **${quest.name ?? 'ไม่ระบุ'}** • ${quest.analysis_state}/${quest.sale_state}`).join('\n') || 'ยังไม่มี Quest')],
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('catalog_sale'))
-      .setLabel('เปลี่ยนสถานะขาย Quest').setStyle(ButtonStyle.Primary))] });
-  }
-  if (interaction.values?.[0] === 'orders') {
-    const items = (await runtime.pool.query(`SELECT i.*,o.account_username FROM order_items i
-      JOIN orders o ON o.id=i.order_id WHERE i.state NOT IN ('READY_TO_CLAIM','EXPIRED_RELEASED',
-      'EXTERNAL_COMPLETED_RELEASED','STOPPED_RELEASED','FAILED_RELEASED')
-      ORDER BY i.updated_at LIMIT 10`)).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Orders และ Runner')
-      .setDescription(items.map((item) => `• \`${item.id}\` • **${item.quest_name}** • ${item.state} • ${item.progress_bucket}%`).join('\n') || 'ไม่มี Item ที่กำลังทำงาน')],
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('adminorder_review'))
-      .setLabel('เปิด Manual Review / Stop / Retry').setStyle(ButtonStyle.Danger).setDisabled(!items.length))] });
-  }
-  if (interaction.values?.[0] === 'backup') {
-    const [backups, drills] = await Promise.all([
-      runtime.pool.query('SELECT * FROM backup_runs ORDER BY started_at DESC LIMIT 5'),
-      runtime.pool.query('SELECT * FROM restore_drills ORDER BY started_at DESC LIMIT 5'),
-    ]);
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Backup / Restore')
-      .setDescription(backupSummary(backups.rows, drills.rows))] });
-  }
-  if (interaction.values?.[0] === 'branding') {
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Branding / Config')
-      .setDescription(brandingSummary(runtime))],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(customId('config_branding')).setLabel('แก้ Branding').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId(customId('config_concurrency')).setLabel('Runner concurrency').setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(customId('config_roles')).setLabel('Admin / Announcement Roles')
-        .setStyle(ButtonStyle.Danger).setDisabled(interaction.user.id !== runtime.env.OWNER_ID),
-    )], allowedMentions: { parse: [] } });
-  }
-  if (interaction.values?.[0] === 'secrets') {
-    if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Secret status ใช้ได้เฉพาะ Owner');
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('Secret / Key version status')
-      .setDescription(`Data encryption key: **v${runtime.env.DATA_ENCRYPTION_KEYS_JSON.current}** (${Object.keys(runtime.env.DATA_ENCRYPTION_KEYS_JSON.keys).length} retained)\nVoucher HMAC key: **v${runtime.env.VOUCHER_HMAC_KEYS_JSON.current}** (${Object.keys(runtime.env.VOUCHER_HMAC_KEYS_JSON.keys).length} retained)\nBackup key: **v${runtime.env.BACKUP_ENCRYPTION_KEYS_JSON.current}** (${Object.keys(runtime.env.BACKUP_ENCRYPTION_KEYS_JSON.keys).length} retained)\n\nค่าจริงไม่ถูกอ่านกลับหรือแสดงใน Discord และ Rotation ต้องเปลี่ยนผ่าน Environment/Secret manager`)] });
-  }
-  if (interaction.values?.[0] === 'dlq') {
-    const dlq = (await runtime.pool.query(`SELECT * FROM dead_letter_items
-      WHERE state IN ('DEAD_LETTER','PENDING') ORDER BY created_at DESC LIMIT 10`)).rows;
-    const activeIncidents = (await runtime.pool.query(`SELECT * FROM incidents WHERE state<>'RESOLVED'
-      ORDER BY severity DESC,opened_at DESC LIMIT 10`)).rows;
-    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xf23f43).setTitle('DLQ และ Incidents')
-      .setDescription(`**DLQ**\n${listRows(dlq, (row) => `• \`${row.id}\` • ${row.category} • ${row.state} • ${row.error_code}`)}\n\n**Incidents**\n${listRows(activeIncidents, (row) => `• ${row.severity} • **${row.incident_code}** / ${row.scope}`)}`)],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(customId('dlq_replay')).setLabel('Replay DLQ').setStyle(ButtonStyle.Primary).setDisabled(!dlq.length),
-      new ButtonBuilder().setCustomId(customId('dlq_discard')).setLabel('Discard non-financial').setStyle(ButtonStyle.Danger)
-        .setDisabled(interaction.user.id !== runtime.env.OWNER_ID || !dlq.length),
-    )] });
-  }
-  const [wallets, queue, reviews, incidents, backup] = await Promise.all([
-    runtime.pool.query('SELECT count(*)::integer AS users,COALESCE(sum(available_cents),0)::bigint AS available,COALESCE(sum(reserved_cents),0)::bigint AS reserved FROM wallets'),
-    runtime.pool.query("SELECT count(*)::integer AS count FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')"),
-    runtime.pool.query("SELECT count(*)::integer AS count FROM manual_reviews WHERE state<>'RESOLVED'"),
-    runtime.pool.query("SELECT count(*)::integer AS count FROM incidents WHERE state<>'RESOLVED'"),
-    runtime.pool.query("SELECT completed_at FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
-  ]);
-  const row = wallets.rows[0];
-  return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`Admin • ${interaction.values?.[0] ?? 'overview'}`)
-    .setDescription(`Wallet users: **${row.users}**\nAvailable: **${money(row.available)}**\nReserved: **${money(row.reserved)}**\nQueue: **${queue.rows[0].count}**\nReviews: **${reviews.rows[0].count}**\nIncidents: **${incidents.rows[0].count}**\nBackup ล่าสุด: **${backup.rows[0]?.completed_at?.toISOString?.() ?? 'ยังไม่มี'}**`)] });
-}
+  const renderer = ADMIN_PANEL_RENDERERS[interaction.values?.[0]] ?? renderOverviewPanel;
+  return renderer(interaction, runtime);
 }
 
 async function handleWalletAdjust({ interaction, route, runtime, gates: _gates }) {
@@ -635,6 +695,34 @@ if (['block_add', 'block_remove'].includes(route.route) && interaction.isButton(
 }
 }
 
+function blockInput(interaction) {
+  const input = {
+    discordUserId: interaction.fields.getTextInputValue('user_id').trim(),
+    blockType: interaction.fields.getTextInputValue('block_type').trim().toUpperCase(),
+    reason: interaction.fields.getTextInputValue('reason').trim(),
+  };
+  if (!/^\d{17,20}$/.test(input.discordUserId)) throw new TypeError('Discord User ID ไม่ถูกต้อง');
+  return input;
+}
+
+function blockExpiryHours(interaction) {
+  const hoursText = interaction.fields.getTextInputValue('hours').trim();
+  const hours = hoursText ? Number(hoursText) : null;
+  if (hours != null && (!Number.isInteger(hours) || hours <= 0 || hours > 8760)) {
+    throw new TypeError('จำนวนชั่วโมงไม่ถูกต้อง');
+  }
+  return hours;
+}
+
+async function executeBlockChange({ adding, input, interaction, runtime }) {
+  if (adding) {
+    await blockUser({ ...input, expiresInHours: blockExpiryHours(interaction) },
+      contextFor(interaction, 'block_add_execute'), { pool: runtime.pool });
+    return;
+  }
+  await unblockUser(input, contextFor(interaction, 'block_remove_execute'), { pool: runtime.pool });
+}
+
 async function handleBlockSubmit({ interaction, route, runtime, gates: _gates }) {
 if (['block_add_submit', 'block_remove_submit'].includes(route.route) && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
@@ -642,17 +730,8 @@ if (['block_add_submit', 'block_remove_submit'].includes(route.route) && interac
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId,
     operation: adding ? 'ADMIN_BLOCK' : 'ADMIN_UNBLOCK' }, contextFor(interaction, 'block_load'), { pool: runtime.pool });
-  const input = { discordUserId: interaction.fields.getTextInputValue('user_id').trim(),
-    blockType: interaction.fields.getTextInputValue('block_type').trim().toUpperCase(),
-    reason: interaction.fields.getTextInputValue('reason').trim() };
-  if (!/^\d{17,20}$/.test(input.discordUserId)) throw new TypeError('Discord User ID ไม่ถูกต้อง');
-  if (adding) {
-    const hoursText = interaction.fields.getTextInputValue('hours').trim();
-    const hours = hoursText ? Number(hoursText) : null;
-    if (hours != null && (!Number.isInteger(hours) || hours <= 0 || hours > 8760)) throw new TypeError('จำนวนชั่วโมงไม่ถูกต้อง');
-    input.expiresInHours = hours;
-    await blockUser(input, contextFor(interaction, 'block_add_execute'), { pool: runtime.pool });
-  } else await unblockUser(input, contextFor(interaction, 'block_remove_execute'), { pool: runtime.pool });
+  const input = blockInput(interaction);
+  await executeBlockChange({ adding, input, interaction, runtime });
   await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
   return interaction.editReply(`${adding ? 'Block' : 'Unblock'} \`${input.discordUserId}\` / **${input.blockType}** เรียบร้อย`);
 }
@@ -850,29 +929,46 @@ if (route.route === 'price_create' && interaction.isButton()) {
 }
 }
 
+function priceTarget(ruleType, rawTarget) {
+  const target = rawTarget.trim();
+  if (ruleType === 'QUEST') return { questId: target || null, taskType: null };
+  if (ruleType === 'TYPE') return { questId: null, taskType: target.toUpperCase() || null };
+  if (ruleType !== 'TEMPORARY') return { questId: null, taskType: null };
+  if (target.startsWith('quest:')) return { questId: target.slice(6) || null, taskType: null };
+  if (target.startsWith('type:')) return { questId: null, taskType: target.slice(5).toUpperCase() || null };
+  return { questId: null, taskType: null };
+}
+
+function pricePeriod(rawPeriod) {
+  const [startText, endText] = rawPeriod.trim() ? rawPeriod.split('|').map((value) => value.trim()) : [];
+  const startsAt = startText ? new Date(startText) : null;
+  const endsAt = endText ? new Date(endText) : null;
+  const invalidStart = startText && !Number.isFinite(startsAt.getTime());
+  const invalidEnd = endText && !Number.isFinite(endsAt.getTime());
+  if (invalidStart || invalidEnd || (startsAt && endsAt && endsAt <= startsAt)) {
+    throw new TypeError('ช่วงเวลา Price rule ไม่ถูกต้อง');
+  }
+  return { startsAt, endsAt };
+}
+
+function priceRuleInput(interaction) {
+  const ruleType = interaction.fields.getTextInputValue('scope').trim().toUpperCase();
+  return {
+    ruleType,
+    ...priceTarget(ruleType, interaction.fields.getTextInputValue('target')),
+    ...pricePeriod(interaction.fields.getTextInputValue('period')),
+    amountCents: parseBahtToCents(interaction.fields.getTextInputValue('amount')),
+    reason: interaction.fields.getTextInputValue('reason').trim(),
+  };
+}
+
 async function handlePriceCreateSubmit({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'price_create_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PRICE_CREATE' },
   contextFor(interaction, 'price_load'), { pool: runtime.pool });
-  const ruleType = interaction.fields.getTextInputValue('scope').trim().toUpperCase();
-  const target = interaction.fields.getTextInputValue('target').trim();
-  let questId = ruleType === 'QUEST' ? target : null;
-  let taskType = ruleType === 'TYPE' ? target.toUpperCase() : null;
-  if (ruleType === 'TEMPORARY' && target.startsWith('quest:')) questId = target.slice(6);
-  if (ruleType === 'TEMPORARY' && target.startsWith('type:')) taskType = target.slice(5).toUpperCase();
-  const period = interaction.fields.getTextInputValue('period').trim();
-  const [startText, endText] = period ? period.split('|').map((value) => value.trim()) : [];
-  const startsAt = startText ? new Date(startText) : null;
-  const endsAt = endText ? new Date(endText) : null;
-  if ((startText && (!Number.isFinite(startsAt.getTime()))) || (endText && (!Number.isFinite(endsAt.getTime())))
-    || (startsAt && endsAt && endsAt <= startsAt)) throw new TypeError('ช่วงเวลา Price rule ไม่ถูกต้อง');
-  const rule = await setPriceRule({ ruleType,
-    questId: questId || null, taskType: taskType || null,
-    amountCents: parseBahtToCents(interaction.fields.getTextInputValue('amount')),
-    startsAt, endsAt,
-    reason: interaction.fields.getTextInputValue('reason').trim() },
+  const rule = await setPriceRule(priceRuleInput(interaction),
   contextFor(interaction, 'price_create_execute'), { pool: runtime.pool });
   await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
   return interaction.editReply(`สร้าง Price rule **${rule.rule_type}** ราคา **${money(rule.amount_cents)}** แล้ว`);
@@ -1191,31 +1287,44 @@ if (['config_branding', 'config_roles'].includes(route.route) && interaction.isB
 }
 }
 
+function configOperation(roles) {
+  return roles ? 'CONFIG_ROLES' : 'CONFIG_BRANDING';
+}
+
+function roleConfigPatch(interaction) {
+  const adminRoleId = interaction.fields.getTextInputValue('admin_role').trim() || null;
+  const questAnnouncementRoleId = interaction.fields.getTextInputValue('quest_role').trim() || null;
+  if ([adminRoleId, questAnnouncementRoleId].some((id) => id && !/^\d{17,20}$/.test(id))) {
+    throw new TypeError('Role ID ไม่ถูกต้อง');
+  }
+  return { adminRoleId, questAnnouncementRoleId };
+}
+
+function brandingConfigPatch(interaction) {
+  const mediaUrl = interaction.fields.getTextInputValue('media_url').trim() || null;
+  if (mediaUrl && !['https:', 'http:'].includes(new URL(mediaUrl).protocol)) {
+    throw new TypeError('Media URL ต้องเป็น HTTP(S)');
+  }
+  return { branding: {
+    title: interaction.fields.getTextInputValue('title').trim(),
+    description: interaction.fields.getTextInputValue('description').trim(), mediaUrl,
+  } };
+}
+
+function configPatch(interaction, roles) {
+  return roles ? roleConfigPatch(interaction) : brandingConfigPatch(interaction);
+}
+
 async function handleConfigSubmit({ interaction, route, runtime, gates: _gates }) {
 if (['config_roles_submit', 'config_branding_submit'].includes(route.route) && interaction.isModalSubmit()) {
   const roles = route.route === 'config_roles_submit';
-  if (roles && interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Role config ใช้ได้เฉพาะ Owner');
+  if (roles) ownerOnly(interaction, runtime, 'Role config ใช้ได้เฉพาะ Owner');
   await interaction.deferReply({ ephemeral: true });
-  const operation = roles ? 'CONFIG_ROLES' : 'CONFIG_BRANDING';
+  const operation = configOperation(roles);
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation },
   contextFor(interaction, 'config_load'), { pool: runtime.pool });
-  let patch;
-  if (roles) {
-    const adminRoleId = interaction.fields.getTextInputValue('admin_role').trim() || null;
-    const questAnnouncementRoleId = interaction.fields.getTextInputValue('quest_role').trim() || null;
-    if ([adminRoleId, questAnnouncementRoleId].some((id) => id && !/^\d{17,20}$/.test(id))) throw new TypeError('Role ID ไม่ถูกต้อง');
-    patch = { adminRoleId, questAnnouncementRoleId };
-  } else {
-    const mediaUrl = interaction.fields.getTextInputValue('media_url').trim() || null;
-    if (mediaUrl) {
-      const parsed = new URL(mediaUrl);
-      if (!['https:', 'http:'].includes(parsed.protocol)) throw new TypeError('Media URL ต้องเป็น HTTP(S)');
-    }
-    patch = { branding: { title: interaction.fields.getTextInputValue('title').trim(),
-      description: interaction.fields.getTextInputValue('description').trim(), mediaUrl } };
-  }
-  const changed = await updateRuntimeConfig({ patch, expectedVersion: session.payload.expectedVersion,
+  const changed = await updateRuntimeConfig({ patch: configPatch(interaction, roles), expectedVersion: session.payload.expectedVersion,
     reason: interaction.fields.getTextInputValue('reason').trim() },
   contextFor(interaction, 'config_execute'), { pool: runtime.pool });
   runtime.config = await loadRuntimeConfig(runtime.pool);
