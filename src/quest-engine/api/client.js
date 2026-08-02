@@ -18,6 +18,14 @@ export class DiscordApiError extends Error {
   }
 }
 
+export class DiscordApiTransportError extends Error {
+  constructor(path, cause) {
+    super(`Unable to read Discord API response at ${path}`, { cause });
+    this.name = 'DiscordApiTransportError';
+    this.path = path;
+  }
+}
+
 function safePath(path) {
   if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')
     || path.includes('\\') || path.includes('?') || path.includes('#')
@@ -60,9 +68,13 @@ function retryAfterMs(response, data) {
   return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1000) : 1000;
 }
 
-async function parseResponse(response) {
-  const text = response.status === 204 ? '' : await response.text();
-  try { return text ? JSON.parse(text) : null; } catch { return text; }
+async function parseResponse(response, path) {
+  try {
+    const text = response.status === 204 ? '' : await response.text();
+    try { return text ? JSON.parse(text) : null; } catch { return text; }
+  } catch (error) {
+    throw new DiscordApiTransportError(path, error);
+  }
 }
 
 async function waitForSafeRetry({ response, data, safeRead, attempt, maxAttempts, coordinator, signal }) {
@@ -78,22 +90,34 @@ async function waitForSafeRetry({ response, data, safeRead, attempt, maxAttempts
   return true;
 }
 
+async function waitForTransportRetry({ error, safeRead, attempt, maxAttempts, signal }) {
+  if (error?.name === 'AbortError' || !safeRead || attempt + 1 >= maxAttempts) return false;
+  await delay(secureJitter(Math.min(30_000, 500 * (2 ** attempt))), undefined, { signal, ref: false });
+  return true;
+}
+
 export function createQuestApiClient({ token, profile, coordinator = discordRateLimitCoordinator }) {
   async function request(path, options = {}, { safeRead = false, maxAttempts = safeRead ? 5 : 1 } = {}) {
     const method = String(options.method ?? 'GET').toUpperCase();
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const response = await coordinator.schedule({
-        token,
-        signal: options.signal,
-        execute: () => fetch(apiUrl(path), {
-          ...options,
-          headers: { ...headers(token, path, profile), ...options.headers },
-        }),
-      });
-      const data = await parseResponse(response);
-      if (response.ok) return data ?? { ok: true, status: response.status };
-      if (await waitForSafeRetry({ response, data, safeRead, attempt, maxAttempts, coordinator, signal: options.signal })) continue;
-      throw new DiscordApiError(response.status, path, data);
+      try {
+        const response = await coordinator.schedule({
+          token,
+          signal: options.signal,
+          execute: () => fetch(apiUrl(path), {
+            ...options,
+            headers: { ...headers(token, path, profile), ...options.headers },
+          }),
+        });
+        const data = await parseResponse(response, path);
+        if (response.ok) return data ?? { ok: true, status: response.status };
+        if (await waitForSafeRetry({ response, data, safeRead, attempt, maxAttempts, coordinator, signal: options.signal })) continue;
+        throw new DiscordApiError(response.status, path, data);
+      } catch (error) {
+        if (error instanceof DiscordApiError || error?.name === 'AbortError') throw error;
+        if (await waitForTransportRetry({ error, safeRead, attempt, maxAttempts, signal: options.signal })) continue;
+        throw error;
+      }
     }
     throw new Error(`${method} ${path} retry budget exhausted`);
   }
