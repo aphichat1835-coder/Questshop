@@ -9,3 +9,6 @@ tmp/
 *.dump
 *.qsbk
 
+# Legacy reference projects are retained locally only.
+/Questbotdiscord/
+/ตัวอย่างบอทร้านค้าขายเเอพพรีเมี่ยม/
