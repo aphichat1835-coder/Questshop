@@ -1,7 +1,6 @@
-import { v7 as uuidv7 } from 'uuid';
 import { readFile } from 'node:fs/promises';
-import { RUNNER_VERSION_COMPATIBILITY } from '../config/versions.js';
-import { isRunnerVersionCompatible } from '../config/versions.js';
+import { v7 as uuidv7 } from 'uuid';
+import { RUNNER_VERSION_COMPATIBILITY, isRunnerVersionCompatible } from '../config/versions.js';
 
 async function memoryLimitBytes() {
   for (const path of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
@@ -22,49 +21,46 @@ async function setIncident(client, { code, scope, active, severity, evidence }) 
       VALUES($1,$2,$3,'OPEN',$4,$5,$6) ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
       DO UPDATE SET severity=EXCLUDED.severity,evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
     [uuidv7(), code, scope, severity, evidence, uuidv7()]);
-  } else {
-    await client.query(`UPDATE incidents SET state='RESOLVED',resolved_at=clock_timestamp(),
-      updated_at=clock_timestamp() WHERE incident_code=$1 AND scope=$2 AND state<>'RESOLVED'`, [code, scope]);
+    return;
   }
+  await client.query(`UPDATE incidents SET state='RESOLVED',resolved_at=clock_timestamp(),
+    updated_at=clock_timestamp() WHERE incident_code=$1 AND scope=$2 AND state<>'RESOLVED'`, [code, scope]);
 }
 
-export async function evaluateAlerts({ pool, health, eventLoopMonitor = null }) {
+async function collectRuntimeMetrics(pool, eventLoopMonitor) {
   const rssBytes = process.memoryUsage().rss;
   const memoryLimit = await memoryLimitBytes();
   const memoryPercent = memoryLimit ? (rssBytes / memoryLimit) * 100 : null;
   const eventLoopLagMs = eventLoopMonitor ? eventLoopMonitor.percentile(99) / 1e6 : null;
   eventLoopMonitor?.reset();
+  const memoryOutcome = memoryPercent != null && memoryPercent > 85 ? 'ERROR' : 'SUCCESS';
+  const lagOutcome = eventLoopLagMs != null && eventLoopLagMs > 500 ? 'ERROR' : 'SUCCESS';
   await pool.query(`INSERT INTO operation_metrics(id,operation,outcome,duration_ms,error_class)
-    VALUES($1,'SYSTEM:MEMORY_PERCENT',$2,$3,NULL),
-      ($4,'SYSTEM:EVENT_LOOP_LAG',$5,$6,NULL)`, [uuidv7(), memoryPercent != null && memoryPercent > 85 ? 'ERROR' : 'SUCCESS',
-    Math.round(Math.max(0, memoryPercent ?? 0)), uuidv7(),
-    eventLoopLagMs != null && eventLoopLagMs > 500 ? 'ERROR' : 'SUCCESS',
+    VALUES($1,'SYSTEM:MEMORY_PERCENT',$2,$3,NULL),($4,'SYSTEM:EVENT_LOOP_LAG',$5,$6,NULL)`,
+  [uuidv7(), memoryOutcome, Math.round(Math.max(0, memoryPercent ?? 0)), uuidv7(), lagOutcome,
     Math.round(Math.max(0, eventLoopLagMs ?? 0))]);
+  return { rssBytes, memoryLimit, memoryPercent, eventLoopLagMs };
+}
+
+async function collectAlertSnapshot(pool) {
   const [financial, queue, outbox, errors, backup, restore, counts, gates, activeVersions] = await Promise.all([
-    pool.query(`SELECT
-      (SELECT count(*)::integer FROM wallets WHERE available_cents<0 OR reserved_cents<0) AS negative,
-      (SELECT count(*)::integer FROM wallets w LEFT JOIN LATERAL (
-        SELECT available_after_cents,reserved_after_cents FROM wallet_transactions t
-        WHERE t.discord_user_id=w.discord_user_id ORDER BY created_at DESC,id DESC LIMIT 1) t ON true
-        LEFT JOIN LATERAL (SELECT available_cents,reserved_cents FROM wallet_checkpoints c
-          WHERE c.discord_user_id=w.discord_user_id ORDER BY created_at DESC LIMIT 1) c ON true
-        WHERE COALESCE(t.available_after_cents,c.available_cents,w.available_cents)<>w.available_cents
+    pool.query(`SELECT (SELECT count(*)::integer FROM wallets WHERE available_cents<0 OR reserved_cents<0) AS negative,
+      (SELECT count(*)::integer FROM wallets w LEFT JOIN LATERAL (SELECT available_after_cents,reserved_after_cents
+        FROM wallet_transactions t WHERE t.discord_user_id=w.discord_user_id ORDER BY created_at DESC,id DESC LIMIT 1) t ON true
+        LEFT JOIN LATERAL (SELECT available_cents,reserved_cents FROM wallet_checkpoints c WHERE c.discord_user_id=w.discord_user_id
+          ORDER BY c.created_at DESC LIMIT 1) c ON true WHERE COALESCE(t.available_after_cents,c.available_cents,w.available_cents)<>w.available_cents
           OR COALESCE(t.reserved_after_cents,c.reserved_cents,w.reserved_cents)<>w.reserved_cents) AS mismatch,
       (SELECT count(*)::integer FROM topups WHERE status IN ('AMBIGUOUS','MANUAL_REVIEW')) AS ambiguous,
-      (SELECT count(*)::integer FROM dead_letter_items d WHERE d.state='DEAD_LETTER'
-        AND d.category IN ('FINANCIAL','AUDIT')) AS financial_dlq`),
-    pool.query(`SELECT count(*)::integer AS stuck FROM runner_jobs
-      WHERE state NOT IN ('COMPLETED','FAILED') AND updated_at<clock_timestamp()-interval '5 minutes'`),
-    pool.query(`SELECT count(*)::integer AS stuck FROM outbox_events
-      WHERE state IN ('PENDING','LEASED','RETRY_WAIT')
-        AND GREATEST(created_at,available_at)<clock_timestamp()-interval '5 minutes'`),
-    pool.query(`SELECT count(*)::integer AS total,
-      count(*) FILTER (WHERE outcome<>'SUCCESS')::integer AS failed FROM operation_metrics
-      WHERE created_at>=clock_timestamp()-interval '5 minutes'`),
+      (SELECT count(*)::integer FROM dead_letter_items d WHERE d.state='DEAD_LETTER' AND d.category IN ('FINANCIAL','AUDIT')) AS financial_dlq`),
+    pool.query(`SELECT count(*)::integer AS stuck FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')
+      AND updated_at<clock_timestamp()-interval '5 minutes'`),
+    pool.query(`SELECT count(*)::integer AS stuck FROM outbox_events WHERE state IN ('PENDING','LEASED','RETRY_WAIT')
+      AND GREATEST(created_at,available_at)<clock_timestamp()-interval '5 minutes'`),
+    pool.query(`SELECT count(*)::integer AS total,count(*) FILTER (WHERE outcome<>'SUCCESS')::integer AS failed
+      FROM operation_metrics WHERE created_at>=clock_timestamp()-interval '5 minutes'`),
     pool.query("SELECT EXTRACT(EPOCH FROM clock_timestamp()-completed_at)*1000 AS age_ms FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
     pool.query("SELECT EXTRACT(EPOCH FROM clock_timestamp()-completed_at)*1000 AS age_ms FROM restore_drills WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
-    pool.query(`SELECT
-      (SELECT count(*)::integer FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')) AS queue,
+    pool.query(`SELECT (SELECT count(*)::integer FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')) AS queue,
       (SELECT count(*)::integer FROM outbox_events WHERE state IN ('PENDING','LEASED','RETRY_WAIT')) AS outbox,
       (SELECT count(*)::integer FROM manual_reviews WHERE state<>'RESOLVED') AS reviews,
       (SELECT count(*)::integer FROM incidents WHERE state<>'RESOLVED') AS incidents,
@@ -73,24 +69,40 @@ export async function evaluateAlerts({ pool, health, eventLoopMonitor = null }) 
     pool.query(`SELECT DISTINCT engine_version,executor_version,contract_version,runner_state_schema_version
       FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')`),
   ]);
-  const invariant = financial.rows[0];
-  const engineVersions = RUNNER_VERSION_COMPATIBILITY.map((item) => item.engine);
-  const executorVersions = RUNNER_VERSION_COMPATIBILITY.map((item) => item.executor);
-  const contractVersions = RUNNER_VERSION_COMPATIBILITY.map((item) => item.contract);
-  const stateSchemas = RUNNER_VERSION_COMPATIBILITY.map((item) => item.stateSchema);
+  return { invariant: financial.rows[0], queue: queue.rows[0], outbox: outbox.rows[0], errors: errors.rows[0],
+    backupAgeMs: backup.rows[0]?.age_ms == null ? Infinity : Number(backup.rows[0].age_ms),
+    restoreAgeMs: restore.rows[0]?.age_ms == null ? Infinity : Number(restore.rows[0].age_ms),
+    counts: counts.rows[0], gates: gates.rows, activeVersions: activeVersions.rows };
+}
+
+function versionArrays() {
+  return {
+    engine: RUNNER_VERSION_COMPATIBILITY.map((item) => item.engine),
+    executor: RUNNER_VERSION_COMPATIBILITY.map((item) => item.executor),
+    contract: RUNNER_VERSION_COMPATIBILITY.map((item) => item.contract),
+    stateSchema: RUNNER_VERSION_COMPATIBILITY.map((item) => item.stateSchema),
+  };
+}
+
+async function protectVersionCompatibility(pool, snapshot) {
+  const versions = versionArrays();
   const incompatibleJobs = Number((await pool.query(`SELECT count(*)::integer AS count FROM runner_jobs j
-    WHERE j.state NOT IN ('COMPLETED','FAILED') AND NOT EXISTS(SELECT 1 FROM
-      unnest($1::text[],$2::text[],$3::text[],$4::integer[])
-      AS supported(engine,executor,contract,state_schema)
-      WHERE supported.engine=j.engine_version AND supported.executor=j.executor_version
-        AND supported.contract=j.contract_version
+    WHERE j.state NOT IN ('COMPLETED','FAILED') AND NOT EXISTS(SELECT 1 FROM unnest($1::text[],$2::text[],$3::text[],$4::integer[])
+      AS supported(engine,executor,contract,state_schema) WHERE supported.engine=j.engine_version
+        AND supported.executor=j.executor_version AND supported.contract=j.contract_version
         AND supported.state_schema=j.runner_state_schema_version)`,
-  [engineVersions, executorVersions, contractVersions, stateSchemas])).rows[0].count);
+  [versions.engine, versions.executor, versions.contract, versions.stateSchema])).rows[0].count);
   if (incompatibleJobs > 0) await pool.query(`UPDATE feature_gates SET enabled=false,
     reason='RUNNER_VERSION_INCOMPATIBLE',version=version+CASE WHEN enabled THEN 1 ELSE 0 END,
     updated_at=clock_timestamp() WHERE gate='RUNNER_DISPATCH_ENABLED' AND enabled=true`);
-  await setIncident(pool, { code: 'RUNNER_VERSION_INCOMPATIBLE', scope: 'RUNNER',
-    active: incompatibleJobs > 0, severity: 'CRITICAL', evidence: { count: incompatibleJobs } });
+  await setIncident(pool, { code: 'RUNNER_VERSION_INCOMPATIBLE', scope: 'RUNNER', active: incompatibleJobs > 0,
+    severity: 'CRITICAL', evidence: { count: incompatibleJobs } });
+  const incompatibleVersions = snapshot.activeVersions.filter((row) => !isRunnerVersionCompatible(row));
+  await setIncident(pool, { code: 'RUNNER_VERSION_INCOMPATIBLE', scope: 'RUNNER', active: incompatibleVersions.length > 0,
+    severity: 'ERROR', evidence: { versions: incompatibleVersions } });
+}
+
+async function applyFinancialAlerts(pool, invariant) {
   const financialBroken = invariant.negative > 0 || invariant.mismatch > 0;
   if (financialBroken) await pool.query(`UPDATE feature_gates SET enabled=false,reason='FINANCIAL_INVARIANT',
     version=version+CASE WHEN enabled THEN 1 ELSE 0 END,updated_at=clock_timestamp()
@@ -101,47 +113,53 @@ export async function evaluateAlerts({ pool, health, eventLoopMonitor = null }) 
     severity: 'CRITICAL', evidence: { count: invariant.ambiguous } });
   await setIncident(pool, { code: 'FINANCIAL_DLQ', scope: 'OUTBOX', active: invariant.financial_dlq > 0,
     severity: 'CRITICAL', evidence: { count: invariant.financial_dlq } });
-  const incompatibleVersions = activeVersions.rows.filter((row) => !isRunnerVersionCompatible(row));
-  await setIncident(pool, { code: 'RUNNER_VERSION_INCOMPATIBLE', scope: 'RUNNER',
-    active: incompatibleVersions.length > 0, severity: 'ERROR', evidence: { versions: incompatibleVersions } });
-  await setIncident(pool, { code: 'QUEUE_STUCK', scope: 'RUNNER', active: queue.rows[0].stuck > 0,
-    severity: 'ERROR', evidence: queue.rows[0] });
-  await setIncident(pool, { code: 'OUTBOX_STUCK', scope: 'DISCORD', active: outbox.rows[0].stuck > 0,
-    severity: 'ERROR', evidence: outbox.rows[0] });
-  const errorRateHigh = errors.rows[0].total >= 20
-    && errors.rows[0].failed / errors.rows[0].total >= 0.05;
-  await setIncident(pool, { code: 'ERROR_RATE_HIGH', scope: 'OPERATIONS', active: errorRateHigh,
-    severity: 'ERROR', evidence: errors.rows[0] });
-  const backupAgeMs = backup.rows[0]?.age_ms == null ? Infinity : Number(backup.rows[0].age_ms);
-  const restoreAgeMs = restore.rows[0]?.age_ms == null ? Infinity : Number(restore.rows[0].age_ms);
-  await setIncident(pool, { code: 'BACKUP_STALE', scope: 'DATABASE', active: backupAgeMs > 26 * 3_600_000,
-    severity: 'ERROR', evidence: { ageMs: Number.isFinite(backupAgeMs) ? backupAgeMs : null } });
-  await setIncident(pool, { code: 'RESTORE_DRILL_STALE', scope: 'DATABASE', active: restoreAgeMs > 35 * 86_400_000,
-    severity: 'ERROR', evidence: { ageMs: Number.isFinite(restoreAgeMs) ? restoreAgeMs : null } });
+  return financialBroken;
+}
+
+async function applyOperationalAlerts(pool, snapshot, health, runtime) {
+  await setIncident(pool, { code: 'QUEUE_STUCK', scope: 'RUNNER', active: snapshot.queue.stuck > 0, severity: 'ERROR', evidence: snapshot.queue });
+  await setIncident(pool, { code: 'OUTBOX_STUCK', scope: 'DISCORD', active: snapshot.outbox.stuck > 0, severity: 'ERROR', evidence: snapshot.outbox });
+  const errorRateHigh = snapshot.errors.total >= 20 && snapshot.errors.failed / snapshot.errors.total >= 0.05;
+  await setIncident(pool, { code: 'ERROR_RATE_HIGH', scope: 'OPERATIONS', active: errorRateHigh, severity: 'ERROR', evidence: snapshot.errors });
+  await setIncident(pool, { code: 'BACKUP_STALE', scope: 'DATABASE', active: snapshot.backupAgeMs > 26 * 3_600_000,
+    severity: 'ERROR', evidence: { ageMs: Number.isFinite(snapshot.backupAgeMs) ? snapshot.backupAgeMs : null } });
+  await setIncident(pool, { code: 'RESTORE_DRILL_STALE', scope: 'DATABASE', active: snapshot.restoreAgeMs > 35 * 86_400_000,
+    severity: 'ERROR', evidence: { ageMs: Number.isFinite(snapshot.restoreAgeMs) ? snapshot.restoreAgeMs : null } });
   const staleWorkers = Object.entries(health.workers).filter(([, worker]) => worker.lastTick
     && Date.now() - Date.parse(worker.lastTick) > 120_000).map(([name]) => name);
   await setIncident(pool, { code: 'WORKER_HEARTBEAT_MISSING', scope: 'RUNTIME', active: staleWorkers.length > 0,
     severity: 'ERROR', evidence: { workers: staleWorkers } });
-  const sustained = (await pool.query(`SELECT
-    count(*) FILTER (WHERE operation='SYSTEM:MEMORY_PERCENT' AND outcome='ERROR'
-      AND created_at>=clock_timestamp()-interval '10 minutes')::integer AS memory_high,
+  const sustained = (await pool.query(`SELECT count(*) FILTER (WHERE operation='SYSTEM:MEMORY_PERCENT' AND outcome='ERROR'
+    AND created_at>=clock_timestamp()-interval '10 minutes')::integer AS memory_high,
     count(*) FILTER (WHERE operation='SYSTEM:EVENT_LOOP_LAG' AND outcome='ERROR'
-      AND created_at>=clock_timestamp()-interval '5 minutes')::integer AS event_loop_high
-    FROM operation_metrics`)).rows[0];
+      AND created_at>=clock_timestamp()-interval '5 minutes')::integer AS event_loop_high FROM operation_metrics`)).rows[0];
   await setIncident(pool, { code: 'MEMORY_PRESSURE', scope: 'RUNTIME', active: sustained.memory_high >= 10,
-    severity: 'ERROR', evidence: { percent: memoryPercent, rssBytes, memoryLimitBytes: memoryLimit,
-      highSamples: sustained.memory_high } });
+    severity: 'ERROR', evidence: { percent: runtime.memoryPercent, rssBytes: runtime.rssBytes,
+      memoryLimitBytes: runtime.memoryLimit, highSamples: sustained.memory_high } });
   await setIncident(pool, { code: 'EVENT_LOOP_LAG', scope: 'RUNTIME', active: sustained.event_loop_high >= 5,
-    severity: 'ERROR', evidence: { p99Ms: eventLoopLagMs, highSamples: sustained.event_loop_high } });
-  health.overview = { ...counts.rows[0], queueSoftLimit: 400, queueHardLimit: 500,
-    gates: Object.fromEntries(gates.rows.map((row) => [row.gate, {
-      enabled: row.enabled, version: Number(row.version),
-    }])),
-    backupAgeMs: Number.isFinite(backupAgeMs) ? backupAgeMs : null,
-    restoreAgeMs: Number.isFinite(restoreAgeMs) ? restoreAgeMs : null,
-    memoryRssBytes: rssBytes, memoryLimitBytes: memoryLimit, memoryPercent, eventLoopLagP99Ms: eventLoopLagMs };
-  health.status = financialBroken ? 'INCIDENT' : !health.ready ? 'NOT_READY'
-    : queue.rows[0].stuck || outbox.rows[0].stuck ? 'DEGRADED'
-      : !counts.rows[0].store_open ? 'MAINTENANCE' : 'HEALTHY';
+    severity: 'ERROR', evidence: { p99Ms: runtime.eventLoopLagMs, highSamples: sustained.event_loop_high } });
+}
+
+function resolveHealthStatus({ financialBroken, health, snapshot }) {
+  if (financialBroken) return 'INCIDENT';
+  if (!health.ready) return 'NOT_READY';
+  if (snapshot.queue.stuck || snapshot.outbox.stuck) return 'DEGRADED';
+  if (!snapshot.counts.store_open) return 'MAINTENANCE';
+  return 'HEALTHY';
+}
+
+export async function evaluateAlerts({ pool, health, eventLoopMonitor = null }) {
+  const runtime = await collectRuntimeMetrics(pool, eventLoopMonitor);
+  const snapshot = await collectAlertSnapshot(pool);
+  await protectVersionCompatibility(pool, snapshot);
+  const financialBroken = await applyFinancialAlerts(pool, snapshot.invariant);
+  await applyOperationalAlerts(pool, snapshot, health, runtime);
+  health.overview = { ...snapshot.counts, queueSoftLimit: 400, queueHardLimit: 500,
+    gates: Object.fromEntries(snapshot.gates.map((row) => [row.gate, { enabled: row.enabled, version: Number(row.version) }])),
+    backupAgeMs: Number.isFinite(snapshot.backupAgeMs) ? snapshot.backupAgeMs : null,
+    restoreAgeMs: Number.isFinite(snapshot.restoreAgeMs) ? snapshot.restoreAgeMs : null,
+    memoryRssBytes: runtime.rssBytes, memoryLimitBytes: runtime.memoryLimit, memoryPercent: runtime.memoryPercent,
+    eventLoopLagP99Ms: runtime.eventLoopLagMs };
+  health.status = resolveHealthStatus({ financialBroken, health, snapshot });
   return false;
 }

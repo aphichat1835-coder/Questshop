@@ -121,7 +121,7 @@ async function lockAuthorizedSession(client, { sessionId, actorId, guildId, chan
     SELECT *, expires_at > clock_timestamp() AS is_fresh
     FROM interaction_sessions WHERE id = $1 FOR UPDATE
   `, [sessionId])).rows[0];
-  if (!session || session.state !== 'ACTIVE' || !session.is_fresh) {
+  if (session?.state !== 'ACTIVE' || !session.is_fresh) {
     throw new QuestshopError('SESSION_EXPIRED', 'เซสชันหมดอายุ กรุณาเริ่มใหม่');
   }
   if (session.actor_id !== actorId || session.guild_id !== guildId) {
@@ -205,7 +205,7 @@ export async function buildQuote({ sessionId, actorId, guildId, channelId = null
     if (!items.length) throw new QuestshopError('NO_QUEST_SELECTED', 'กรุณาเลือก Quest อย่างน้อยหนึ่งรายการ');
     for (const item of items) {
       const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR SHARE', [item.quest_id])).rows[0];
-      if (!quest || quest.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
+      if (quest?.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
         throw new QuestshopError('QUEST_NOT_FOR_SALE', `Quest ${item.quest_name} ไม่เปิดขายแล้ว`);
       }
       const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
@@ -299,7 +299,7 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
       const quest = (await client.query(
         'SELECT * FROM quests WHERE quest_id = $1 FOR SHARE', [option.quest_id],
       )).rows[0];
-      if (!quest || quest.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
+      if (quest?.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
         throw new QuestshopError('QUEST_NOT_FOR_SALE', `Quest ${option.quest_name} ไม่เปิดขายแล้ว`);
       }
       const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });

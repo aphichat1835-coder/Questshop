@@ -33,7 +33,7 @@ export async function rotateMonitorCredential({ monitorId, token, env, reason },
     `monitor:${monitorId}:${context.guildId}`);
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const monitor = (await client.query('SELECT * FROM monitor_accounts WHERE id=$1 FOR UPDATE', [monitorId])).rows[0];
-    if (!monitor || String(profile.id) !== monitor.account_id) throw new TypeError('Monitor token account does not match');
+    if (String(profile.id) !== monitor?.account_id) throw new TypeError('Monitor token account does not match');
     const credential = (await client.query('SELECT key_version FROM monitor_credentials WHERE monitor_id=$1 FOR UPDATE',
       [monitorId])).rows[0];
     await client.query(`UPDATE monitor_credentials SET key_version=$2,nonce=$3,ciphertext=$4,auth_tag=$5,

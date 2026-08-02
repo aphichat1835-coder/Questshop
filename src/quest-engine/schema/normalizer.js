@@ -96,7 +96,7 @@ export function normalizeQuest(raw, options = {}) {
   const target = finite(task.definition?.target);
   const issues = [];
   if (!entries.length) issues.push(questCompatibilityIssue('TASK_DEFINITIONS_MISSING', 'Task definitions are missing'));
-  if (!(target > 0)) issues.push(questCompatibilityIssue('TASK_TARGET_INVALID', 'Task target is invalid'));
+  if (target <= 0) issues.push(questCompatibilityIssue('TASK_TARGET_INVALID', 'Task target is invalid'));
   if (((config.task_config_v2 ?? config.task_config)?.join_operator ?? 'or') === 'and' && entries.length > 1) {
     issues.push(questCompatibilityIssue('MULTI_TASK_AND', 'Multi-task AND is unsupported'));
   }

@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { secureJitter } from '../../shared/random.js';
 import { extractQuestArray, QuestCompatibilityError } from '../schema/compatibility.js';
 import { normalizeQuestPayload } from '../schema/normalizer.js';
 import { discordRateLimitCoordinator } from '../rate-limits/coordinator.js';
@@ -84,7 +85,7 @@ export function createQuestApiClient({ token, profile, coordinator = discordRate
         }
       }
       if (safeRead && response.status >= 500 && attempt + 1 < maxAttempts) {
-        await delay(Math.random() * Math.min(30_000, 500 * (2 ** attempt)), undefined, {
+        await delay(secureJitter(Math.min(30_000, 500 * (2 ** attempt))), undefined, {
           signal: options.signal, ref: false,
         });
         continue;

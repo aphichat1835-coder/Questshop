@@ -21,14 +21,18 @@ export function defineQuestExecutor(definition) {
   return Object.freeze(assertQuestExecutorContract({ ...definition }));
 }
 
+function normalizeValidation(validation) {
+  if (validation === true || validation == null) return { ok: true, issues: [] };
+  if (typeof validation === 'object') {
+    return { ok: validation.ok !== false, issues: validation.issues ?? [] };
+  }
+  return { ok: false, issues: [String(validation)] };
+}
+
 export async function executeQuestExecutor(executor, context) {
   assertQuestExecutorContract(executor);
   const validation = await executor.validate(context.quest, context);
-  const normalized = validation === true || validation == null
-    ? { ok: true, issues: [] }
-    : typeof validation === 'object'
-      ? { ok: validation.ok !== false, issues: validation.issues ?? [] }
-      : { ok: false, issues: [String(validation)] };
+  const normalized = normalizeValidation(validation);
   if (!normalized.ok) {
     const error = new Error(normalized.issues.join('; ') || 'executor validation failed');
     error.name = 'QuestExecutorValidationError';
@@ -38,4 +42,3 @@ export async function executeQuestExecutor(executor, context) {
   const executionResult = await executor.execute(context);
   return { executionResult, verified: Boolean(await executor.verify(context, executionResult)) };
 }
-

@@ -10,7 +10,7 @@ export function createLogger(bindings = {}) {
       censor: '[REDACTED]',
     },
   });
-  const wrap = (level) => (object = {}, message) => base[level](redact(object), message);
+  const wrap = (level) => (object, message) => base[level](redact(object ?? {}), message);
   return Object.freeze({
     debug: wrap('debug'), info: wrap('info'), warn: wrap('warn'), error: wrap('error'),
     child: (child) => createLogger({ ...bindings, ...child }),

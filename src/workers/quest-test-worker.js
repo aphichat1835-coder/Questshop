@@ -7,6 +7,7 @@ import { executeQuestExecutor } from '../quest-engine/executors/contract.js';
 import { createContext } from '../shared/correlation.js';
 import { FencingLostError } from '../shared/errors.js';
 import { ingestDiscovery } from '../domain/catalog/service.js';
+import { secureJitter } from '../shared/random.js';
 import { withTransaction } from '../db/transaction.js';
 import { RUNNER_VERSION_COMPATIBILITY } from '../config/versions.js';
 import { recordTransition } from '../domain/shared/transition.js';
@@ -149,7 +150,7 @@ export async function testQuest({ env, pool, signal, holder, runnerConcurrency =
       if (!applied()) {
         if (mutationError && mutationError.fatalAuth) throw mutationError;
         await setMutationState(pool, run, mutation, 'FAILED', { freshProgress: fresh.progressSecs });
-        await delay(Math.floor(Math.random() * 1000), undefined, { signal: testSignal, ref: false });
+        await delay(secureJitter(1000), undefined, { signal: testSignal, ref: false });
         mutation = await createTestMutation(pool, run, context,
           { kind, payload: { ...payload, controlledRetry: true }, baseline });
         mutation = await setMutationState(pool, run, mutation, 'IN_FLIGHT');

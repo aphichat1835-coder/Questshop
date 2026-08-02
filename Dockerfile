@@ -7,7 +7,7 @@ FROM postgres:16-bookworm AS pgtools
 
 FROM node:22.22.0-bookworm-slim
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates libpq5 liblz4-1 libzstd1 \
+  && apt-get install -y --no-install-recommends ca-certificates liblz4-1 libpq5 libzstd1 \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_dump /usr/local/bin/pg_dump
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_restore /usr/local/bin/pg_restore

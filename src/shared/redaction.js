@@ -1,9 +1,11 @@
 const SECRET_KEYS = /(?:token|authorization|cookie|password|secret|credential|session|database_url|api[_-]?key|ciphertext|auth_tag)/i;
-const DISCORD_TOKEN = /(?:mfa\.[\w-]{20,}|[\w-]{20,}\.[\w-]{6,}\.[\w-]{20,})/g;
+const MFA_DISCORD_TOKEN = /\bmfa\.[A-Za-z0-9_-]{20,}\b/g;
+const DISCORD_TOKEN = /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b/g;
 const DATABASE_URL = /postgres(?:ql)?:\/\/[^\s]+/gi;
 
 export function redactText(value) {
   return String(value)
+    .replace(MFA_DISCORD_TOKEN, '[REDACTED_DISCORD_TOKEN]')
     .replace(DISCORD_TOKEN, '[REDACTED_DISCORD_TOKEN]')
     .replace(DATABASE_URL, '[REDACTED_DATABASE_URL]');
 }

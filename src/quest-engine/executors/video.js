@@ -49,7 +49,7 @@ export const videoExecutor = defineQuestExecutor({
   validate(quest) {
     const issues = [];
     if (!quest?.id) issues.push('missing id');
-    if (!(Number(quest?.secondsNeeded) > 0)) issues.push('invalid target');
+    if (Number(quest?.secondsNeeded) <= 0) issues.push('invalid target');
     return { ok: issues.length === 0, issues };
   },
   estimateDuration(quest) {
@@ -59,4 +59,3 @@ export const videoExecutor = defineQuestExecutor({
   verify: (_context, result) => Boolean(result?.completed),
   describeUnsupportedReason: () => null,
 });
-

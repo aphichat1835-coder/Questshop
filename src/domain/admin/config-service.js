@@ -142,7 +142,7 @@ export async function updateRuntimeConfig({ patch, expectedVersion, reason }, co
     const before = (await client.query('SELECT * FROM config_versions ORDER BY version DESC LIMIT 1 FOR UPDATE')).rows[0] ?? null;
     const version = Number(before?.version ?? 0);
     if (version !== Number(expectedVersion)) throw new Error('STALE_CONFIG');
-    const payload = { ...(before?.payload ?? {}), ...patch };
+    const payload = { ...before?.payload, ...patch };
     const nextVersion = version + 1;
     const hash = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
     const row = (await client.query(`INSERT INTO config_versions(id,version,payload,payload_hash,

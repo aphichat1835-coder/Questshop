@@ -15,6 +15,7 @@ import { recordTransition } from '../shared/transition.js';
 import { captureReservation, releaseReservation } from '../wallet/service.js';
 import { progressBucket, RUNNER_JOB_TRANSITIONS } from './states.js';
 import { isRunnerVersionCompatible, RUNNER_VERSION_COMPATIBILITY } from '../../config/versions.js';
+import { secureJitter } from '../../shared/random.js';
 
 function assertJobTransition(current, next) {
   if (!(RUNNER_JOB_TRANSITIONS[current] ?? []).includes(next)) {
@@ -68,7 +69,7 @@ async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_
 function retryDelay(error) {
   const seconds = Number(error?.data?.retry_after ?? error?.retryAfter);
   const cap = Number.isFinite(seconds) ? Math.min(60_000, seconds * 1000) : 1000;
-  return Math.floor(Math.random() * Math.max(1, cap));
+  return secureJitter(cap);
 }
 
 function mutationApplied(kind, payload, baseline, fresh) {
@@ -261,7 +262,7 @@ async function executeMutation({ job, attempt, kind, payload, baseline, perform,
   }
   await markMutation(job, mutation.id, firstError ? 'UNCERTAIN' : 'FAILED',
     { notApplied: true, controlledRetryPending: true }, firstError?.code ?? 'NOT_APPLIED', options);
-  await delay(firstError ? retryDelay(firstError) : Math.floor(Math.random() * 1000), undefined, { ref: false });
+  await delay(firstError ? retryDelay(firstError) : secureJitter(1000), undefined, { ref: false });
   try {
     await perform();
     fresh = await fetchFresh();

@@ -54,7 +54,7 @@ CREATE TABLE surfaces (
   message_id text,
   renderer_version integer NOT NULL DEFAULT 1,
   expected_permissions jsonb NOT NULL DEFAULT '{}'::jsonb,
-  state text NOT NULL DEFAULT 'ACTIVE' CHECK (state IN ('ACTIVE', 'DRIFTED', 'RECONCILING', 'DISABLED')),
+  state text NOT NULL DEFAULT 'ACTIVE' CHECK (state IN ('ACTIVE', 'DRIFTED', 'RECONCILING', 'DISABLED')), -- NOSONAR: persisted state literals are the schema contract.
   state_version bigint NOT NULL DEFAULT 1,
   last_validated_at timestamptz,
   updated_at timestamptz NOT NULL DEFAULT transaction_timestamp()
@@ -67,7 +67,7 @@ CREATE TABLE interaction_sessions (
   channel_id text NOT NULL,
   message_id text,
   operation text NOT NULL,
-  state text NOT NULL DEFAULT 'ACTIVE' CHECK (state IN ('ACTIVE', 'CONFIRMED', 'EXPIRED', 'CANCELLED', 'TERMINAL')),
+  state text NOT NULL DEFAULT 'ACTIVE' CHECK (state IN ('ACTIVE', 'CONFIRMED', 'EXPIRED', 'CANCELLED', 'TERMINAL')), -- NOSONAR: persisted state literals are the schema contract.
   state_version bigint NOT NULL DEFAULT 1,
   config_version bigint NOT NULL,
   payload jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -258,9 +258,9 @@ CREATE TABLE topups (
   id uuid PRIMARY KEY,
   discord_user_id text NOT NULL,
   status text NOT NULL CHECK (status IN (
-    'RECEIVED', 'VALIDATING', 'PAYMENT_QUEUED', 'PROCESSING', 'REDEEMED',
-    'CREDITED', 'AMBIGUOUS', 'MANUAL_REVIEW', 'INVALID', 'EXPIRED',
-    'ALREADY_REDEEMED', 'RETRY_WAIT', 'FAILED', 'REJECTED', 'REVERSED'
+    'RECEIVED', 'VALIDATING', 'PAYMENT_QUEUED', 'PROCESSING', 'REDEEMED', -- NOSONAR: persisted payment-state contract.
+    'CREDITED', 'AMBIGUOUS', 'MANUAL_REVIEW', 'INVALID', 'EXPIRED', -- NOSONAR: persisted payment-state contract.
+    'ALREADY_REDEEMED', 'RETRY_WAIT', 'FAILED', 'REJECTED', 'REVERSED' -- NOSONAR: persisted payment-state contract.
   )),
   state_version bigint NOT NULL DEFAULT 1,
   voucher_hmac_version integer NOT NULL,
@@ -312,8 +312,8 @@ CREATE TABLE payment_attempts (
   attempt_number integer NOT NULL CHECK (attempt_number > 0),
   parent_attempt_id uuid REFERENCES payment_attempts(id),
   dispatch_state text NOT NULL CHECK (dispatch_state IN (
-    'INTENT_RECORDED', 'NOT_SENT', 'POSSIBLY_SENT', 'RESPONSE_RECEIVED',
-    'VERIFIED', 'FAILED', 'AMBIGUOUS'
+    'INTENT_RECORDED', 'NOT_SENT', 'POSSIBLY_SENT', 'RESPONSE_RECEIVED', -- NOSONAR: persisted payment-attempt contract.
+    'VERIFIED', 'FAILED', 'AMBIGUOUS' -- NOSONAR: persisted payment-attempt contract.
   )),
   provider_status_code text,
   provider_http_status integer,
@@ -367,7 +367,7 @@ CREATE TABLE quest_metadata_revisions (
   revision bigint NOT NULL,
   normalized jsonb NOT NULL,
   redacted_raw jsonb NOT NULL,
-  source text NOT NULL CHECK (source IN ('MONITOR', 'CUSTOMER_CHECKOUT', 'ADMIN')),
+  source text NOT NULL CHECK (source IN ('MONITOR', 'CUSTOMER_CHECKOUT', 'ADMIN')), -- NOSONAR: persisted source contract.
   core_complete boolean NOT NULL,
   schema_issues jsonb NOT NULL DEFAULT '[]'::jsonb,
   trace_id uuid NOT NULL,
@@ -377,7 +377,7 @@ CREATE TABLE quest_metadata_revisions (
 
 CREATE TABLE price_rules (
   id uuid PRIMARY KEY,
-  rule_type text NOT NULL CHECK (rule_type IN ('TEMPORARY', 'QUEST', 'TYPE', 'DEFAULT')),
+  rule_type text NOT NULL CHECK (rule_type IN ('TEMPORARY', 'QUEST', 'TYPE', 'DEFAULT')), -- NOSONAR: persisted rule-scope contract.
   quest_id text REFERENCES quests(quest_id),
   task_type text,
   amount_cents bigint NOT NULL CHECK (amount_cents > 0),
@@ -489,10 +489,10 @@ CREATE TABLE order_items (
   contract_version text NOT NULL,
   runner_state_schema_version integer NOT NULL,
   state text NOT NULL CHECK (state IN (
-    'SELECTED', 'RESERVED', 'QUEUED', 'LEASED', 'RUNNING', 'VERIFYING',
-    'WAITING_RATE_LIMIT', 'WAITING_RETRY', 'MANUAL_REVIEW', 'SETTLING',
-    'READY_TO_CLAIM', 'EXPIRED_RELEASED', 'EXTERNAL_COMPLETED_RELEASED',
-    'STOPPED_RELEASED', 'FAILED_RELEASED'
+    'SELECTED', 'RESERVED', 'QUEUED', 'LEASED', 'RUNNING', 'VERIFYING', -- NOSONAR: immutable order-item state contract.
+    'WAITING_RATE_LIMIT', 'WAITING_RETRY', 'MANUAL_REVIEW', 'SETTLING', -- NOSONAR: immutable order-item state contract.
+    'READY_TO_CLAIM', 'EXPIRED_RELEASED', 'EXTERNAL_COMPLETED_RELEASED', -- NOSONAR: immutable order-item state contract.
+    'STOPPED_RELEASED', 'FAILED_RELEASED' -- NOSONAR: immutable order-item state contract.
   )),
   state_version bigint NOT NULL DEFAULT 1,
   progress_actual numeric(7,3) NOT NULL DEFAULT 0 CHECK (progress_actual >= 0 AND progress_actual <= 100),
@@ -649,7 +649,7 @@ CREATE TABLE delivery_attempts (
   id uuid PRIMARY KEY,
   outbox_id uuid NOT NULL REFERENCES outbox_events(id),
   attempt_number integer NOT NULL,
-  outcome text NOT NULL CHECK (outcome IN ('DELIVERED', 'RETRY', 'UNKNOWN', 'FAILED')),
+  outcome text NOT NULL CHECK (outcome IN ('DELIVERED', 'RETRY', 'UNKNOWN', 'FAILED')), -- NOSONAR: persisted delivery contract.
   discord_status integer,
   error_code text,
   evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -661,8 +661,8 @@ CREATE TABLE dead_letter_items (
   id uuid PRIMARY KEY,
   source_type text NOT NULL,
   source_id text NOT NULL,
-  category text NOT NULL CHECK (category IN ('FINANCIAL', 'AUDIT', 'NOTIFICATION', 'RUNNER', 'SYSTEM')),
-  state text NOT NULL CHECK (state IN ('DEAD_LETTER', 'PENDING', 'RESOLVED', 'DISCARDED')),
+  category text NOT NULL CHECK (category IN ('FINANCIAL', 'AUDIT', 'NOTIFICATION', 'RUNNER', 'SYSTEM')), -- NOSONAR: persisted DLQ-category contract.
+  state text NOT NULL CHECK (state IN ('DEAD_LETTER', 'PENDING', 'RESOLVED', 'DISCARDED')), -- NOSONAR: persisted DLQ-state contract.
   error_code text NOT NULL,
   evidence jsonb NOT NULL DEFAULT '{}'::jsonb,
   parent_trace_id uuid NOT NULL,

@@ -154,7 +154,7 @@ const ORDER_RELEASE_DECISIONS = Object.freeze({
 async function applyTopupDecision(client, review, decision, input, context) {
   const topup = (await client.query('SELECT * FROM topups WHERE id=$1 FOR UPDATE',
     [review.subject_id])).rows[0];
-  if (!topup || topup.status !== 'MANUAL_REVIEW') throw new StaleStateError('topup', review.subject_id);
+  if (topup?.status !== 'MANUAL_REVIEW') throw new StaleStateError('topup', review.subject_id);
   if (decision === 'REJECT') {
     const updated = (await client.query(`UPDATE topups SET status='REJECTED',state_version=state_version+1,
       failure_code=$2,updated_at=transaction_timestamp() WHERE id=$1 AND status='MANUAL_REVIEW' RETURNING *`,
@@ -189,7 +189,7 @@ async function applyOrderItemDecision(client, review, decision, input, context) 
   const item = (await client.query(`SELECT i.*,q.url AS quest_url FROM order_items i
     JOIN quests q ON q.quest_id=i.quest_id WHERE i.id=$1 FOR UPDATE OF i`,
   [review.subject_id])).rows[0];
-  if (!item || item.state !== 'MANUAL_REVIEW') throw new StaleStateError('order_item', review.subject_id);
+  if (item?.state !== 'MANUAL_REVIEW') throw new StaleStateError('order_item', review.subject_id);
   if (decision === 'RETRY') {
     const updated = (await client.query(`UPDATE order_items SET state='QUEUED',state_version=state_version+1,
       updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' RETURNING *`,

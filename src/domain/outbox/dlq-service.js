@@ -7,7 +7,7 @@ export async function replayDeadLetter({ dlqId, reason }, context, options = {})
   if (!reason?.trim()) throw new TypeError('DLQ replay reason is required');
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const dlq = (await client.query('SELECT * FROM dead_letter_items WHERE id=$1 FOR UPDATE', [dlqId])).rows[0];
-    if (!dlq || dlq.state !== 'DEAD_LETTER') throw new QuestshopError('DLQ_NOT_REPLAYABLE', 'DLQ ไม่อยู่ในสถานะที่ Replay ได้');
+    if (dlq?.state !== 'DEAD_LETTER') throw new QuestshopError('DLQ_NOT_REPLAYABLE', 'DLQ ไม่อยู่ในสถานะที่ Replay ได้');
     if (dlq.source_type !== 'OUTBOX') throw new QuestshopError('DLQ_REPLAY_UNSUPPORTED', 'DLQ ประเภทนี้ต้องใช้ Runbook เฉพาะ');
     const source = (await client.query('SELECT * FROM outbox_events WHERE id=$1 FOR UPDATE', [dlq.source_id])).rows[0];
     if (!source) throw new QuestshopError('DLQ_SOURCE_MISSING', 'ไม่พบ Outbox ต้นทาง');
@@ -31,7 +31,7 @@ export async function discardDeadLetter({ dlqId, reason, isOwner }, context, opt
   if (!reason?.trim()) throw new TypeError('DLQ discard reason is required');
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const dlq = (await client.query('SELECT * FROM dead_letter_items WHERE id=$1 FOR UPDATE', [dlqId])).rows[0];
-    if (!dlq || dlq.state !== 'DEAD_LETTER') throw new QuestshopError('DLQ_NOT_DISCARDABLE', 'DLQ ไม่อยู่ในสถานะที่ Discard ได้');
+    if (dlq?.state !== 'DEAD_LETTER') throw new QuestshopError('DLQ_NOT_DISCARDABLE', 'DLQ ไม่อยู่ในสถานะที่ Discard ได้');
     if (['FINANCIAL', 'AUDIT'].includes(dlq.category)) {
       throw new QuestshopError('DLQ_DISCARD_FORBIDDEN', 'Financial/Audit DLQ ห้าม Discard');
     }
@@ -42,4 +42,3 @@ export async function discardDeadLetter({ dlqId, reason, isOwner }, context, opt
     return updated;
   });
 }
-

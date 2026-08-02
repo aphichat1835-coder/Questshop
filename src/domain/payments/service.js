@@ -18,6 +18,12 @@ async function findVoucher(client, hashes) {
   return null;
 }
 
+function paymentAttemptState(outcome) {
+  if (outcome === 'REDEEMED') return 'VERIFIED';
+  if (outcome === 'AMBIGUOUS') return 'AMBIGUOUS';
+  return 'FAILED';
+}
+
 export async function submitVoucher({ discordUserId, voucherUrl, env }, context, options = {}) {
   const normalized = normalizeVoucherUrl(voucherUrl);
   const hashes = allVoucherHmacs(normalized.code, env.VOUCHER_HMAC_KEYS_JSON);
@@ -160,7 +166,7 @@ export async function recordProviderResult({ topup, attemptId, result }, context
         provider_http_status = $4, provider_evidence = $5,
         completed_at = clock_timestamp() WHERE id = $1
     `, [
-      attemptId, next === 'REDEEMED' ? 'VERIFIED' : next === 'AMBIGUOUS' ? 'AMBIGUOUS' : 'FAILED',
+      attemptId, paymentAttemptState(next),
       result.providerCode ?? null, result.httpStatus ?? null,
       { receiverConfirmation: result.receiverConfirmation ?? null },
     ]);

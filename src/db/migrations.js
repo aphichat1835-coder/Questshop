@@ -15,7 +15,7 @@ function quoteIdentifier(value) {
   return `"${String(value).replaceAll('"', '""')}"`;
 }
 
-export async function listMigrations(directory = path.join(root, 'migrations')) {
+export const listMigrations = async (directory = path.join(root, 'migrations')) => {
   const names = (await readdir(directory))
     .filter((name) => /^\d{4}_.+\.sql$/.test(name))
     .sort();
@@ -23,9 +23,9 @@ export async function listMigrations(directory = path.join(root, 'migrations')) 
     const sql = await readFile(path.join(directory, name), 'utf8');
     return { version: Number(name.slice(0, 4)), name, sql, checksum: checksum(sql) };
   }));
-}
+};
 
-export async function runMigrations({ pool = getDirectPool(), gitSha = 'unknown', runtimeRole = null } = {}) {
+export const runMigrations = async ({ pool = getDirectPool(), gitSha = 'unknown', runtimeRole = null } = {}) => {
   const client = await pool.connect();
   try {
     await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
@@ -83,4 +83,4 @@ export async function runMigrations({ pool = getDirectPool(), gitSha = 'unknown'
       client.release();
     }
   }
-}
+};

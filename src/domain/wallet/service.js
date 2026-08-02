@@ -7,8 +7,8 @@ import { assertTransition, recordTransition, requireUpdated } from '../shared/tr
 import {
   ORDER_ITEM_TRANSITIONS,
   RELEASED_STATES,
-  TERMINAL_ITEM_STATES,
 } from '../orders/states.js';
+export { TERMINAL_ITEM_STATES } from '../orders/states.js';
 import { appendLedger } from './ledger.js';
 import { resolvePromotionBonus } from '../promotions/resolver.js';
 import { bangkokDayBounds } from '../../db/postgres-time.js';
@@ -68,7 +68,7 @@ async function finalizeOrderIfTerminal(client, orderId, context) {
     'SELECT * FROM order_aggregates WHERE order_id = $1',
     [orderId],
   )).rows[0];
-  if (!aggregate || Number(aggregate.active_items) !== 0) return aggregate;
+  if (!aggregate || Number(aggregate.active_items) !== 0) return;
   await client.query(`
     UPDATE orders SET completed_at = COALESCE(completed_at, transaction_timestamp()) WHERE id = $1
   `, [orderId]);
@@ -77,7 +77,6 @@ async function finalizeOrderIfTerminal(client, orderId, context) {
   const order = (await client.query('SELECT discord_user_id FROM orders WHERE id=$1', [orderId])).rows[0];
   if (order) await enqueueProjection(client, { projectionType: 'ORDER_DM', aggregateType: 'ORDER',
     aggregateId: orderId, aggregateVersion: 1, surfaceKey: `DM:${order.discord_user_id}`, context });
-  return aggregate;
 }
 
 export async function reserveOrderItemsInTransaction(client, { discordUserId, items }, context) {
@@ -201,19 +200,19 @@ export async function captureReservation(input, context, options = {}) {
 export async function releaseReservationInTransaction(client, { orderItemId, terminalState, reason,
   runnerOwnership = null }, context) {
   if (!RELEASED_STATES.includes(terminalState)) throw new TypeError('invalid released terminal state');
-    if (runnerOwnership) {
+  if (runnerOwnership) {
       const owned = (await client.query(`SELECT 1 FROM runner_jobs WHERE id=$1 AND order_item_id=$2
         AND lease_owner=$3 AND fencing_token=$4 AND lease_expires_at>clock_timestamp()`,
       [runnerOwnership.jobId, orderItemId, runnerOwnership.leaseOwner, runnerOwnership.fencingToken])).rowCount;
       if (!owned) throw new FencingLostError(`runner:${runnerOwnership.jobId}`);
-    }
-    const reservation = (await client.query(`
+  }
+  const reservation = (await client.query(`
       SELECT r.*, i.order_id, i.task_type, i.started_at,
         i.state AS item_state, i.state_version AS item_version
       FROM wallet_reservations r JOIN order_items i ON i.id = r.order_item_id
       WHERE r.order_item_id = $1 FOR UPDATE OF r, i
     `, [orderItemId])).rows[0];
-    if (!reservation) throw new QuestshopError('RESERVATION_NOT_FOUND', 'ไม่พบยอดจอง');
+  if (!reservation) throw new QuestshopError('RESERVATION_NOT_FOUND', 'ไม่พบยอดจอง');
     if (reservation.state === 'RELEASED') return reservation;
     if (reservation.state !== 'RESERVED') throw new QuestshopError('RESERVATION_CAPTURED', 'ยอดจองถูกคิดค่าบริการแล้ว');
     assertTransition(ORDER_ITEM_TRANSITIONS, reservation.item_state, terminalState);
@@ -335,11 +334,11 @@ export async function refundCapturedOrderItem(input, context, options = {}) {
 export async function adjustBalanceInTransaction(client, { discordUserId, amountCents, reason }, context) {
   const amount = BigInt(amountCents);
   if (amount === 0n || !reason?.trim()) throw new TypeError('non-zero amount and reason are required');
-    const existing = (await client.query('SELECT discord_user_id FROM wallet_transactions WHERE idempotency_key=$1',
+  const existing = (await client.query('SELECT discord_user_id FROM wallet_transactions WHERE idempotency_key=$1',
       [context.idempotencyKey])).rows[0];
-    if (existing) return (await client.query('SELECT * FROM wallets WHERE discord_user_id=$1',
+  if (existing) return (await client.query('SELECT * FROM wallets WHERE discord_user_id=$1',
       [existing.discord_user_id])).rows[0];
-    const wallet = await lockWallet(client, discordUserId);
+  const wallet = await lockWallet(client, discordUserId);
     const balances = walletBalances(wallet, amount, 0n);
     const updated = await updateWallet(client, wallet, balances);
     await appendLedger(client, {
@@ -514,5 +513,3 @@ export async function reverseTopup({ topupId, reason }, context, options = {}) {
     return updated;
   });
 }
-
-export { TERMINAL_ITEM_STATES };

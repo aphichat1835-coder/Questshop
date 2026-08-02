@@ -7,6 +7,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { createS3Client } from './client.js';
 
 const MAGIC = Buffer.from('QSBK1');
+const PG_DUMP = '/usr/local/bin/pg_dump';
 
 function currentKey(keyring) {
   return { version: keyring.current, key: Buffer.from(keyring.keys[String(keyring.current)], 'base64') };
@@ -40,7 +41,7 @@ export async function createEncryptedBackup({ env, schemaVersion, reason = 'sche
   const cipher = createCipheriv('aes-256-gcm', key, nonce);
   cipher.setAAD(header);
   const connection = dumpConnection(env.DATABASE_BACKUP_URL);
-  const child = spawn('pg_dump', ['--format=custom', '--no-owner', '--no-acl', `--dbname=${connection.url}`], {
+  const child = spawn(PG_DUMP, ['--format=custom', '--no-owner', '--no-acl', `--dbname=${connection.url}`], {
     env: { ...process.env, PGPASSWORD: connection.password }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   const stderr = { value: '' };

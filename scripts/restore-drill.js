@@ -8,6 +8,7 @@ import { getRuntimePool, closePools } from '../src/db/pools.js';
 import { decryptSecret } from '../src/adapters/crypto/keyring.js';
 
 const { Pool } = pg;
+const PG_RESTORE = '/usr/local/bin/pg_restore';
 const env = loadEnvironment();
 const source = getRuntimePool(env);
 const backup = (await source.query("SELECT * FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1")).rows[0];
@@ -26,7 +27,7 @@ try {
   const restored = await downloadAndDecryptBackup({ env, objectKey: backup.object_key,
     expectedChecksum: backup.checksum });
   const targetUrl = new URL(direct); targetUrl.pathname = `/${databaseName}`;
-  const child = spawn('pg_restore', ['--no-owner', '--no-acl', `--dbname=${targetUrl}`], {
+  const child = spawn(PG_RESTORE, ['--no-owner', '--no-acl', `--dbname=${targetUrl}`], {
     env: { ...process.env, PGPASSWORD: password }, stdio: ['pipe', 'ignore', 'pipe'],
   });
   let stderr = '';

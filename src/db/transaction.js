@@ -1,11 +1,23 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { getRuntimePool } from './pools.js';
+import { secureJitter } from '../shared/random.js';
 
 const RETRYABLE_SQLSTATES = new Set(['40001', '40P01']);
 const ISOLATION_LEVELS = new Set(['READ COMMITTED', 'REPEATABLE READ', 'SERIALIZABLE']);
 
 function fullJitter(attempt, capMs = 1000, baseMs = 25) {
-  return Math.floor(Math.random() * Math.min(capMs, baseMs * (2 ** attempt)));
+  return secureJitter(Math.min(capMs, baseMs * (2 ** attempt)));
+}
+
+async function rollbackOrRelease(client, error) {
+  try {
+    await client.query('ROLLBACK');
+    return false;
+  } catch {
+    client.release(true);
+    if (!isRetryableTransactionError(error)) throw error;
+    return true;
+  }
 }
 
 export function isRetryableTransactionError(error) {
@@ -37,14 +49,8 @@ export async function withTransaction({
       return result;
     } catch (error) {
       lastError = error;
-      try {
-        await client.query('ROLLBACK');
-      } catch {
-        client.release(true);
-        destroyed = true;
-        if (!isRetryableTransactionError(error)) throw error;
-        continue;
-      }
+      destroyed = await rollbackOrRelease(client, error);
+      if (destroyed) continue;
       if (!isRetryableTransactionError(error) || attempt + 1 >= maxAttempts) throw error;
     } finally {
       if (!destroyed) client.release();

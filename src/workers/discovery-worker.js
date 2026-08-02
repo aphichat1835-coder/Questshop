@@ -24,7 +24,9 @@ export async function scanMonitor({ env, pool, signal, holder, runnerConcurrency
       updated_at=clock_timestamp() WHERE id=$1`, [monitor.id]);
   } catch (error) {
     const failures = Number(monitor.consecutive_failures) + 1;
-    const state = error.fatalAuth || failures >= 5 ? 'QUARANTINED' : failures >= 3 ? 'COOLDOWN' : 'ACTIVE';
+    let state = 'ACTIVE';
+    if (error.fatalAuth || failures >= 5) state = 'QUARANTINED';
+    else if (failures >= 3) state = 'COOLDOWN';
     await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
       cooldown_until=CASE WHEN $2='COOLDOWN' THEN clock_timestamp()+interval '15 minutes' ELSE cooldown_until END,
       updated_at=clock_timestamp() WHERE id=$1`, [monitor.id, state, failures]);
