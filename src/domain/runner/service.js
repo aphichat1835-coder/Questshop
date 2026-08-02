@@ -269,7 +269,7 @@ async function verifyMutationResult(job, mutation, kind, payload, baseline, fetc
   }
 }
 
-async function controlledRetry(job, mutation, perform, fetchFresh, kind, payload, baseline, options) {
+async function controlledRetry({ job, mutation, perform, fetchFresh, kind, payload, baseline, options }) {
   try {
     await perform();
     const fresh = await fetchFresh();
@@ -290,7 +290,7 @@ async function executeMutation({ job, attempt, kind, payload, baseline, perform,
   await markMutation(job, mutation.id, firstError ? 'UNCERTAIN' : 'FAILED',
     { notApplied: true, controlledRetryPending: true }, firstError?.code ?? 'NOT_APPLIED', options);
   await delay(firstError ? retryDelay(firstError) : secureJitter(1000), undefined, { ref: false });
-  const retried = await controlledRetry(job, mutation, perform, fetchFresh, kind, payload, baseline, options);
+  const retried = await controlledRetry({ job, mutation, perform, fetchFresh, kind, payload, baseline, options });
   if (retried) return retried;
   throw new QuestshopError('MUTATION_AMBIGUOUS', 'Mutation ยังไม่ชัดเจนหลัง Controlled retry', {
     category: 'AMBIGUOUS',
@@ -429,161 +429,170 @@ export async function materializeNextOrderItem({ orderId }, context, options = {
   });
 }
 
-export async function processRunnerJob(job, { env, signal, options = {} }) {
-  const context = createContext({
+function runnerContext(job, env) {
+  return createContext({
     traceId: job.trace_id,
     actorType: 'SYSTEM', actorId: String(job.lease_owner),
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `runner:${job.id}:${job.attempt_count}`,
   });
-  const attempt = await createAttempt(job, context, options);
-  let runningJob = job;
-  let order;
-  try {
-    if (!isRunnerVersionCompatible(job)) {
-      throw new QuestshopError('RUNNER_VERSION_INCOMPATIBLE', 'Worker รุ่นนี้ไม่รองรับ Job version ที่ถูก Pin');
-    }
-    const data = await withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {
-      order = (await client.query(`
-        SELECT o.*, i.quest_id, i.state AS item_state, i.deadline_at,
-          q.*, c.key_version, c.nonce, c.ciphertext, c.auth_tag
-        FROM runner_jobs j
-        JOIN order_items i ON i.id = j.order_item_id
-        JOIN orders o ON o.id = i.order_id
-        JOIN quests q ON q.quest_id = i.quest_id
-        JOIN order_credentials c ON c.order_id = o.id
-        WHERE j.id = $1
-      `, [job.id])).rows[0];
-      return order;
-    });
-    const token = decryptSecret({
-      keyVersion: data.key_version, nonce: data.nonce,
-      ciphertext: data.ciphertext, authTag: data.auth_tag,
-    }, env.DATA_ENCRYPTION_KEYS_JSON, `order:${data.id}:${env.DISCORD_GUILD_ID}`);
-    const api = createQuestApiClient({ token, profile: profileFromEnv(env) });
-    const [profile, quests] = await Promise.all([api.fetchCurrentUser(signal), api.fetchQuests(signal)]);
-    if (String(profile.id) !== data.account_id) throw new QuestshopError('RUNNER_ACCOUNT_MISMATCH', 'Token account changed');
-    let quest = quests.find((item) => item.id === data.quest_id);
-    if (!quest) throw new QuestshopError('QUEST_MISSING', 'Quest disappeared from account');
-    if (quest.completed) {
-      await releaseReservation({
-        orderItemId: job.order_item_id,
-        terminalState: 'EXTERNAL_COMPLETED_RELEASED',
-        reason: 'EXTERNAL_COMPLETED_BEFORE_START',
-        runnerOwnership: { jobId: job.id, leaseOwner: job.lease_owner, fencingToken: job.fencing_token },
-      }, context, options);
-      await failJob(job, context, options);
-      await materializeNextOrderItem({ orderId: data.id }, context, options);
-      return { outcome: 'EXTERNAL_COMPLETED_RELEASED' };
-    }
-    const admission = await withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, (client) => (
-      evaluateExpiryAdmission(client, {
-        quest: { ...data, progress_actual: quest.progress },
-        runnerConcurrency: env.RUNNER_CONCURRENCY,
-      })
-    ));
-    if (!admission.eligible) {
-      await releaseReservation({
-        orderItemId: job.order_item_id,
-        terminalState: 'EXPIRED_RELEASED', reason: admission.reason,
-        runnerOwnership: { jobId: job.id, leaseOwner: job.lease_owner, fencingToken: job.fencing_token },
-      }, context, options);
-      await failJob(job, context, options);
-      await materializeNextOrderItem({ orderId: data.id }, context, options);
-      return { outcome: 'EXPIRED_RELEASED' };
-    }
-    const executor = selectQuestExecutor(quest);
-    if (!executor.supportsAutomaticProgress || executor.id !== data.executor_id) {
-      throw new QuestshopError('EXECUTOR_INCOMPATIBLE', 'Quest executor contract changed');
-    }
-    runningJob = await transitionRunning(runningJob, context, options);
-    const fetchFreshQuest = async () => {
-      const fresh = (await api.fetchQuests(signal)).find((item) => item.id === quest.id);
-      if (!fresh) throw new QuestshopError('QUEST_MISSING', 'Quest disappeared during execution');
-      return fresh;
-    };
-    const mutate = async (kind, payload, perform) => {
-      const fresh = await executeMutation({
-        job: runningJob, attempt, kind, payload,
-        baseline: quest.progressSecs, perform, fetchFresh: fetchFreshQuest,
-        context, options,
-      });
-      quest = fresh;
-      return fresh;
-    };
-    if (!quest.enrolled) {
-      quest = await mutate('ENROLL', { location: 11 }, () => api.enroll(quest.id, signal));
-      if (!quest.enrolled) throw new QuestshopError('ENROLL_NOT_VERIFIED', 'Discord did not confirm enrollment');
-    }
-    const execution = await executeQuestExecutor(executor, {
-      quest, api, signal, mutate,
-      fetchFreshQuest,
-      onServerProgress: (fresh) => updateItemProgress(runningJob, fresh, context, options),
-      sleep: (ms, abortSignal) => delay(ms, undefined, { signal: abortSignal, ref: false }),
-      now: () => Date.now(),
-    });
-    quest = execution.executionResult;
-    await updateItemProgress(runningJob, quest, context, options);
-    const verified = await fetchFreshQuest();
-    if (!execution.verified || !verified.completed || !verified.completedAt) {
-      throw new QuestshopError('COMPLETION_NOT_VERIFIED', 'Discord did not confirm completed_at');
-    }
-    runningJob = await transitionToSettling(runningJob, context, options);
-    await captureReservation({ orderItemId: job.order_item_id, claimUrl: verified.url,
-      runnerOwnership: { jobId: runningJob.id, leaseOwner: runningJob.lease_owner,
-        fencingToken: runningJob.fencing_token } }, context, options);
-    await completeJob(runningJob, context, options);
+}
+
+async function loadRunnerData(job, options) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => (
+    (await client.query(`
+      SELECT o.*, i.quest_id, i.state AS item_state, i.deadline_at,
+        q.*, c.key_version, c.nonce, c.ciphertext, c.auth_tag
+      FROM runner_jobs j
+      JOIN order_items i ON i.id = j.order_item_id
+      JOIN orders o ON o.id = i.order_id
+      JOIN quests q ON q.quest_id = i.quest_id
+      JOIN order_credentials c ON c.order_id = o.id
+      WHERE j.id = $1
+    `, [job.id])).rows[0]
+  ));
+}
+
+async function prepareRunnerExecution(job, env, signal, options) {
+  if (!isRunnerVersionCompatible(job)) {
+    throw new QuestshopError('RUNNER_VERSION_INCOMPATIBLE', 'Worker รุ่นนี้ไม่รองรับ Job version ที่ถูก Pin');
+  }
+  const data = await loadRunnerData(job, options);
+  const token = decryptSecret({ keyVersion: data.key_version, nonce: data.nonce,
+    ciphertext: data.ciphertext, authTag: data.auth_tag }, env.DATA_ENCRYPTION_KEYS_JSON,
+  `order:${data.id}:${env.DISCORD_GUILD_ID}`);
+  const api = createQuestApiClient({ token, profile: profileFromEnv(env) });
+  const [profile, quests] = await Promise.all([api.fetchCurrentUser(signal), api.fetchQuests(signal)]);
+  if (String(profile.id) !== data.account_id) throw new QuestshopError('RUNNER_ACCOUNT_MISMATCH', 'Token account changed');
+  const quest = quests.find((item) => item.id === data.quest_id);
+  if (!quest) throw new QuestshopError('QUEST_MISSING', 'Quest disappeared from account');
+  return { data, api, quest };
+}
+
+function runnerOwnership(job) {
+  return { jobId: job.id, leaseOwner: job.lease_owner, fencingToken: job.fencing_token };
+}
+
+async function releaseBeforeExecution({ job, data, quest, env, context, options }) {
+  if (quest.completed) {
+    await releaseReservation({ orderItemId: job.order_item_id, terminalState: 'EXTERNAL_COMPLETED_RELEASED',
+      reason: 'EXTERNAL_COMPLETED_BEFORE_START', runnerOwnership: runnerOwnership(job) }, context, options);
+    await failJob(job, context, options);
     await materializeNextOrderItem({ orderId: data.id }, context, options);
-    return { outcome: 'READY_TO_CLAIM', quest: verified };
+    return { outcome: 'EXTERNAL_COMPLETED_RELEASED' };
+  }
+  const admission = await withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, (client) => (
+    evaluateExpiryAdmission(client, { quest: { ...data, progress_actual: quest.progress },
+      runnerConcurrency: env.RUNNER_CONCURRENCY })
+  ));
+  if (admission.eligible) return null;
+  await releaseReservation({ orderItemId: job.order_item_id, terminalState: 'EXPIRED_RELEASED',
+    reason: admission.reason, runnerOwnership: runnerOwnership(job) }, context, options);
+  await failJob(job, context, options);
+  await materializeNextOrderItem({ orderId: data.id }, context, options);
+  return { outcome: 'EXPIRED_RELEASED' };
+}
+
+async function executeAndSettleRunner({ state, attempt, data, api, quest: initialQuest, signal, context, options }) {
+  const executor = selectQuestExecutor(initialQuest);
+  if (!executor.supportsAutomaticProgress || executor.id !== data.executor_id) {
+    throw new QuestshopError('EXECUTOR_INCOMPATIBLE', 'Quest executor contract changed');
+  }
+  state.runningJob = await transitionRunning(state.runningJob, context, options);
+  let quest = initialQuest;
+  const fetchFreshQuest = async () => {
+    const fresh = (await api.fetchQuests(signal)).find((item) => item.id === quest.id);
+    if (!fresh) throw new QuestshopError('QUEST_MISSING', 'Quest disappeared during execution');
+    return fresh;
+  };
+  const mutate = async (kind, payload, perform) => {
+    const fresh = await executeMutation({ job: state.runningJob, attempt, kind, payload,
+      baseline: quest.progressSecs, perform, fetchFresh: fetchFreshQuest, context, options });
+    quest = fresh;
+    return fresh;
+  };
+  if (!quest.enrolled) {
+    quest = await mutate('ENROLL', { location: 11 }, () => api.enroll(quest.id, signal));
+    if (!quest.enrolled) throw new QuestshopError('ENROLL_NOT_VERIFIED', 'Discord did not confirm enrollment');
+  }
+  const execution = await executeQuestExecutor(executor, {
+    quest, api, signal, mutate, fetchFreshQuest,
+    onServerProgress: (fresh) => updateItemProgress(state.runningJob, fresh, context, options),
+    sleep: (ms, abortSignal) => delay(ms, undefined, { signal: abortSignal, ref: false }),
+    now: () => Date.now(),
+  });
+  await updateItemProgress(state.runningJob, execution.executionResult, context, options);
+  const verified = await fetchFreshQuest();
+  if (!execution.verified || !verified.completed || !verified.completedAt) {
+    throw new QuestshopError('COMPLETION_NOT_VERIFIED', 'Discord did not confirm completed_at');
+  }
+  state.runningJob = await transitionToSettling(state.runningJob, context, options);
+  await captureReservation({ orderItemId: state.runningJob.order_item_id, claimUrl: verified.url,
+    runnerOwnership: runnerOwnership(state.runningJob) }, context, options);
+  await completeJob(state.runningJob, context, options);
+  await materializeNextOrderItem({ orderId: data.id }, context, options);
+  return { outcome: 'READY_TO_CLAIM', quest: verified };
+}
+
+async function moveRunnerToManualReview(job, context, options, error, contractFailure) {
+  await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const current = (await client.query('SELECT * FROM runner_jobs WHERE id = $1 FOR UPDATE', [job.id])).rows[0];
+    if (!current || ['COMPLETED', 'FAILED', 'MANUAL_REVIEW'].includes(current.state)) return;
+    await client.query(`UPDATE runner_jobs SET state = 'MANUAL_REVIEW', state_version = state_version + 1,
+      lease_owner = NULL, lease_expires_at = NULL, updated_at = clock_timestamp() WHERE id = $1`, [job.id]);
+    await client.query(`UPDATE order_items SET state = 'MANUAL_REVIEW', state_version = state_version + 1,
+      updated_at = clock_timestamp() WHERE id = $1`, [job.order_item_id]);
+    await openReview(client, { subjectType: 'ORDER_ITEM', subjectId: job.order_item_id,
+      reason: error.code, financial: true, ownerOnly: false, context });
+    if (!contractFailure) return;
+    await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
+      updated_at=clock_timestamp() WHERE quest_id=(SELECT quest_id FROM order_items WHERE id=$1)
+      AND sale_state='OPEN'`, [job.order_item_id]);
+    await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
+      VALUES(gen_random_uuid(),'QUEST_CONTRACT_FAILURE',$1,'OPEN','CRITICAL',$2,$3)`,
+    [job.order_item_id, { errorCode: error.code }, context.traceId]);
+  });
+}
+
+function needsManualReview(error) {
+  const ambiguous = error.code === 'MUTATION_AMBIGUOUS' || error.category === 'AMBIGUOUS';
+  const contractFailure = error.name === 'QuestCompatibilityError'
+    || ['EXECUTOR_INCOMPATIBLE', 'QUEST_PAYLOAD_NOT_ARRAY', 'QUEST_ENTRY_INVALID'].includes(error.code);
+  return { manualReview: ambiguous || contractFailure, contractFailure };
+}
+
+async function resolveRunnerFailure({ state, job, context, options, error }) {
+  if (error instanceof FencingLostError) throw error;
+  if (error?.name === 'AbortError' && error.code !== 'MUTATION_AMBIGUOUS') {
+    await checkpointRetryJob(state.runningJob, context, options);
+    return { outcome: 'CHECKPOINTED_FOR_RESTART', error };
+  }
+  if (isRunnerTransient(error) && Number(state.runningJob.attempt_count) < 3) {
+    await checkpointRetryJob(state.runningJob, context, options, 'TRANSIENT_RETRY');
+    return { outcome: 'WAITING_RETRY', error };
+  }
+  const review = needsManualReview(error);
+  if (review.manualReview) {
+    await moveRunnerToManualReview(job, context, options, error, review.contractFailure);
+    return { outcome: 'MANUAL_REVIEW', error };
+  }
+  await releaseReservation({ orderItemId: job.order_item_id, terminalState: 'FAILED_RELEASED',
+    reason: error.code ?? error.name, runnerOwnership: runnerOwnership(state.runningJob) }, context, options);
+  await failJob(state.runningJob, context, options);
+  if (state.order?.id) await materializeNextOrderItem({ orderId: state.order.id }, context, options);
+  return { outcome: 'FAILED_RELEASED', error };
+}
+
+export async function processRunnerJob(job, { env, signal, options = {} }) {
+  const context = runnerContext(job, env);
+  const attempt = await createAttempt(job, context, options);
+  const state = { runningJob: job, order: null };
+  try {
+    const prepared = await prepareRunnerExecution(job, env, signal, options);
+    state.order = prepared.data;
+    const released = await releaseBeforeExecution({ job, ...prepared, env, context, options });
+    if (released) return released;
+    return executeAndSettleRunner({ state, attempt, ...prepared, signal, context, options });
   } catch (error) {
-    if (error instanceof FencingLostError) throw error;
-    if (error?.name === 'AbortError' && !['MUTATION_AMBIGUOUS'].includes(error.code)) {
-      await checkpointRetryJob(runningJob, context, options);
-      return { outcome: 'CHECKPOINTED_FOR_RESTART', error };
-    }
-    if (isRunnerTransient(error) && Number(runningJob.attempt_count) < 3) {
-      await checkpointRetryJob(runningJob, context, options, 'TRANSIENT_RETRY');
-      return { outcome: 'WAITING_RETRY', error };
-    }
-    const ambiguous = error.code === 'MUTATION_AMBIGUOUS' || error.category === 'AMBIGUOUS';
-    const contractFailure = error.name === 'QuestCompatibilityError'
-      || ['EXECUTOR_INCOMPATIBLE','QUEST_PAYLOAD_NOT_ARRAY','QUEST_ENTRY_INVALID'].includes(error.code);
-    if (ambiguous || contractFailure) {
-      await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-        const current = (await client.query('SELECT * FROM runner_jobs WHERE id = $1 FOR UPDATE', [job.id])).rows[0];
-        if (current && !['COMPLETED', 'FAILED', 'MANUAL_REVIEW'].includes(current.state)) {
-          await client.query(`
-            UPDATE runner_jobs SET state = 'MANUAL_REVIEW', state_version = state_version + 1,
-              lease_owner = NULL, lease_expires_at = NULL, updated_at = clock_timestamp()
-            WHERE id = $1
-          `, [job.id]);
-          await client.query(`
-            UPDATE order_items SET state = 'MANUAL_REVIEW', state_version = state_version + 1,
-              updated_at = clock_timestamp() WHERE id = $1
-          `, [job.order_item_id]);
-          await openReview(client, {
-            subjectType: 'ORDER_ITEM', subjectId: job.order_item_id,
-            reason: error.code, financial: true, ownerOnly: false, context,
-          });
-          if (contractFailure) {
-            await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
-              updated_at=clock_timestamp() WHERE quest_id=(SELECT quest_id FROM order_items WHERE id=$1)
-              AND sale_state='OPEN'`, [job.order_item_id]);
-            await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-              VALUES(gen_random_uuid(),'QUEST_CONTRACT_FAILURE',$1,'OPEN','CRITICAL',$2,$3)`,
-            [job.order_item_id, { errorCode: error.code }, context.traceId]);
-          }
-        }
-      });
-      return { outcome: 'MANUAL_REVIEW', error };
-    }
-    await releaseReservation({
-      orderItemId: job.order_item_id,
-      terminalState: 'FAILED_RELEASED', reason: error.code ?? error.name,
-      runnerOwnership: { jobId: runningJob.id, leaseOwner: runningJob.lease_owner,
-        fencingToken: runningJob.fencing_token },
-    }, context, options);
-    await failJob(runningJob, context, options);
-    if (order?.id) await materializeNextOrderItem({ orderId: order.id }, context, options);
-    return { outcome: 'FAILED_RELEASED', error };
+    return resolveRunnerFailure({ state, job, context, options, error });
   }
 }

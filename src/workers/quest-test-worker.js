@@ -99,12 +99,12 @@ async function setMutationState(pool, run, mutation, state, evidence = {}) {
   });
 }
 
-export async function testQuest({ env, pool, signal, holder, runnerConcurrency = env.RUNNER_CONCURRENCY }) {
-  const acquired = await acquireTestRun({ holder, pool });
-  if (!acquired) return false;
-  const { run, monitor } = acquired;
-  const context = createContext({ traceId: run.trace_id, actorType: 'SYSTEM', actorId: holder,
+function testContext(run, holder, env) {
+  return createContext({ traceId: run.trace_id, actorType: 'SYSTEM', actorId: holder,
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `quest-test:${run.id}` });
+}
+
+function startTestHeartbeat(run, pool, signal) {
   const leaseAbort = new AbortController();
   const testSignal = AbortSignal.any([signal, leaseAbort.signal]);
   const heartbeat = (async () => {
@@ -113,80 +113,109 @@ export async function testQuest({ env, pool, signal, holder, runnerConcurrency =
       if (!testSignal.aborted) await renewQuestTestLease(run, { pool });
     }
   })().catch((error) => { if (!testSignal.aborted) leaseAbort.abort(error); });
-  try {
-    const token = decryptSecret({ keyVersion: monitor.key_version, nonce: monitor.nonce,
+  return { testSignal, stop: async () => { leaseAbort.abort('quest test finished'); await heartbeat; } };
+}
+
+async function loadTestQuest({ monitor, run, env, testSignal }) {
+  const token = decryptSecret({ keyVersion: monitor.key_version, nonce: monitor.nonce,
       ciphertext: monitor.ciphertext, authTag: monitor.auth_tag }, env.DATA_ENCRYPTION_KEYS_JSON,
     `monitor:${monitor.id}:${env.DISCORD_GUILD_ID}`);
-    const api = createQuestApiClient({ token, profile: profileFromEnv(env) });
-    const quest = (await api.fetchQuests(testSignal)).find((candidate) => candidate.id === run.quest_id);
-    const executor = quest && selectQuestExecutor(quest);
-    if (!quest || !executor?.supportsAutomaticProgress || executor.id !== run.executor_id) {
-      throw Object.assign(new Error('Quest contract unsupported on monitor'), { code: 'TEST_CONTRACT_UNSUPPORTED' });
-    }
-    if (quest.completed) throw Object.assign(new Error('Monitor already completed this Quest'), {
+  const api = createQuestApiClient({ token, profile: profileFromEnv(env) });
+  const quest = (await api.fetchQuests(testSignal)).find((candidate) => candidate.id === run.quest_id);
+  const executor = quest && selectQuestExecutor(quest);
+  if (!quest || !executor?.supportsAutomaticProgress || executor.id !== run.executor_id) {
+    throw Object.assign(new Error('Quest contract unsupported on monitor'), { code: 'TEST_CONTRACT_UNSUPPORTED' });
+  }
+  if (quest.completed) {
+    throw Object.assign(new Error('Monitor already completed this Quest'), {
       code: 'MONITOR_QUEST_ALREADY_COMPLETED', accountSpecific: true,
     });
-    const freshQuest = async () => {
-      const fresh = (await api.fetchQuests(testSignal)).find((candidate) => candidate.id === run.quest_id);
-      if (!fresh) throw Object.assign(new Error('Quest disappeared during test'), { code: 'TEST_QUEST_MISSING' });
-      return fresh;
-    };
-    let current = quest;
-    const mutate = async (kind, payload, perform) => {
-      const baseline = current.progressSecs;
-      let mutation = await createTestMutation(pool, run, context, { kind, payload, baseline });
-      mutation = await setMutationState(pool, run, mutation, 'IN_FLIGHT');
-      let mutationError = null;
-      try {
-        await perform();
-        mutation = await setMutationState(pool, run, mutation, 'ACCEPTED');
-      } catch (cause) {
-        mutationError = cause;
-        mutation = await setMutationState(pool, run, mutation, 'UNCERTAIN', { code: cause.code ?? cause.name });
-      }
-      let fresh = await freshQuest();
-      const applied = () => kind === 'ENROLL' ? fresh.enrolled
-        : fresh.completed || Number(fresh.progressSecs) > Number(baseline);
-      if (!applied()) {
-        if (mutationError && mutationError.fatalAuth) throw mutationError;
-        await setMutationState(pool, run, mutation, 'FAILED', { freshProgress: fresh.progressSecs });
-        await delay(secureJitter(1000), undefined, { signal: testSignal, ref: false });
-        mutation = await createTestMutation(pool, run, context,
-          { kind, payload: { ...payload, controlledRetry: true }, baseline });
-        mutation = await setMutationState(pool, run, mutation, 'IN_FLIGHT');
-        try {
-          await perform();
-          mutation = await setMutationState(pool, run, mutation, 'ACCEPTED');
-        } catch (cause) {
-          mutation = await setMutationState(pool, run, mutation, 'UNCERTAIN', { code: cause.code ?? cause.name });
-        }
-        fresh = await freshQuest();
-      }
-      if (!applied()) {
-        throw Object.assign(new Error('Test mutation not verified'), { code: 'TEST_MUTATION_NOT_VERIFIED' });
-      }
-      await setMutationState(pool, run, mutation, 'VERIFIED', { freshProgress: fresh.progressSecs });
-      current = fresh;
-      return fresh;
-    };
-    if (!current.enrolled) current = await mutate('ENROLL', {}, () => api.enroll(current.id, testSignal));
-    const execution = await executeQuestExecutor(executor, { quest: current, api, signal: testSignal, mutate,
+  }
+  return { api, quest, executor };
+}
+
+function mutationApplied(kind, fresh, baseline) {
+  if (kind === 'ENROLL') return fresh.enrolled;
+  return fresh.completed || Number(fresh.progressSecs) > Number(baseline);
+}
+
+async function performTestMutation(pool, run, context, input) {
+  let mutation = await createTestMutation(pool, run, context, input);
+  mutation = await setMutationState(pool, run, mutation, 'IN_FLIGHT');
+  try {
+    await input.perform();
+    return setMutationState(pool, run, mutation, 'ACCEPTED');
+  } catch (cause) {
+    const updated = await setMutationState(pool, run, mutation, 'UNCERTAIN', { code: cause.code ?? cause.name });
+    return { ...updated, mutationError: cause };
+  }
+}
+
+function freshQuestLoader(api, run, testSignal) {
+  return async () => {
+    const fresh = (await api.fetchQuests(testSignal)).find((candidate) => candidate.id === run.quest_id);
+    if (!fresh) throw Object.assign(new Error('Quest disappeared during test'), { code: 'TEST_QUEST_MISSING' });
+    return fresh;
+  };
+}
+
+function createTestMutator({ pool, run, context, testSignal, freshQuest, getCurrent, setCurrent }) {
+  return async (kind, payload, perform) => {
+    const baseline = getCurrent().progressSecs;
+    let mutation = await performTestMutation(pool, run, context, { kind, payload, baseline, perform });
+    let fresh = await freshQuest();
+    if (!mutationApplied(kind, fresh, baseline)) {
+      if (mutation.mutationError?.fatalAuth) throw mutation.mutationError;
+      await setMutationState(pool, run, mutation, 'FAILED', { freshProgress: fresh.progressSecs });
+      await delay(secureJitter(1000), undefined, { signal: testSignal, ref: false });
+      mutation = await performTestMutation(pool, run, context, {
+        kind, payload: { ...payload, controlledRetry: true }, baseline, perform,
+      });
+      fresh = await freshQuest();
+    }
+    if (!mutationApplied(kind, fresh, baseline)) {
+      throw Object.assign(new Error('Test mutation not verified'), { code: 'TEST_MUTATION_NOT_VERIFIED' });
+    }
+    await setMutationState(pool, run, mutation, 'VERIFIED', { freshProgress: fresh.progressSecs });
+    setCurrent(fresh);
+    return fresh;
+  };
+}
+
+async function executeTestQuest({ pool, run, monitor, env, runnerConcurrency, testSignal, context }) {
+  const { api, quest, executor } = await loadTestQuest({ monitor, run, env, testSignal });
+  let current = quest;
+  const freshQuest = freshQuestLoader(api, run, testSignal);
+  const mutate = createTestMutator({ pool, run, context, testSignal, freshQuest,
+    getCurrent: () => current, setCurrent: (fresh) => { current = fresh; } });
+  if (!current.enrolled) current = await mutate('ENROLL', {}, () => api.enroll(current.id, testSignal));
+  const execution = await executeQuestExecutor(executor, { quest: current, api, signal: testSignal, mutate,
       fetchFreshQuest: freshQuest, onServerProgress: async () => {},
       sleep: (ms, abortSignal) => delay(ms, undefined, { signal: abortSignal, ref: false }),
       now: () => Date.now() });
-    current = await freshQuest();
-    if (!execution.verified || !current.completed || !current.completedAt) {
-      throw Object.assign(new Error('Background test completion not verified'), { code: 'TEST_COMPLETION_NOT_VERIFIED' });
-    }
-    await updateOwned(pool, run, `UPDATE quest_test_runs SET state='TEST_PASSED',
+  current = await freshQuest();
+  if (!execution.verified || !current.completed || !current.completedAt) {
+    throw Object.assign(new Error('Background test completion not verified'), { code: 'TEST_COMPLETION_NOT_VERIFIED' });
+  }
+  await updateOwned(pool, run, `UPDATE quest_test_runs SET state='TEST_PASSED',
       state_version=state_version+1,evidence=$4,completed_at=clock_timestamp(),
       lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE true`,
-    [{ accountVisible: true, executorId: executor.id, completedAt: current.completedAt,
+  [{ accountVisible: true, executorId: executor.id, completedAt: current.completedAt,
       traceId: context.traceId }], 'TEST_PASSED', 'TEST_COMPLETION_VERIFIED', context);
-    await pool.query(`UPDATE monitor_accounts SET consecutive_failures=0,updated_at=clock_timestamp()
+  await pool.query(`UPDATE monitor_accounts SET consecutive_failures=0,updated_at=clock_timestamp()
       WHERE id=$1`, [monitor.id]);
-    await ingestDiscovery({ normalized: current, source: 'MONITOR',
+  await ingestDiscovery({ normalized: current, source: 'MONITOR',
       runnerConcurrency }, context, { pool });
+}
+
+export async function testQuest({ env, pool, signal, holder, runnerConcurrency = env.RUNNER_CONCURRENCY }) {
+  const acquired = await acquireTestRun({ holder, pool });
+  if (!acquired) return false;
+  const { run, monitor } = acquired;
+  const context = testContext(run, holder, env);
+  const heartbeat = startTestHeartbeat(run, pool, signal);
+  try {
+    await executeTestQuest({ pool, run, monitor, env, runnerConcurrency, testSignal: heartbeat.testSignal, context });
   } catch (error) {
     if (error.code === 'FENCING_LOST') throw error;
     const nextTestState = error.fatalAuth ? 'MANUAL_REVIEW' : 'TEST_FAILED';
@@ -231,8 +260,7 @@ export async function testQuest({ env, pool, signal, holder, runnerConcurrency =
       });
     }
   } finally {
-    leaseAbort.abort('quest test finished');
-    await heartbeat;
+    await heartbeat.stop();
   }
   return true;
 }

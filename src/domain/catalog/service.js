@@ -48,21 +48,15 @@ async function reconcileSale(client, quest, normalized, context, runnerConcurren
   return { quest: updated, price, expiry };
 }
 
-export async function ingestDiscovery({
-  normalized,
-  source,
-  redactedRaw = null,
-  runnerConcurrency = 3,
-}, context, options = {}) {
-  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const previousQuest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
-      [normalized.id])).rows[0] ?? null;
-    const requiresRetest = Boolean(previousQuest && (
-      previousQuest.executor_id !== normalized.executorId
-      || previousQuest.contract_version !== QUEST_CONTRACT_VERSION
-      || Number(previousQuest.task_target) !== Number(normalized.secondsNeeded)
-    ));
-    let quest = (await client.query(`
+function requiresRetest(previousQuest, normalized) {
+  if (!previousQuest) return false;
+  return previousQuest.executor_id !== normalized.executorId
+    || previousQuest.contract_version !== QUEST_CONTRACT_VERSION
+    || Number(previousQuest.task_target) !== Number(normalized.secondsNeeded);
+}
+
+async function upsertQuest(client, normalized) {
+  return (await client.query(`
       INSERT INTO quests(
         quest_id, analysis_state, name, task_type, task_target, url, artwork_url,
         orbs, starts_at, expires_at, executor_id, engine_version,
@@ -83,7 +77,10 @@ export async function ingestDiscovery({
       normalized.expiresAt, normalized.executorId, ENGINE_VERSION, EXECUTOR_VERSION,
       QUEST_CONTRACT_VERSION,
     ])).rows[0];
-    const revision = Number(quest.current_metadata_revision) + 1;
+}
+
+async function recordMetadataRevision(client, quest, normalized, source, redactedRaw, context) {
+  const revision = Number(quest.current_metadata_revision) + 1;
     await client.query(`
       INSERT INTO quest_metadata_revisions(
         id, quest_id, revision, normalized, redacted_raw, source,
@@ -93,54 +90,80 @@ export async function ingestDiscovery({
       uuidv7(), quest.quest_id, revision, normalized, redactedRaw ?? normalized,
       source, normalized.coreComplete, normalized.compatibilityIssues, context.traceId,
     ]);
-    quest = (await client.query(`
+  const updatedQuest = (await client.query(`
       UPDATE quests SET current_metadata_revision = $2 WHERE quest_id = $1 RETURNING *
     `, [quest.quest_id, revision])).rows[0];
+  return { quest: updatedQuest, revision };
+}
 
-    if (quest.analysis_state === 'DETECTED' || quest.analysis_state === 'METADATA_RETRY') {
-      if (!normalized.coreComplete) quest = await transitionAnalysis(client, quest, 'METADATA_RETRY', context);
-      else {
-        quest = await transitionAnalysis(client, quest, 'ANALYZED', context);
-        quest = await transitionAnalysis(
-          client, quest, normalized.autoSupported ? 'SUPPORTED' : 'UNSUPPORTED', context,
-        );
-      }
-    } else if (quest.analysis_state === 'UNSUPPORTED' && normalized.coreComplete && normalized.autoSupported) {
-      quest = await transitionAnalysis(client, quest, 'SUPPORTED', context);
-    }
-    const sale = await reconcileSale(client, quest, normalized, context, runnerConcurrency);
-    quest = sale.quest;
-    if (requiresRetest && quest.sale_state === 'OPEN') {
-      const previousVersion = quest.sale_version;
-      quest = (await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
-        updated_at=transaction_timestamp() WHERE quest_id=$1 AND sale_state='OPEN'
-          AND sale_version=$2 RETURNING *`, [quest.quest_id, previousVersion])).rows[0];
-      await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: quest.quest_id,
-        fromState: 'OPEN', toState: 'PAUSED', stateVersion: quest.sale_version,
-        reasonCode: 'RETEST_REQUIRED', context });
-    }
-    if (quest.analysis_state === 'SUPPORTED') {
-      await client.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,executor_version,
+async function analyzeQuest(client, quest, normalized, context) {
+  if (quest.analysis_state === 'DETECTED' || quest.analysis_state === 'METADATA_RETRY') {
+    if (!normalized.coreComplete) return transitionAnalysis(client, quest, 'METADATA_RETRY', context);
+    const analyzed = await transitionAnalysis(client, quest, 'ANALYZED', context);
+    return transitionAnalysis(client, analyzed, normalized.autoSupported ? 'SUPPORTED' : 'UNSUPPORTED', context);
+  }
+  if (quest.analysis_state === 'UNSUPPORTED' && normalized.coreComplete && normalized.autoSupported) {
+    return transitionAnalysis(client, quest, 'SUPPORTED', context);
+  }
+  return quest;
+}
+
+async function pauseForRetest(client, quest, context) {
+  if (quest.sale_state !== 'OPEN') return quest;
+  const paused = (await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
+    updated_at=transaction_timestamp() WHERE quest_id=$1 AND sale_state='OPEN'
+      AND sale_version=$2 RETURNING *`, [quest.quest_id, quest.sale_version])).rows[0];
+  await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: quest.quest_id,
+    fromState: 'OPEN', toState: 'PAUSED', stateVersion: paused.sale_version,
+    reasonCode: 'RETEST_REQUIRED', context });
+  return paused;
+}
+
+async function queueTestIfSupported(client, quest, requiresTest, context) {
+  if (quest.analysis_state !== 'SUPPORTED') return;
+  const testState = requiresTest ? 'RETEST_REQUIRED' : 'TEST_QUEUED';
+  await client.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,executor_version,
         contract_version,trace_id)
         SELECT $1,$2,$7,$3,$4,$5,$6
         WHERE NOT EXISTS(SELECT 1 FROM quest_test_runs WHERE quest_id=$2 AND engine_version=$3
           AND executor_version=$4 AND contract_version=$5 AND state IN ('TEST_QUEUED','TESTING','TEST_PASSED','RETEST_REQUIRED')
           AND ($7<>'RETEST_REQUIRED' OR state<>'TEST_PASSED'))`,
       [uuidv7(), quest.quest_id, ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION,
-        context.traceId, requiresRetest ? 'RETEST_REQUIRED' : 'TEST_QUEUED']);
-    }
-    const announcementNotBefore = quest.announcement_state === 'ANNOUNCED'
-      ? (await client.query("SELECT clock_timestamp()+interval '30 seconds' AS value")).rows[0].value
-      : null;
-    await enqueueProjection(client, {
+        context.traceId, testState]);
+}
+
+async function queueDiscoveryProjections(client, quest, revision, context) {
+  const announcementNotBefore = quest.announcement_state === 'ANNOUNCED'
+    ? (await client.query("SELECT clock_timestamp()+interval '30 seconds' AS value")).rows[0].value
+    : null;
+  await enqueueProjection(client, {
       projectionType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: quest.quest_id,
       aggregateVersion: revision, surfaceKey: 'QUEST_NEW', notBefore: announcementNotBefore, context,
-    });
-    await enqueueProjection(client, {
+  });
+  await enqueueProjection(client, {
       projectionType: 'QUEST_OPERATION', aggregateType: 'QUEST', aggregateId: quest.quest_id,
       aggregateVersion: revision, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
-    });
-    return { quest, price: sale.price, expiry: sale.expiry, revision };
+  });
+}
+
+export async function ingestDiscovery({
+  normalized,
+  source,
+  redactedRaw = null,
+  runnerConcurrency = 3,
+}, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const previousQuest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
+      [normalized.id])).rows[0] ?? null;
+    const needsRetest = requiresRetest(previousQuest, normalized);
+    let quest = await upsertQuest(client, normalized);
+    const metadata = await recordMetadataRevision(client, quest, normalized, source, redactedRaw, context);
+    quest = await analyzeQuest(client, metadata.quest, normalized, context);
+    const sale = await reconcileSale(client, quest, normalized, context, runnerConcurrency);
+    quest = needsRetest ? await pauseForRetest(client, sale.quest, context) : sale.quest;
+    await queueTestIfSupported(client, quest, needsRetest, context);
+    await queueDiscoveryProjections(client, quest, metadata.revision, context);
+    return { quest, price: sale.price, expiry: sale.expiry, revision: metadata.revision };
   });
 }
 

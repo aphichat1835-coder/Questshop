@@ -255,12 +255,9 @@ async function loadPreflight({ sessionId, actorId, guildId, channelId, messageId
   return { ...snapshot, token, profile, quests };
 }
 
-export async function confirmOrder({ sessionId, actorId, guildId, channelId = null,
-  messageId = null, env, runnerConcurrency = env.RUNNER_CONCURRENCY }, context, options = {}) {
-  const preflight = await loadPreflight({ sessionId, actorId, guildId, channelId, messageId, env }, options);
-  const freshById = new Map(preflight.quests.map((quest) => [quest.id, quest]));
-  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
+async function validateConfirmationSession(client, sessionInput, preflight) {
+  const { sessionId, actorId, guildId, channelId, messageId } = sessionInput;
+  const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
     const currentConfigVersion = await activeConfigVersion(client);
     if (currentConfigVersion !== Number(session.config_version)) {
       throw new QuestshopError('QUOTE_EXPIRED', 'การตั้งค่าร้านเปลี่ยนไป กรุณาเริ่ม Quote ใหม่');
@@ -279,8 +276,8 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
       SELECT count(*)::integer AS count FROM runner_jobs
       WHERE state IN ('QUEUED','LEASED','RUNNING','WAITING_RATE_LIMIT','WAITING_RETRY')
     `)).rows[0].count);
-    if (queueCount >= 500) throw new QuestshopError('QUEUE_FULL', 'คิวงานเต็ม กรุณาลองใหม่ภายหลัง');
-    const selected = (await client.query(`
+  if (queueCount >= 500) throw new QuestshopError('QUEUE_FULL', 'คิวงานเต็ม กรุณาลองใหม่ภายหลัง');
+  const selected = (await client.query(`
       SELECT * FROM checkout_quest_options WHERE session_id = $1 AND selected = true
       ORDER BY created_at, id FOR UPDATE
     `, [sessionId])).rows;
@@ -288,10 +285,13 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
     if (!session.payload?.quoteHash
       || session.payload.quoteHash !== selectionHash(selected, session.config_version)) {
       throw new QuestshopError('QUOTE_EXPIRED', 'รายการที่เลือกเปลี่ยนไป กรุณาตรวจ Quote ใหม่');
-    }
+  }
+  return { session, selected };
+}
 
-    const validated = [];
-    for (const option of selected) {
+async function validateSelectedOptions(client, selected, freshById, runnerConcurrency) {
+  const validated = [];
+  for (const option of selected) {
       const fresh = freshById.get(option.quest_id);
       if (!fresh || fresh.completed) {
         throw new QuestshopError('QUEST_EXTERNALLY_COMPLETED', `Quest ${option.quest_name} ทำเสร็จจากที่อื่นแล้ว`);
@@ -311,46 +311,51 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
         runnerConcurrency,
       });
       if (!expiry.eligible) throw new QuestshopError('QUEST_INSUFFICIENT_TIME', `เวลา Quest ${option.quest_name} ไม่เพียงพอ`);
-      validated.push({ option, fresh, quest, price });
-    }
+    validated.push({ option, fresh, quest, price });
+  }
+  return validated;
+}
 
-    const orderId = uuidv7();
-    await client.query(`
+async function createOrder(client, actorId, preflight, context, env) {
+  const orderId = uuidv7();
+  await client.query(`
       INSERT INTO orders(
         id, discord_user_id, account_id, account_username, account_avatar_url,
         trace_id, prelaunch
       ) VALUES ($1,$2,$3,$4,$5,$6,$7)
-    `, [
+  `, [
       orderId, actorId, String(preflight.profile.id),
       preflight.profile.global_name ?? preflight.profile.username,
       avatarUrl(preflight.profile), context.traceId, env.PRELAUNCH,
-    ]);
-    try {
-      await client.query(`
-        INSERT INTO active_quest_accounts(account_id, order_id) VALUES ($1,$2)
-      `, [String(preflight.profile.id), orderId]);
-    } catch (error) {
-      if (error.code === '23505') {
-        throw new QuestshopError('ACCOUNT_ACTIVE_ORDER', 'บัญชี Quest นี้มีงานที่กำลังดำเนินการอยู่');
-      }
-      throw error;
-    }
-    const orderSecret = encryptSecret(
-      preflight.token,
-      env.DATA_ENCRYPTION_KEYS_JSON,
-      `order:${orderId}:${guildId}`,
-    );
+  ]);
+  try {
     await client.query(`
+        INSERT INTO active_quest_accounts(account_id, order_id) VALUES ($1,$2)
+    `, [String(preflight.profile.id), orderId]);
+  } catch (error) {
+    if (error.code === '23505') {
+      throw new QuestshopError('ACCOUNT_ACTIVE_ORDER', 'บัญชี Quest นี้มีงานที่กำลังดำเนินการอยู่');
+    }
+    throw error;
+  }
+  return orderId;
+}
+
+async function storeOrderCredential(client, orderId, preflight, env, guildId) {
+  const orderSecret = encryptSecret(preflight.token, env.DATA_ENCRYPTION_KEYS_JSON, `order:${orderId}:${guildId}`);
+  await client.query(`
       INSERT INTO order_credentials(
         order_id, account_id, key_version, nonce, ciphertext, auth_tag
       ) VALUES ($1,$2,$3,$4,$5,$6)
-    `, [
+  `, [
       orderId, String(preflight.profile.id), orderSecret.keyVersion,
       orderSecret.nonce, orderSecret.ciphertext, orderSecret.authTag,
-    ]);
+  ]);
+}
 
-    const itemRows = [];
-    for (let index = 0; index < validated.length; index += 1) {
+async function createOrderItems(client, orderId, session, validated) {
+  const itemRows = [];
+  for (let index = 0; index < validated.length; index += 1) {
       const { option, quest } = validated[index];
       const item = (await client.query(`
         INSERT INTO order_items(
@@ -369,55 +374,79 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
         Math.floor(Math.min(99.999, validated[index].fresh.progress) / 25) * 25,
         option.deadline_at,
       ])).rows[0];
-      itemRows.push(item);
-    }
-    await reserveOrderItemsInTransaction(client, {
-      discordUserId: actorId,
-      items: itemRows.map((item) => ({ itemId: item.id, amountCents: item.price_cents })),
-    }, context);
+    itemRows.push(item);
+  }
+  return itemRows;
+}
 
-    const first = itemRows[0];
-    const queued = (await client.query(`
+async function queueFirstOrderItem(client, itemRows, actorId, preflight, context) {
+  const first = itemRows[0];
+  const queued = (await client.query(`
       UPDATE order_items SET state = 'QUEUED', state_version = state_version + 1,
         updated_at = transaction_timestamp() WHERE id = $1 AND state = 'RESERVED' RETURNING *
-    `, [first.id])).rows[0];
-    await recordTransition(client, {
+  `, [first.id])).rows[0];
+  await recordTransition(client, {
       aggregateType: 'ORDER_ITEM', aggregateId: first.id,
       fromState: 'RESERVED', toState: 'QUEUED', stateVersion: queued.state_version, context,
-    });
-    await client.query(`
+  });
+  await client.query(`
       INSERT INTO runner_jobs(
         id, order_item_id, discord_user_id, account_id, state, deadline_at,
         engine_version, executor_version, contract_version,
         runner_state_schema_version, trace_id
       ) VALUES ($1,$2,$3,$4,'QUEUED',$5,$6,$7,$8,$9,$10)
-    `, [
+  `, [
       uuidv7(), first.id, actorId, String(preflight.profile.id), first.deadline_at,
       ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION,
       RUNNER_STATE_SCHEMA_VERSION, context.traceId,
-    ]);
-    await client.query(`
+  ]);
+  await client.query(`
       INSERT INTO scheduler_users(discord_user_id) VALUES ($1)
       ON CONFLICT (discord_user_id) DO NOTHING
-    `, [actorId]);
+  `, [actorId]);
+}
 
-    for (let index = 0; index < itemRows.length; index += 1) {
+async function enqueueOrderHistory(client, itemRows, context) {
+  for (let index = 0; index < itemRows.length; index += 1) {
       const item = itemRows[index];
       const notBefore = (await client.query(
         "SELECT clock_timestamp() + make_interval(secs => $1) AS value",
         [Math.floor(index / 5) * 10],
       )).rows[0].value;
-      await enqueueProjection(client, {
+    await enqueueProjection(client, {
         projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM', aggregateId: item.id,
         aggregateVersion: item.state_version + (index === 0 ? 1 : 0),
         surfaceKey: 'QUEST_HISTORY', notBefore, context,
-      });
-    }
-    await client.query(`
+    });
+  }
+}
+
+async function finishCheckout(client, sessionId) {
+  await client.query(`
       UPDATE interaction_sessions SET state = 'CONFIRMED', state_version = state_version + 1,
         updated_at = transaction_timestamp() WHERE id = $1
-    `, [sessionId]);
-    await client.query('DELETE FROM checkout_credentials WHERE session_id = $1', [sessionId]);
+  `, [sessionId]);
+  await client.query('DELETE FROM checkout_credentials WHERE session_id = $1', [sessionId]);
+}
+
+export async function confirmOrder({ sessionId, actorId, guildId, channelId = null,
+  messageId = null, env, runnerConcurrency = env.RUNNER_CONCURRENCY }, context, options = {}) {
+  const input = { sessionId, actorId, guildId, channelId, messageId };
+  const preflight = await loadPreflight({ ...input, env }, options);
+  const freshById = new Map(preflight.quests.map((quest) => [quest.id, quest]));
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const { session, selected } = await validateConfirmationSession(client, input, preflight);
+    const validated = await validateSelectedOptions(client, selected, freshById, runnerConcurrency);
+    const orderId = await createOrder(client, actorId, preflight, context, env);
+    await storeOrderCredential(client, orderId, preflight, env, guildId);
+    const itemRows = await createOrderItems(client, orderId, session, validated);
+    await reserveOrderItemsInTransaction(client, {
+      discordUserId: actorId,
+      items: itemRows.map((item) => ({ itemId: item.id, amountCents: item.price_cents })),
+    }, context);
+    await queueFirstOrderItem(client, itemRows, actorId, preflight, context);
+    await enqueueOrderHistory(client, itemRows, context);
+    await finishCheckout(client, sessionId);
     return { orderId, items: itemRows, totalCents: sumCents(itemRows.map((item) => item.price_cents)) };
   });
 }
