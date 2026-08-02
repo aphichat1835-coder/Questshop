@@ -60,6 +60,24 @@ function retryAfterMs(response, data) {
   return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1000) : 1000;
 }
 
+async function parseResponse(response) {
+  const text = response.status === 204 ? '' : await response.text();
+  try { return text ? JSON.parse(text) : null; } catch { return text; }
+}
+
+async function waitForSafeRetry({ response, data, safeRead, attempt, maxAttempts, coordinator, signal }) {
+  if (!safeRead || attempt + 1 >= maxAttempts) return false;
+  if (response.status === 429) {
+    const wait = retryAfterMs(response, data);
+    if (data?.global) coordinator.blockGlobally(wait);
+    await delay(wait, undefined, { signal, ref: false });
+    return true;
+  }
+  if (response.status < 500) return false;
+  await delay(secureJitter(Math.min(30_000, 500 * (2 ** attempt))), undefined, { signal, ref: false });
+  return true;
+}
+
 export function createQuestApiClient({ token, profile, coordinator = discordRateLimitCoordinator }) {
   async function request(path, options = {}, { safeRead = false, maxAttempts = safeRead ? 5 : 1 } = {}) {
     const method = String(options.method ?? 'GET').toUpperCase();
@@ -72,24 +90,9 @@ export function createQuestApiClient({ token, profile, coordinator = discordRate
           headers: { ...headers(token, path, profile), ...options.headers },
         }),
       });
-      const text = response.status === 204 ? '' : await response.text();
-      let data = null;
-      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      const data = await parseResponse(response);
       if (response.ok) return data ?? { ok: true, status: response.status };
-      if (response.status === 429) {
-        const wait = retryAfterMs(response, data);
-        if (data?.global) coordinator.blockGlobally(wait);
-        if (safeRead && attempt + 1 < maxAttempts) {
-          await delay(wait, undefined, { signal: options.signal, ref: false });
-          continue;
-        }
-      }
-      if (safeRead && response.status >= 500 && attempt + 1 < maxAttempts) {
-        await delay(secureJitter(Math.min(30_000, 500 * (2 ** attempt))), undefined, {
-          signal: options.signal, ref: false,
-        });
-        continue;
-      }
+      if (await waitForSafeRetry({ response, data, safeRead, attempt, maxAttempts, coordinator, signal: options.signal })) continue;
       throw new DiscordApiError(response.status, path, data);
     }
     throw new Error(`${method} ${path} retry budget exhausted`);

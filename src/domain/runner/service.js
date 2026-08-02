@@ -40,14 +40,19 @@ function isRunnerTransient(error) {
     || (error?.name === 'TypeError' && error?.category !== 'BUSINESS');
 }
 
+function retryStateForRunnerJob(state) {
+  if (state === 'LEASED') return 'QUEUED';
+  if (['RUNNING', 'VERIFYING'].includes(state)) return 'WAITING_RETRY';
+  return 'MANUAL_REVIEW';
+}
+
 async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_SHUTDOWN_CHECKPOINT') {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const current = (await client.query(`SELECT * FROM runner_jobs WHERE id=$1 AND lease_owner=$2
       AND fencing_token=$3 AND lease_expires_at>clock_timestamp() FOR UPDATE`,
     [job.id, job.lease_owner, job.fencing_token])).rows[0];
     if (!current) throw new FencingLostError(`runner:${job.id}`);
-    const next = current.state === 'LEASED' ? 'QUEUED'
-      : ['RUNNING','VERIFYING'].includes(current.state) ? 'WAITING_RETRY' : 'MANUAL_REVIEW';
+    const next = retryStateForRunnerJob(current.state);
     const itemNext = next;
     const updatedJob = (await client.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
       available_at=clock_timestamp()+make_interval(secs => floor(random()*LEAST(300::double precision,
@@ -233,46 +238,60 @@ async function markMutation(job, mutationId, status, evidence, errorClass, optio
   });
 }
 
-async function executeMutation({ job, attempt, kind, payload, baseline, perform, fetchFresh, context, options }) {
-  const mutation = await prepareMutation(job, attempt, kind, payload, baseline, context, options);
-  let firstError;
+async function acceptInitialMutation(job, mutation, perform, options) {
   try {
     await perform();
     await markMutation(job, mutation.id, 'ACCEPTED', {}, null, options);
+    return null;
   } catch (error) {
-    firstError = error;
     if (!isUncertain(error)) {
       await markMutation(job, mutation.id, 'FAILED', {}, error.code ?? error.name, options);
       throw error;
     }
     await markMutation(job, mutation.id, 'UNCERTAIN', {}, error.code ?? error.name, options);
+    return error;
   }
-  let fresh;
+}
+
+async function verifyMutationResult(job, mutation, kind, payload, baseline, fetchFresh, options) {
   try {
-    fresh = await fetchFresh();
+    const fresh = await fetchFresh();
+    if (mutationApplied(kind, payload, baseline, fresh)) {
+      await markMutation(job, mutation.id, 'VERIFIED', { progress: fresh.progressSecs }, null, options);
+      return fresh;
+    }
+    return null;
   } catch (error) {
     await markMutation(job, mutation.id, 'UNCERTAIN', { verificationFailed: true }, error.code ?? error.name, options);
     throw new QuestshopError('MUTATION_AMBIGUOUS', 'ไม่สามารถยืนยันผล Mutation ได้', {
       category: 'AMBIGUOUS', cause: error,
     });
   }
-  if (mutationApplied(kind, payload, baseline, fresh)) {
-    await markMutation(job, mutation.id, 'VERIFIED', { progress: fresh.progressSecs }, null, options);
+}
+
+async function controlledRetry(job, mutation, perform, fetchFresh, kind, payload, baseline, options) {
+  try {
+    await perform();
+    const fresh = await fetchFresh();
+    if (!mutationApplied(kind, payload, baseline, fresh)) return null;
+    await markMutation(job, mutation.id, 'VERIFIED', { controlledRetry: true, progress: fresh.progressSecs }, null, options);
     return fresh;
+  } catch (error) {
+    await markMutation(job, mutation.id, 'UNCERTAIN', { controlledRetry: true }, error.code ?? error.name, options);
+    return null;
   }
+}
+
+async function executeMutation({ job, attempt, kind, payload, baseline, perform, fetchFresh, context, options }) {
+  const mutation = await prepareMutation(job, attempt, kind, payload, baseline, context, options);
+  const firstError = await acceptInitialMutation(job, mutation, perform, options);
+  const verified = await verifyMutationResult(job, mutation, kind, payload, baseline, fetchFresh, options);
+  if (verified) return verified;
   await markMutation(job, mutation.id, firstError ? 'UNCERTAIN' : 'FAILED',
     { notApplied: true, controlledRetryPending: true }, firstError?.code ?? 'NOT_APPLIED', options);
   await delay(firstError ? retryDelay(firstError) : secureJitter(1000), undefined, { ref: false });
-  try {
-    await perform();
-    fresh = await fetchFresh();
-    if (mutationApplied(kind, payload, baseline, fresh)) {
-      await markMutation(job, mutation.id, 'VERIFIED', { controlledRetry: true, progress: fresh.progressSecs }, null, options);
-      return fresh;
-    }
-  } catch (error) {
-    await markMutation(job, mutation.id, 'UNCERTAIN', { controlledRetry: true }, error.code ?? error.name, options);
-  }
+  const retried = await controlledRetry(job, mutation, perform, fetchFresh, kind, payload, baseline, options);
+  if (retried) return retried;
   throw new QuestshopError('MUTATION_AMBIGUOUS', 'Mutation ยังไม่ชัดเจนหลัง Controlled retry', {
     category: 'AMBIGUOUS',
   });

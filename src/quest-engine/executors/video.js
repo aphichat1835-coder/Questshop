@@ -10,6 +10,25 @@ export function nextVideoTimestamp(current, target, enrolledAtMs, now = Date.now
   return Math.min(target, current + STEP_SECONDS, allowance);
 }
 
+async function waitForAllowedTimestamp(context, current, target, enrolledAtMs, allowanceWaits) {
+  const timestamp = nextVideoTimestamp(current, target, enrolledAtMs, context.now());
+  if (timestamp > current) return { timestamp, allowanceWaits: 0 };
+  const waits = allowanceWaits + 1;
+  if (waits >= 120) throw new Error('video timestamp allowance exceeded 2 minutes');
+  await context.sleep(1000, context.signal);
+  return { timestamp: null, allowanceWaits: waits };
+}
+
+async function sendAndRefreshProgress(context, fresh, timestamp) {
+  await context.mutate('VIDEO_PROGRESS', { timestamp }, () => (
+    context.api.sendVideoProgress(fresh.id, timestamp, context.signal)
+  ));
+  await context.sleep(1000, context.signal);
+  const updated = await context.fetchFreshQuest(fresh.id, context.signal);
+  await context.onServerProgress(updated);
+  return updated;
+}
+
 async function execute(context) {
   let fresh = context.quest;
   let current = Number(fresh.progressSecs ?? 0);
@@ -19,20 +38,10 @@ async function execute(context) {
   let allowanceWaits = 0;
   while (!fresh.completed && current < target) {
     if (context.signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    const timestamp = nextVideoTimestamp(current, target, enrolledAtMs, context.now());
-    if (timestamp <= current) {
-      allowanceWaits += 1;
-      if (allowanceWaits >= 120) throw new Error('video timestamp allowance exceeded 2 minutes');
-      await context.sleep(1000, context.signal);
-      continue;
-    }
-    allowanceWaits = 0;
-    await context.mutate('VIDEO_PROGRESS', { timestamp }, () => (
-      context.api.sendVideoProgress(fresh.id, timestamp, context.signal)
-    ));
-    await context.sleep(1000, context.signal);
-    fresh = await context.fetchFreshQuest(fresh.id, context.signal);
-    await context.onServerProgress(fresh);
+    const allowed = await waitForAllowedTimestamp(context, current, target, enrolledAtMs, allowanceWaits);
+    allowanceWaits = allowed.allowanceWaits;
+    if (allowed.timestamp == null) continue;
+    fresh = await sendAndRefreshProgress(context, fresh, allowed.timestamp);
     unchanged = fresh.progressSecs > current || fresh.completed ? 0 : unchanged + 1;
     if (unchanged >= 8) throw new Error('Discord did not confirm video progress after 8 checks');
     current = Math.max(current, Number(fresh.progressSecs ?? 0));

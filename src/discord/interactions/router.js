@@ -39,11 +39,15 @@ function runnerConcurrency(runtime) {
   return Math.max(1, Math.min(runtime.env.RUNNER_CONCURRENCY_HARD_MAX,
     Number(runtime.config.values?.runnerConcurrency ?? runtime.env.RUNNER_CONCURRENCY)));
 }
+function actorTypeFor(interaction, runtime) {
+  if (interaction.user.id === runtime.env.OWNER_ID) return 'OWNER';
+  const adminRoleId = runtime.config.values?.adminRoleId;
+  if (adminRoleId && interaction.member?.roles?.cache?.has(adminRoleId)) return 'ADMIN';
+  return 'CUSTOMER';
+}
 function contextFor(interaction, operation) {
   const runtime = interaction.client.questshop;
-  const adminRoleId = runtime.config.values?.adminRoleId;
-  const actorType = interaction.user.id === runtime.env.OWNER_ID ? 'OWNER'
-    : adminRoleId && interaction.member?.roles?.cache?.has(adminRoleId) ? 'ADMIN' : 'CUSTOMER';
+  const actorType = actorTypeFor(interaction, runtime);
   return createContext({ actorType,
     actorId: interaction.user.id, guildId: interaction.guildId,
     idempotencyKey: `${operation}:${interaction.id}`,
@@ -648,7 +652,7 @@ export async function routeInteraction(interaction) {
       contextFor(interaction, 'permission_repair_load'), { pool: runtime.pool });
       const surfaceKey = interaction.fields.getTextInputValue('surface').trim().toUpperCase();
       const surface = (await runtime.pool.query('SELECT * FROM surfaces WHERE surface_key=$1', [surfaceKey])).rows[0];
-      if (!surface || surface.state !== 'DRIFTED') throw new QuestshopError('SURFACE_NOT_DRIFTED', 'Surface นี้ไม่อยู่ในสถานะ Drifted');
+      if (surface?.state !== 'DRIFTED') throw new QuestshopError('SURFACE_NOT_DRIFTED', 'Surface นี้ไม่อยู่ในสถานะ Drifted');
       const payload = { surfaceKey, expectedVersion: String(surface.state_version),
         reason: interaction.fields.getTextInputValue('reason').trim() };
       const confirm = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
