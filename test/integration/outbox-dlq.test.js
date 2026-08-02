@@ -1,0 +1,154 @@
+import test, { after, before } from 'node:test';
+import assert from 'node:assert/strict';
+import { v7 as uuidv7 } from 'uuid';
+import { createTestPool } from '../fixtures/postgres.js';
+import { processOutbox } from '../../src/workers/outbox-worker.js';
+import { createContext } from '../../src/shared/correlation.js';
+import { replayDeadLetter, discardDeadLetter } from '../../src/domain/outbox/dlq-service.js';
+import { acquireDelivery, recordDelivery, enqueueProjection } from '../../src/domain/outbox/service.js';
+import { reconcileSurfaceAnchors } from '../../src/discord/surfaces/setup.js';
+
+let pool;
+before(async () => { pool = await createTestPool(); });
+after(async () => { await pool?.end(); });
+
+test('outbox exhausts bounded retries into schema-valid DLQ evidence', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const projection = uuidv7(); const event = uuidv7(); const trace = uuidv7();
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state)
+    VALUES('QUEST_NEW','guild','channel','anchor','ACTIVE') ON CONFLICT(surface_key) DO UPDATE SET
+      guild_id=EXCLUDED.guild_id,channel_id=EXCLUDED.channel_id,message_id=EXCLUDED.message_id,state='ACTIVE'`);
+  await pool.query("UPDATE feature_gates SET enabled=true WHERE gate='QUEST_ANNOUNCEMENT_ENABLED'");
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'QUEST_OPERATION','quest-x','QUEST_NEW','nonce-x')`, [projection]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,attempt_count,trace_id) VALUES($1,'REFRESH_PROJECTION','QUEST','quest-x',1,$2,'PENDING',6,$3)`,
+  [event, projection, trace]);
+  const client = { channels: { fetch: async () => { throw Object.assign(new Error('network down'), { code: 'NETWORK' }); } } };
+  assert.equal(await processOutbox({ holder: uuidv7(), client, pool, env: {} }), true);
+  const outbox = (await pool.query('SELECT * FROM outbox_events WHERE id=$1', [event])).rows[0];
+  assert.equal(outbox.state, 'DEAD_LETTER');
+  const dlq = (await pool.query("SELECT * FROM dead_letter_items WHERE source_type='OUTBOX' AND source_id=$1", [event])).rows[0];
+  assert.equal(dlq.state, 'DEAD_LETTER');
+  assert.equal(dlq.error_code, 'NETWORK');
+  const context = createContext({ actorType: 'OWNER', actorId: 'owner', guildId: 'guild',
+    idempotencyKey: 'replay-dlq' });
+  const replay = await replayDeadLetter({ dlqId: dlq.id, reason: 'provider recovered' }, context, { pool });
+  let acquired;
+  for (let index = 0; index < 3; index += 1) {
+    const holder = uuidv7();
+    acquired = await acquireDelivery({ holder }, { pool });
+    assert.ok(acquired);
+    await recordDelivery({ outboxId: acquired.id, holder, fencingToken: acquired.fencing_token,
+      messageId: `replayed-message-${index}` }, { pool });
+    if (acquired.id === replay.replayOutboxId) break;
+  }
+  assert.equal(acquired.id, replay.replayOutboxId);
+  assert.equal((await pool.query('SELECT state FROM dead_letter_items WHERE id=$1', [dlq.id])).rows[0].state, 'RESOLVED');
+  const forbiddenProjection = uuidv7(); const forbiddenEvent = uuidv7();
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'QUEST_OPERATION','quest-forbidden','QUEST_NEW','nonce-forbidden')`, [forbiddenProjection]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','QUEST','quest-forbidden',1,$2,'PENDING',$3)`,
+  [forbiddenEvent, forbiddenProjection, uuidv7()]);
+  const forbiddenClient = { channels: { fetch: async () => {
+    throw Object.assign(new Error('Missing Permissions'), { status: 403, code: 50013 });
+  } } };
+  assert.equal(await processOutbox({ holder: uuidv7(), client: forbiddenClient, pool, env: {} }), true);
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [forbiddenEvent])).rows[0].state,
+    'DEAD_LETTER');
+  assert.equal((await pool.query("SELECT state FROM surfaces WHERE surface_key='QUEST_NEW'")).rows[0].state,
+    'DRIFTED');
+  assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM incidents
+    WHERE incident_code='PERMISSION_DRIFT' AND scope='QUEST_NEW' AND state='OPEN'`)).rows[0].count), 1);
+});
+
+test('financial DLQ cannot be discarded', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const id = uuidv7();
+  await pool.query(`INSERT INTO dead_letter_items(id,source_type,source_id,category,state,error_code,
+    parent_trace_id) VALUES($1,'PAYMENT','topup-x','FINANCIAL','DEAD_LETTER','AMBIGUOUS',$2)`, [id, uuidv7()]);
+  const context = createContext({ actorType: 'OWNER', actorId: 'owner', guildId: 'guild',
+    idempotencyKey: 'discard-financial' });
+  await assert.rejects(() => discardDeadLetter({ dlqId: id, reason: 'never allowed', isOwner: true },
+    context, { pool }), (error) => error.code === 'DLQ_DISCARD_FORBIDDEN');
+});
+
+test('delivery coalesces obsolete outbox events for the same Discord message', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const context = createContext({ actorType: 'SYSTEM', actorId: 'worker', guildId: 'guild',
+    idempotencyKey: 'projection-coalesce' });
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state)
+    VALUES('LOG_SYSTEM','guild','channel','anchor','ACTIVE') ON CONFLICT(surface_key) DO UPDATE SET state='ACTIVE'`);
+  const first = await enqueueProjection(pool, { projectionType: 'SYSTEM_INCIDENT', aggregateType: 'INCIDENT',
+    aggregateId: 'coalesce-incident', aggregateVersion: 1, surfaceKey: 'LOG_SYSTEM', context });
+  await enqueueProjection(pool, { projectionType: 'SYSTEM_INCIDENT', aggregateType: 'INCIDENT',
+    aggregateId: 'coalesce-incident', aggregateVersion: 2, surfaceKey: 'LOG_SYSTEM', context });
+  const holder = uuidv7();
+  const acquired = await acquireDelivery({ holder }, { pool });
+  assert.ok(acquired);
+  assert.equal(acquired.projection_id, first.id);
+  await recordDelivery({ outboxId: acquired.id, holder, fencingToken: acquired.fencing_token,
+    messageId: 'coalesced-message' }, { pool });
+  const events = (await pool.query(`SELECT state FROM outbox_events WHERE projection_id=$1 ORDER BY aggregate_version`,
+    [first.id])).rows;
+  assert.deepEqual(events.map((event) => event.state), ['DELIVERED', 'DELIVERED']);
+});
+
+test('quest-new role ping is durable and is not repeated when the message is recreated', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const projection = uuidv7();
+  const trace = uuidv7();
+  await pool.query(`INSERT INTO config_versions(id,version,payload,payload_hash,actor_type,actor_id,trace_id)
+    VALUES($1,1,$2,'hash','OWNER','owner',$3)`, [uuidv7(), { questAnnouncementRoleId: '123456789012345678' }, trace]);
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state)
+    VALUES('QUEST_NEW','guild','channel','anchor','ACTIVE') ON CONFLICT(surface_key) DO UPDATE SET
+      guild_id=EXCLUDED.guild_id,channel_id=EXCLUDED.channel_id,message_id=EXCLUDED.message_id,state='ACTIVE'`);
+  await pool.query("UPDATE feature_gates SET enabled=true WHERE gate='QUEST_ANNOUNCEMENT_ENABLED'");
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,sale_state,name,task_type,task_target,url)
+    VALUES('quest-ping','SUPPORTED','OPEN','Ping Quest','WATCH_VIDEO',60,'https://discord.com/quests/quest-ping')`);
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'QUEST_NEW','quest-ping','QUEST_NEW','nonce-ping')`, [projection]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','QUEST','quest-ping',1,$2,'PENDING',$3)`,
+  [uuidv7(), projection, trace]);
+  const sent = [];
+  const channel = { isTextBased: () => true, messages: { fetch: async () => null },
+    send: async (body) => { sent.push(body); return { id: `message-${sent.length}` }; } };
+  const client = { channels: { fetch: async () => channel } };
+  assert.equal(await processOutbox({ holder: uuidv7(), client, pool, env: {} }), true);
+  assert.equal(sent[0].content, '<@&123456789012345678>');
+  const delivered = (await pool.query('SELECT * FROM message_projections WHERE id=$1', [projection])).rows[0];
+  assert.ok(delivered.ping_sent_at);
+
+  await pool.query(`UPDATE message_projections SET message_id=NULL,desired_version=desired_version+1 WHERE id=$1`, [projection]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','QUEST','quest-ping',2,$2,'PENDING',$3)`,
+  [uuidv7(), projection, trace]);
+  assert.equal(await processOutbox({ holder: uuidv7(), client, pool, env: {} }), true);
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].content, undefined);
+  assert.deepEqual(sent[1].allowedMentions, { parse: [] });
+});
+
+test('surface reconciliation refreshes existing anchors after config version changes', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  await pool.query("UPDATE surfaces SET state='DISABLED' WHERE surface_key<>'QUEST_AUTO'");
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state,rendered_config_version)
+    VALUES('QUEST_AUTO','guild','channel','anchor','ACTIVE',1)`);
+  const edits = [];
+  const message = { id: 'anchor', edit: async (body) => { edits.push(body); return message; } };
+  const channel = { isTextBased: () => true, isDMBased: () => false,
+    messages: { fetch: async (input) => (input === 'anchor' ? message : new Map()) } };
+  const guild = { channels: { fetch: async () => channel } };
+  const client = { guilds: { fetch: async () => guild } };
+  const context = createContext({ actorType: 'SYSTEM', actorId: 'runtime', guildId: 'guild',
+    idempotencyKey: 'surface-refresh' });
+  const result = await reconcileSurfaceAnchors({ client, pool,
+    env: { DISCORD_GUILD_ID: 'guild' }, config: { version: 2,
+      values: { branding: { title: 'ชื่อใหม่', description: 'รายละเอียดใหม่' } } } }, context);
+  assert.equal(edits.length, 1);
+  assert.equal(result[0].refreshed, true);
+  const surface = (await pool.query("SELECT * FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0];
+  assert.equal(Number(surface.rendered_config_version), 2);
+});
