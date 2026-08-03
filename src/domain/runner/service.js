@@ -59,6 +59,9 @@ async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_
         5::double precision*power(2::double precision,GREATEST(0,attempt_count-1))))::integer),
       lease_owner=NULL,lease_expires_at=NULL,
       updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [current.id, next])).rows[0];
+    await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: current.id,
+      fromState: current.state, toState: next, stateVersion: updatedJob.state_version,
+      reasonCode, context });
     const item = (await client.query(`UPDATE order_items SET state=$2,state_version=state_version+1,
       updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [current.order_item_id, itemNext])).rows[0];
     await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
@@ -85,7 +88,7 @@ function mutationApplied(kind, payload, baseline, fresh) {
   return false;
 }
 
-async function updateOwnedJob(client, job, next, patch = {}) {
+async function updateOwnedJob(client, job, next, patch = {}, context = null) {
   assertJobTransition(job.state, next);
   const result = await client.query(`
     UPDATE runner_jobs SET
@@ -101,8 +104,14 @@ async function updateOwnedJob(client, job, next, patch = {}) {
     job.id, job.lease_owner, job.fencing_token, next, patch.availableAt ?? null,
     patch.releaseLease ?? false, job.state_version,
   ]);
-  if (!result.rows[0]) throw new FencingLostError(`runner:${job.id}`);
-  return result.rows[0];
+  const updated = result.rows[0];
+  if (!updated) throw new FencingLostError(`runner:${job.id}`);
+  if (context && job.state !== next) {
+    await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+      fromState: job.state, toState: next, stateVersion: updated.state_version,
+      reasonCode: patch.reasonCode ?? null, context });
+  }
+  return updated;
 }
 
 export async function acquireRunnableJob({ holder, ttlSeconds = 60 }, context, options = {}) {
@@ -162,6 +171,11 @@ export async function acquireRunnableJob({ holder, ttlSeconds = 60 }, context, o
     await recordTransition(client, {
       aggregateType: 'ORDER_ITEM', aggregateId: item.id,
       fromState: 'QUEUED', toState: 'LEASED', stateVersion: item.state_version, context,
+    });
+    await recordTransition(client, {
+      aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+      fromState: 'QUEUED', toState: 'LEASED', stateVersion: job.state_version,
+      reasonCode: 'RUNNER_LEASED', context,
     });
     await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
       aggregateId: job.id, aggregateVersion: job.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context });
@@ -331,7 +345,7 @@ async function updateItemProgress(job, fresh, context, options) {
 
 async function transitionRunning(job, context, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
-    const updatedJob = await updateOwnedJob(client, job, 'RUNNING');
+    const updatedJob = await updateOwnedJob(client, job, 'RUNNING', {}, context);
     const item = (await client.query(`
       UPDATE order_items SET state = 'RUNNING', state_version = state_version + 1,
         started_at = COALESCE(started_at, clock_timestamp()), updated_at = clock_timestamp()
@@ -351,7 +365,7 @@ async function transitionRunning(job, context, options) {
 
 async function transitionToSettling(job, context, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
-    let updatedJob = await updateOwnedJob(client, job, 'VERIFYING');
+    let updatedJob = await updateOwnedJob(client, job, 'VERIFYING', {}, context);
     const verifying = (await client.query(`
       UPDATE order_items SET state = 'VERIFYING', state_version = state_version + 1,
         updated_at = clock_timestamp() WHERE id = $1 AND state = 'RUNNING' RETURNING *
@@ -360,7 +374,7 @@ async function transitionToSettling(job, context, options) {
       aggregateType: 'ORDER_ITEM', aggregateId: verifying.id,
       fromState: 'RUNNING', toState: 'VERIFYING', stateVersion: verifying.state_version, context,
     });
-    updatedJob = await updateOwnedJob(client, updatedJob, 'SETTLING');
+    updatedJob = await updateOwnedJob(client, updatedJob, 'SETTLING', {}, context);
     const settling = (await client.query(`
       UPDATE order_items SET state = 'SETTLING', state_version = state_version + 1,
         updated_at = clock_timestamp() WHERE id = $1 AND state = 'VERIFYING' RETURNING *
@@ -375,7 +389,7 @@ async function transitionToSettling(job, context, options) {
 
 async function completeJob(job, context, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
-    const updated = await updateOwnedJob(client, job, 'COMPLETED', { releaseLease: true });
+    const updated = await updateOwnedJob(client, job, 'COMPLETED', { releaseLease: true }, context);
     await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
       aggregateId: updated.id, aggregateVersion: updated.state_version,
       surfaceKey: 'LOG_QUEST_OPERATIONS', context });
@@ -385,9 +399,10 @@ async function completeJob(job, context, options) {
 
 async function failJob(job, context, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
-    const current = (await client.query('SELECT * FROM runner_jobs WHERE id = $1 FOR UPDATE', [job.id])).rows[0];
+    const current = (await client.query(`SELECT *,lease_expires_at>clock_timestamp() AS lease_valid
+      FROM runner_jobs WHERE id = $1 FOR UPDATE`, [job.id])).rows[0];
     if (!current || ['COMPLETED', 'FAILED'].includes(current.state)) return current;
-    const updated = await updateOwnedJob(client, current, 'FAILED', { releaseLease: true });
+    const updated = await updateOwnedJob(client, current, 'FAILED', { releaseLease: true }, context);
     await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
       aggregateId: updated.id, aggregateVersion: updated.state_version,
       surfaceKey: 'LOG_QUEST_OPERATIONS', context });
@@ -536,23 +551,54 @@ async function executeAndSettleRunner({ state, attempt, data, api, quest: initia
   return { outcome: 'READY_TO_CLAIM', quest: verified };
 }
 
-async function moveRunnerToManualReview(job, context, options, error, contractFailure) {
+export async function moveRunnerToManualReview(job, context, options, error, contractFailure) {
   await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const current = (await client.query('SELECT * FROM runner_jobs WHERE id = $1 FOR UPDATE', [job.id])).rows[0];
+    const current = (await client.query(`SELECT *,lease_expires_at>clock_timestamp() AS lease_valid
+      FROM runner_jobs WHERE id = $1 FOR UPDATE`, [job.id])).rows[0];
     if (!current || ['COMPLETED', 'FAILED', 'MANUAL_REVIEW'].includes(current.state)) return;
-    await client.query(`UPDATE runner_jobs SET state = 'MANUAL_REVIEW', state_version = state_version + 1,
-      lease_owner = NULL, lease_expires_at = NULL, updated_at = clock_timestamp() WHERE id = $1`, [job.id]);
-    await client.query(`UPDATE order_items SET state = 'MANUAL_REVIEW', state_version = state_version + 1,
-      updated_at = clock_timestamp() WHERE id = $1`, [job.order_item_id]);
+    if (current.lease_owner !== job.lease_owner || String(current.fencing_token) !== String(job.fencing_token)
+      || !current.lease_valid) {
+      throw new FencingLostError(`runner:${job.id}`);
+    }
+    const updatedJob = await updateOwnedJob(client, current, 'MANUAL_REVIEW', {
+      releaseLease: true, reasonCode: error.code ?? error.name,
+    }, context);
+    const item = (await client.query('SELECT * FROM order_items WHERE id=$1 FOR UPDATE',
+      [job.order_item_id])).rows[0];
+    if (!item || ['READY_TO_CLAIM', 'EXPIRED_RELEASED', 'EXTERNAL_COMPLETED_RELEASED', 'STOPPED_RELEASED', 'FAILED_RELEASED'].includes(item.state)) {
+      throw new QuestshopError('ITEM_STATE_CONFLICT', 'Order item is already terminal');
+    }
+    const updatedItem = (await client.query(`UPDATE order_items SET state='MANUAL_REVIEW',state_version=state_version+1,
+      updated_at=clock_timestamp() WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+    [item.id, item.state, item.state_version])).rows[0];
+    if (!updatedItem) throw new QuestshopError('ITEM_STATE_CONFLICT', 'Order item changed during Manual Review');
+    await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
+      fromState: item.state, toState: 'MANUAL_REVIEW', stateVersion: updatedItem.state_version,
+      reasonCode: error.code ?? error.name, context });
+    await enqueueProjection(client, { projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM',
+      aggregateId: item.id, aggregateVersion: updatedItem.state_version,
+      surfaceKey: 'QUEST_HISTORY', context });
+    await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
+      aggregateId: updatedJob.id, aggregateVersion: updatedJob.state_version,
+      surfaceKey: 'LOG_QUEST_OPERATIONS', context });
     await openReview(client, { subjectType: 'ORDER_ITEM', subjectId: job.order_item_id,
       reason: error.code, financial: true, ownerOnly: false, context });
     if (!contractFailure) return;
-    await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
-      updated_at=clock_timestamp() WHERE quest_id=(SELECT quest_id FROM order_items WHERE id=$1)
-      AND sale_state='OPEN'`, [job.order_item_id]);
+    const quest = (await client.query(`SELECT q.* FROM quests q JOIN order_items i ON i.quest_id=q.quest_id
+      WHERE i.id=$1 FOR UPDATE OF q`, [job.order_item_id])).rows[0];
+    if (quest?.sale_state === 'OPEN') {
+      const paused = (await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
+        updated_at=clock_timestamp() WHERE quest_id=$1 AND sale_state='OPEN' AND sale_version=$2 RETURNING *`,
+      [quest.quest_id, quest.sale_version])).rows[0];
+      if (paused) await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: paused.quest_id,
+        fromState: 'OPEN', toState: 'PAUSED', stateVersion: paused.sale_version,
+        reasonCode: error.code ?? error.name, context });
+    }
     await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-      VALUES(gen_random_uuid(),'QUEST_CONTRACT_FAILURE',$1,'OPEN','CRITICAL',$2,$3)`,
-    [job.order_item_id, { errorCode: error.code }, context.traceId]);
+      VALUES(gen_random_uuid(),'QUEST_CONTRACT_FAILURE',$1,'OPEN','CRITICAL',$2,$3)
+      ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
+      DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
+    [job.order_item_id, { errorCode: error.code ?? error.name }, context.traceId]);
   });
 }
 
