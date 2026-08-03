@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createTestPool } from '../fixtures/postgres.js';
 import { customId, parseCustomId } from '../../src/discord/components/custom-id.js';
+import { authorizeRoute } from '../../src/discord/interactions/router.js';
 import {
   bindSessionMessage,
   createAdminSession,
@@ -21,6 +22,30 @@ test('component custom IDs are versioned opaque and reject forged input', () => 
   assert.equal(parseCustomId(value).route, 'quest_confirm');
   assert.equal(parseCustomId('qs:v2:quest_confirm:not-a-session'), null);
   assert.equal(parseCustomId('qs:v1:../../admin:00000000-0000-0000-0000-000000000000'), null);
+});
+
+test('pre-launch keeps customer routes limited to Owner or Admin even when UAT gates are open', async () => {
+  const runtime = {
+    env: { PRELAUNCH: true, OWNER_ID: 'owner' },
+    config: { values: { adminRoleId: 'admin-role' } },
+    pool: { query: async () => ({ rows: [
+      { gate: 'STORE_OPEN', enabled: true }, { gate: 'CUSTOMER_INTERACTIONS_ENABLED', enabled: true },
+      { gate: 'TOPUP_ACCEPTING', enabled: true },
+    ] }) },
+  };
+  const customer = {
+    user: { id: 'customer' }, member: { roles: { cache: { has: () => false } } },
+    isButton: () => false,
+  };
+  await assert.rejects(() => authorizeRoute(customer, { route: 'payment_method' }, runtime),
+    (error) => error.code === 'PRELAUNCH_RESTRICTED');
+
+  const admin = {
+    user: { id: 'admin' }, member: { roles: { cache: { has: (id) => id === 'admin-role' } } },
+    isButton: () => false,
+  };
+  const gates = await authorizeRoute(admin, { route: 'payment_method' }, runtime);
+  assert.equal(gates.TOPUP_ACCEPTING, true);
 });
 
 test('Discord router delegates durable session state writes to domain services', async () => {

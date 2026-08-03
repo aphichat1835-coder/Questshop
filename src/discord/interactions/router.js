@@ -411,13 +411,19 @@ function isBackofficeRoute(route) {
   return prefixes.some((prefix) => route === prefix || route.startsWith(prefix));
 }
 
-async function authorizeRoute(interaction, route, runtime) {
+export async function authorizeRoute(interaction, route, runtime) {
   await assertSurfaceBinding(interaction, route, runtime);
+  const backofficeRoute = isBackofficeRoute(route.route);
+  // Pre-launch intentionally uses the production guild, database and real
+  // financial adapters.  It must therefore be an Owner/Admin-only test round:
+  // opening a gate for UAT must not accidentally make the store public.
+  if (runtime.env.PRELAUNCH && !backofficeRoute && !isBackoffice(interaction, runtime)) {
+    throw new QuestshopError('PRELAUNCH_RESTRICTED', 'ช่วงทดสอบ Pre-launch ใช้ได้เฉพาะ Owner/Admin');
+  }
   if (interaction.isButton() && ['start', 'topup'].includes(route.route)) {
     await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'BUTTON' }, contextFor(interaction, 'button_rate'));
   }
   const gates = Object.fromEntries((await runtime.pool.query('SELECT gate, enabled FROM feature_gates')).rows.map((row) => [row.gate, row.enabled]));
-  const backofficeRoute = isBackofficeRoute(route.route);
   if (backofficeRoute && !isBackoffice(interaction, runtime)) throw new QuestshopError('ADMIN_ONLY', 'เมนูนี้ใช้ได้เฉพาะ Owner/Admin');
   if (!backofficeRoute && (!gates.STORE_OPEN || !gates.CUSTOMER_INTERACTIONS_ENABLED)) throw new QuestshopError('STORE_CLOSED', 'ร้านปิดรับรายการชั่วคราว');
   if (['payment_method', 'voucher_submit'].includes(route.route) && !gates.TOPUP_ACCEPTING) throw new QuestshopError('TOPUP_CLOSED', 'ระบบเติมเงินปิดชั่วคราว');
