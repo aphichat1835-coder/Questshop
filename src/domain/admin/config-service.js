@@ -3,8 +3,9 @@ import { withTransaction } from '../../db/transaction.js';
 import { appendAdminAudit } from './audit.js';
 import { assertFeatureGate } from '../../config/feature-gates.js';
 import { createHash } from 'node:crypto';
+import { appendReleaseEvidence } from './release-evidence.js';
 
-export async function updateFeatureGate({ gate, enabled, reason, expectedVersion }, context, options = {}) {
+export async function updateFeatureGate({ gate, enabled, reason, expectedVersion, release = null }, context, options = {}) {
   assertFeatureGate(gate);
   if (!reason?.trim()) throw new TypeError('feature gate reason is required');
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
@@ -16,6 +17,12 @@ export async function updateFeatureGate({ gate, enabled, reason, expectedVersion
       context.actorId, context.traceId, expectedVersion])).rows[0];
     await appendAdminAudit(client, { action: 'FEATURE_GATE_CHANGE', targetType: 'FEATURE_GATE',
       targetId: gate, actorId: context.actorId, before, after, reason, context });
+    if (release?.prelaunch) {
+      await appendReleaseEvidence(client, {
+        evidenceType: 'PRELAUNCH_GATE', subjectType: 'FEATURE_GATE', subjectId: `${gate}:v${after.version}`,
+        release, evidence: { enabled, reason, beforeVersion: before.version, afterVersion: after.version },
+      }, context);
+    }
     return after;
   });
 }

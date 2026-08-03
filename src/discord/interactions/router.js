@@ -39,6 +39,7 @@ import {
 } from '../../domain/admin/operations-service.js';
 import { discardDeadLetter, replayDeadLetter } from '../../domain/outbox/dlq-service.js';
 import { loadRuntimeConfig } from '../../config/runtime-config.js';
+import { APP_VERSION, ENGINE_VERSION } from '../../config/versions.js';
 
 function money(cents) { return `${(Number(cents) / 100).toFixed(2)} บาท`; }
 function runnerConcurrency(runtime) {
@@ -1498,7 +1499,10 @@ if (['gate_enable_submit','gate_disable_submit'].includes(route.route) && intera
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_GATE' }, context, { pool: runtime.pool });
   const changed = await updateFeatureGate({ gate: session.payload.gate,
     enabled: route.route === 'gate_enable_submit', reason: interaction.fields.getTextInputValue('reason'),
-    expectedVersion: session.payload.expectedVersion }, context, { pool: runtime.pool });
+    expectedVersion: session.payload.expectedVersion,
+    release: runtime.env.PRELAUNCH ? {
+      prelaunch: true, gitSha: runtime.env.GIT_SHA, appVersion: APP_VERSION, engineVersion: ENGINE_VERSION,
+    } : null }, context, { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`อัปเดต **${changed.gate}** เป็น ${changed.enabled ? 'เปิด' : 'ปิด'} (v${changed.version}) แล้ว`);
 }
