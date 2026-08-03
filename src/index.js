@@ -18,6 +18,10 @@ try {
       await shutdownModule.shutdown(runtime, signal, options);
     })().catch(() => { process.exitCode = 1; });
     await stopping;
+    // A lost Runtime lease is a fencing event, not a recoverable shutdown.
+    // Exit after cleanup so a stuck handle cannot leave a split-brain process
+    // alive with an invalid authority token.
+    if (options.leaseLost) process.exit(1);
   };
   runtime = await startup({ health, server,
     onRuntimeLeaseLost: (error) => stop('RUNTIME_LEASE_LOST', { leaseLost: true, error }) });
