@@ -62,10 +62,9 @@ test('simultaneous confirmation of one checkout creates one order and one reserv
     confirmOrder(input, context(user, 'race-confirm-a'), options),
     confirmOrder(input, context(user, 'race-confirm-b'), options),
   ]);
-  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
-  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
-  const rejected = results.find((result) => result.status === 'rejected');
-  assert.equal(rejected.reason.code, 'SESSION_EXPIRED');
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 2);
+  assert.equal(results[0].value.orderId, results[1].value.orderId);
+  assert.equal(results.filter((result) => result.value.idempotent === true).length, 1);
   assert.equal(Number((await pool.query('SELECT count(*) AS count FROM orders')).rows[0].count), 1);
   assert.equal(Number((await pool.query('SELECT count(*) AS count FROM wallet_reservations')).rows[0].count), 1);
   const wallet = (await pool.query('SELECT available_cents,reserved_cents FROM wallets WHERE discord_user_id=$1', [user])).rows[0];

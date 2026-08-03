@@ -200,16 +200,21 @@ async function validateOptionAdmission(client, option, quest) {
 }
 
 async function lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId = null,
-  messageId = null }) {
+  messageId = null }, { allowConfirmed = false } = {}) {
   const session = (await client.query(`
     SELECT *, expires_at > clock_timestamp() AS is_fresh
     FROM interaction_sessions WHERE id = $1 FOR UPDATE
   `, [sessionId])).rows[0];
-  if (session?.state !== 'ACTIVE' || !session.is_fresh) {
+  const confirmedReplay = allowConfirmed && session?.state === 'CONFIRMED'
+    && typeof session.payload?.orderId === 'string';
+  if ((!confirmedReplay && session?.state !== 'ACTIVE') || (!confirmedReplay && !session.is_fresh)) {
     throw new QuestshopError('SESSION_EXPIRED', 'เซสชันหมดอายุ กรุณาเริ่มใหม่');
   }
   if (session.actor_id !== actorId || session.guild_id !== guildId) {
     throw new AuthorizationError('เซสชันนี้เป็นของผู้ใช้อื่น');
+  }
+  if (session.operation !== 'CHECKOUT') {
+    throw new AuthorizationError('เซสชันนี้ไม่ใช่ Checkout session');
   }
   if (channelId && session.channel_id !== channelId) {
     throw new AuthorizationError('เซสชันนี้ถูกเรียกจากห้องอื่น');
@@ -218,6 +223,38 @@ async function lockAuthorizedSession(client, { sessionId, actorId, guildId, chan
     throw new AuthorizationError('เซสชันนี้ถูกเรียกจากข้อความอื่น');
   }
   return session;
+}
+
+async function orderResult(client, orderId) {
+  const items = (await client.query(`
+    SELECT * FROM order_items WHERE order_id = $1 ORDER BY sequence_number, id
+  `, [orderId])).rows;
+  if (!items.length) throw new QuestshopError('CHECKOUT_RESULT_MISSING', 'ไม่พบผลลัพธ์ Order เดิม');
+  return { orderId, items, totalCents: sumCents(items.map((item) => item.price_cents)) };
+}
+
+async function loadConfirmedOrder({ sessionId, actorId, guildId, channelId = null,
+  messageId = null }, options = {}) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {
+    const session = (await client.query(`
+      SELECT * FROM interaction_sessions WHERE id = $1
+    `, [sessionId])).rows[0];
+    if (!session) throw new QuestshopError('SESSION_NOT_FOUND', 'ไม่พบ Checkout session');
+    if (session.actor_id !== actorId || session.guild_id !== guildId) {
+      throw new AuthorizationError('เซสชันนี้เป็นของผู้ใช้อื่น');
+    }
+    if (session.operation !== 'CHECKOUT') {
+      throw new AuthorizationError('เซสชันนี้ไม่ใช่ Checkout session');
+    }
+    if (channelId && session.channel_id !== channelId) {
+      throw new AuthorizationError('เซสชันนี้ถูกเรียกจากห้องอื่น');
+    }
+    if (messageId && session.message_id && session.message_id !== messageId) {
+      throw new AuthorizationError('เซสชันนี้ถูกเรียกจากข้อความอื่น');
+    }
+    if (session.state !== 'CONFIRMED' || typeof session.payload?.orderId !== 'string') return null;
+    return { ...(await orderResult(client, session.payload.orderId)), idempotent: true };
+  });
 }
 
 export async function updateSelection({ sessionId, actorId, guildId, channelId = null,
@@ -321,6 +358,9 @@ async function loadPreflight({ sessionId, actorId, guildId, channelId, messageId
     const dbNow = (await client.query('SELECT clock_timestamp() AS now')).rows[0].now;
     return { session, credential, items, dbNow };
   });
+  if (!snapshot.credential) {
+    throw new QuestshopError('CHECKOUT_CREDENTIAL_MISSING', 'ไม่พบ Credential ของ Checkout session');
+  }
   if (!snapshot.items.length) throw new QuestshopError('NO_QUEST_SELECTED', 'กรุณาเลือก Quest อย่างน้อยหนึ่งรายการ');
   const token = decryptSecret({
     keyVersion: snapshot.credential.key_version,
@@ -340,7 +380,12 @@ async function loadPreflight({ sessionId, actorId, guildId, channelId, messageId
 
 async function validateConfirmationSession(client, sessionInput, preflight, env) {
   const { sessionId, actorId, guildId, channelId, messageId } = sessionInput;
-  const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
+  const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId }, {
+    allowConfirmed: true,
+  });
+  if (session.state === 'CONFIRMED' && typeof session.payload?.orderId === 'string') {
+    return { session, selected: [], idempotentOrderId: session.payload.orderId };
+  }
   if (session.trace_id !== preflight.session.trace_id) {
     throw new QuestshopError('PREFLIGHT_TRACE_MISMATCH', 'ผลการตรวจบัญชีไม่ตรงกับ Checkout session');
   }
@@ -536,21 +581,36 @@ async function enqueueOrderHistory(client, itemRows, context) {
   }
 }
 
-async function finishCheckout(client, sessionId) {
+async function finishCheckout(client, sessionId, orderId) {
   await client.query(`
-      UPDATE interaction_sessions SET state = 'CONFIRMED', state_version = state_version + 1,
+    UPDATE interaction_sessions SET state = 'CONFIRMED', state_version = state_version + 1,
+        payload = payload || jsonb_build_object('orderId', $2::text),
         updated_at = transaction_timestamp() WHERE id = $1
-  `, [sessionId]);
+  `, [sessionId, orderId]);
   await client.query('DELETE FROM checkout_credentials WHERE session_id = $1', [sessionId]);
 }
 
 export async function confirmOrder({ sessionId, actorId, guildId, channelId = null,
   messageId = null, env, runnerConcurrency = env.RUNNER_CONCURRENCY }, context, options = {}) {
   const input = { sessionId, actorId, guildId, channelId, messageId };
-  const preflight = await loadPreflight({ ...input, env }, options);
+  const existing = await loadConfirmedOrder(input, options);
+  if (existing) return existing;
+  let preflight;
+  try {
+    preflight = await loadPreflight({ ...input, env }, options);
+  } catch (error) {
+    if (error.code === 'SESSION_EXPIRED' || error.code === 'CHECKOUT_CREDENTIAL_MISSING') {
+      const replay = await loadConfirmedOrder(input, options);
+      if (replay) return replay;
+    }
+    throw error;
+  }
   const freshById = new Map(preflight.quests.map((quest) => [quest.id, quest]));
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const { session, selected } = await validateConfirmationSession(client, input, preflight, env);
+    const { session, selected, idempotentOrderId } = await validateConfirmationSession(client, input, preflight, env);
+    if (idempotentOrderId) {
+      return { ...(await orderResult(client, idempotentOrderId)), idempotent: true };
+    }
     const correlatedContext = withSessionTrace(context, session);
     const validated = await validateSelectedOptions(client, selected, freshById, runnerConcurrency);
     const orderId = await createOrder(client, actorId, preflight, correlatedContext, env);
@@ -562,7 +622,7 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
     }, correlatedContext);
     await queueFirstOrderItem(client, itemRows, actorId, preflight, correlatedContext);
     await enqueueOrderHistory(client, itemRows, correlatedContext);
-    await finishCheckout(client, sessionId);
+    await finishCheckout(client, sessionId, orderId);
     return { orderId, items: itemRows, totalCents: sumCents(itemRows.map((item) => item.price_cents)) };
   });
 }

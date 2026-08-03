@@ -54,6 +54,13 @@ test('large checkout reserves all items but materializes one account job', async
     guildId: '10000000000000002', env }, createContext({ traceId: confirmationTrace,
     actorType: 'CUSTOMER', actorId: user, guildId: '10000000000000002', idempotencyKey: 'confirm' }), options);
   assert.equal(order.items.length, 5);
+  const duplicateOrder = await confirmOrder({ sessionId: created.session.id, actorId: user,
+    guildId: '10000000000000002', env }, createContext({ traceId: uuidv7(),
+    actorType: 'CUSTOMER', actorId: user, guildId: '10000000000000002', idempotencyKey: 'confirm-duplicate' }), options);
+  assert.equal(duplicateOrder.orderId, order.orderId);
+  assert.equal(duplicateOrder.idempotent, true);
+  assert.equal(Number((await pool.query('SELECT count(*)::integer AS count FROM orders WHERE id=$1',
+    [order.orderId])).rows[0].count), 1);
   const persistedSession = (await pool.query('SELECT trace_id FROM interaction_sessions WHERE id=$1', [created.session.id])).rows[0];
   const persistedOrder = (await pool.query('SELECT trace_id FROM orders WHERE id=$1', [order.orderId])).rows[0];
   const auditEvent = (await pool.query(`SELECT trace_id FROM outbox_events
