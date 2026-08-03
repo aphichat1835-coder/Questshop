@@ -2,7 +2,9 @@ import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestPool } from '../fixtures/postgres.js';
 import { createContext } from '../../src/shared/correlation.js';
-import { addMonitor, rotateMonitorCredential, setMonitorState } from '../../src/domain/admin/monitor-service.js';
+import {
+  addMonitor, checkAllMonitorHealth, checkMonitorHealth, rotateMonitorCredential, setMonitorState,
+} from '../../src/domain/admin/monitor-service.js';
 import { setCircuitBreakerState } from '../../src/domain/admin/operations-service.js';
 import { createPromotion, setPriceRule, setPriceRuleEnabled, setPromotionState } from '../../src/domain/admin/config-service.js';
 
@@ -20,15 +22,15 @@ test('monitor credential rotation validates the same account and never exposes p
   const factory = ({ token }) => ({ fetchCurrentUser: async () => ({
     id: token === 'other-token' ? 'account-2' : 'account-1', username: 'monitor',
   }) });
-  const monitor = await addMonitor({ token: 'initial-token', capabilities: ['SCAN', 'TEST'], env,
-    reason: 'initial monitor' }, context, { pool, questApiFactory: factory });
+  const monitor = await addMonitor({ token: 'initial-token', env }, context, { pool, questApiFactory: factory });
   assert.equal(monitor.account_id, 'account-1');
-  await setMonitorState({ monitorId: monitor.id, state: 'QUARANTINED', reason: 'auth failure' },
+  assert.deepEqual(monitor.capabilities, ['SCAN', 'TEST']);
+  await setMonitorState({ monitorId: monitor.id, state: 'QUARANTINED' },
     context, { pool });
-  await assert.rejects(() => rotateMonitorCredential({ monitorId: monitor.id, token: 'other-token', env,
-    reason: 'wrong account' }, context, { pool, questApiFactory: factory }), /does not match/);
-  const rotated = await rotateMonitorCredential({ monitorId: monitor.id, token: 'replacement-token', env,
-    reason: 'owner rotation' }, context, { pool, questApiFactory: factory });
+  await assert.rejects(() => rotateMonitorCredential({ monitorId: monitor.id, token: 'other-token', env },
+    context, { pool, questApiFactory: factory }), /does not match/);
+  const rotated = await rotateMonitorCredential({ monitorId: monitor.id, token: 'replacement-token', env },
+    context, { pool, questApiFactory: factory });
   assert.equal(rotated.state, 'ACTIVE');
   const credential = (await pool.query('SELECT * FROM monitor_credentials WHERE monitor_id=$1', [monitor.id])).rows[0];
   assert.notEqual(credential.ciphertext.toString('utf8'), 'replacement-token');
@@ -37,6 +39,59 @@ test('monitor credential rotation validates the same account and never exposes p
   assert.deepEqual(audit.map((row) => row.action), [
     'ADD_MONITOR', 'MONITOR_STATE_CHANGE', 'ROTATE_MONITOR_CREDENTIAL',
   ]);
+});
+
+test('monitor health check is read-only, records readiness, and quarantines an invalid token', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const calls = [];
+  const factory = ({ token }) => ({
+    fetchCurrentUser: async () => {
+      calls.push(`profile:${token}`);
+      if (token === 'invalid-token') {
+        const error = new Error('unauthorized');
+        error.status = 401;
+        throw error;
+      }
+      return { id: token === 'healthy-token' ? 'monitor-health' : 'monitor-invalid', username: token };
+    },
+    fetchQuests: async () => {
+      calls.push(`quests:${token}`);
+      return [{ id: 'quest-a' }, { id: 'quest-b' }];
+    },
+  });
+  const healthy = await addMonitor({ token: 'healthy-token', env }, context, { pool, questApiFactory: factory });
+  const invalid = await addMonitor({ token: 'valid-before-rotation', env }, context, { pool, questApiFactory: factory });
+  await rotateMonitorCredential({ monitorId: invalid.id, token: 'invalid-token', env }, context, {
+    pool,
+    questApiFactory: ({ token }) => ({ fetchCurrentUser: async () => ({ id: 'monitor-invalid', username: token }) }),
+  });
+
+  calls.length = 0;
+  const ready = await checkMonitorHealth({ monitorId: healthy.id, env }, context, { pool, questApiFactory: factory });
+  assert.equal(ready.healthState, 'READY');
+  assert.equal(ready.questCount, 2);
+  assert.deepEqual(calls, ['profile:healthy-token', 'quests:healthy-token']);
+
+  const failed = await checkMonitorHealth({ monitorId: invalid.id, env }, context, { pool, questApiFactory: factory });
+  assert.equal(failed.healthState, 'INVALID');
+  assert.equal(failed.errorCode, 'TOKEN_REJECTED');
+  const row = (await pool.query(`SELECT state,health_state,last_health_quest_count,last_health_error_code
+    FROM monitor_accounts WHERE id=$1`, [invalid.id])).rows[0];
+  assert.deepEqual(row, {
+    state: 'QUARANTINED', health_state: 'INVALID', last_health_quest_count: null,
+    last_health_error_code: 'TOKEN_REJECTED',
+  });
+
+  await setMonitorState({ monitorId: healthy.id, state: 'DISABLED' }, context, { pool });
+  const all = await checkAllMonitorHealth({ env }, context, { pool, questApiFactory: factory });
+  const disabled = all.find((result) => result.monitor.id === healthy.id);
+  assert.equal(disabled?.healthState, 'READY');
+  assert.equal(disabled?.monitor.state, 'DISABLED');
+  assert.ok(all.some((result) => result.monitor.id === invalid.id));
+  const plaintext = JSON.stringify((await pool.query(`SELECT before_state,after_state FROM admin_audit_logs
+    WHERE action='MONITOR_HEALTH_CHECK'`)).rows);
+  assert.equal(plaintext.includes('healthy-token'), false);
+  assert.equal(plaintext.includes('invalid-token'), false);
 });
 
 test('circuit breaker recovery uses optimistic state version and audit', async (t) => {

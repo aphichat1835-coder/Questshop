@@ -22,6 +22,20 @@ Implementation: migration `0017_monitor_test_sale_gate.sql`, `domain/catalog/tes
 checkout, test worker, admin override and Discord projection/router changes. Automated evidence:
 `test/integration/monitor-test-gate.test.js` and `checkout-lazy.test.js`.
 
+## Later Owner usability decision — Monitor Token panel
+
+Every Monitor is created with both `SCAN` and `TEST`; the Admin flow no longer asks the Owner to
+choose capabilities or type an artificial reason.  The Owner-only Monitor panel provides a
+read-only **เช็คระบบ Token** action and an individual-account check.  A check decrypts the stored
+credential, confirms its Discord identity matches the stored Account ID, and reads the Quest list;
+it never enrolls, starts, progresses or claims a Quest.  `READY`, `DEGRADED` and `INVALID` health
+are stored durably.  An invalid/decryption-failed Token is quarantined, and neither plaintext Token
+nor secret material is rendered or written to audit data.
+
+Implementation: migration `0018_monitor_health.sql`, `domain/admin/monitor-service.js`, the
+Monitor route handlers in `discord/interactions/router.js`, and
+`test/integration/admin-operations.test.js`.
+
 The Final Decision-Complete plan wins if the documents differ.  This record is a source and
 automated-test audit; release evidence must record `git rev-parse HEAD` at the time each command
 or live check runs.  It does **not** replace the live evidence required for a production release.
@@ -30,7 +44,7 @@ or live check runs.  It does **not** replace the live evidence required for a pr
 
 | Evidence | Result |
 |---|---|
-| Node `22.22.0`, PostgreSQL `16`, `npm run verify` | Passed: syntax, ESLint and 60 tests |
+| Node `22.22.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 61 tests |
 | `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
 | `git diff --check` | Passed |
 | Git tracked files | Neither legacy reference project is tracked; both are ignored locally |
@@ -64,7 +78,7 @@ contracts, not evidence for a managed production service.
 | 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. External alert delivery and monthly SLO evidence remain. |
 | 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
 | 22. Development sequence and feature gates | feature-gate config, Admin controls and pre-launch document | Source-confirmed. Owner must enable gates in the required live order. |
-| 23. Definition of Done and acceptance | definition-of-done, traceability and 60 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
+| 23. Definition of Done and acceptance | definition-of-done, traceability and 61 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
 
 ## Technical Blueprint plan
 

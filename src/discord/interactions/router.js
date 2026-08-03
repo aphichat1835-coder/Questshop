@@ -33,7 +33,9 @@ import { addEvidence, assignReview, resolveSubjectReview } from '../../domain/re
 import { parseBahtToCents } from '../../shared/money.js';
 import { repairPermissionDrift } from '../permissions/drift.js';
 import { activateReceiver } from '../../domain/admin/receiver-service.js';
-import { addMonitor, rotateMonitorCredential, setMonitorState } from '../../domain/admin/monitor-service.js';
+import {
+  addMonitor, checkAllMonitorHealth, checkMonitorHealth, rotateMonitorCredential, setMonitorState,
+} from '../../domain/admin/monitor-service.js';
 import {
   forcePublishFailedMonitorTest, openOrderItemReview, setCircuitBreakerState, setQuestSaleState,
 } from '../../domain/admin/operations-service.js';
@@ -278,12 +280,92 @@ async function renderReceiversPanel(interaction, runtime) {
 
 async function renderMonitorsPanel(interaction, runtime) {
   ownerOnly(interaction, runtime, 'Monitor Accounts ใช้ได้เฉพาะ Owner');
-  const monitors = (await runtime.pool.query('SELECT * FROM monitor_accounts ORDER BY priority DESC,created_at')).rows;
+  const [monitorsResult, testsResult] = await Promise.all([
+    runtime.pool.query('SELECT * FROM monitor_accounts ORDER BY priority DESC,created_at'),
+    runtime.pool.query(`SELECT count(*)::integer AS count FROM quest_test_runs
+      WHERE state IN ('TEST_QUEUED','TESTING')`),
+  ]);
+  const monitors = monitorsResult.rows;
+  const summary = {
+    ready: monitors.filter((row) => row.health_state === 'READY' && row.state === 'ACTIVE').length,
+    degraded: monitors.filter((row) => row.health_state === 'DEGRADED').length,
+    unavailable: monitors.filter((row) => ['INVALID', 'QUARANTINED', 'DISABLED'].includes(row.health_state)
+      || ['QUARANTINED', 'DISABLED'].includes(row.state)).length,
+  };
+  const status = (monitor) => {
+    if (monitor.state === 'DISABLED') return '⚪ พักใช้งาน';
+    if (monitor.state === 'QUARANTINED' || monitor.health_state === 'INVALID') return '🔴 ใช้ไม่ได้';
+    if (monitor.health_state === 'READY') return '🟢 พร้อม';
+    if (monitor.health_state === 'DEGRADED') return '🟡 ตรวจพบปัญหา';
+    return '⚫ ยังไม่ตรวจ';
+  };
+  const recent = listRows(monitors.slice(0, 10), (monitor) => `• ${status(monitor)} **${monitor.username ?? 'ไม่ระบุ'}** (\`${monitor.account_id}\`)`, 'ยังไม่มี Token Monitor');
+  const description = [
+    `ทั้งหมด **${monitors.length}** • พร้อม **${summary.ready}** • มีปัญหา **${summary.degraded}** • ใช้ไม่ได้/พัก **${summary.unavailable}**`,
+    `กำลังทดสอบ Quest: **${testsResult.rows[0].count}** งาน`, '', recent,
+    '', 'Monitor ทุกตัวถูกบังคับให้ใช้ได้ทั้งสแกนและทดสอบ Quest • Token ไม่แสดงในหน้า Admin',
+  ].join('\n');
   return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Monitor Accounts',
-    listRows(monitors, (monitor) => `• **${monitor.username}** (\`${monitor.account_id}\`) • ${monitor.state} • ${monitor.capabilities.join(', ')}`, 'ยังไม่มี Monitor'))],
+    description)],
   components: [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId('monitor_add')).setLabel('เพิ่ม Monitor').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(customId('monitor_manage')).setLabel('State / Rotate token').setStyle(ButtonStyle.Secondary).setDisabled(!monitors.length),
+    new ButtonBuilder().setCustomId(customId('monitor_add')).setLabel('เพิ่ม Token').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(customId('monitor_check_all')).setLabel('เช็คระบบ Token').setStyle(ButtonStyle.Secondary).setDisabled(!monitors.length),
+    new ButtonBuilder().setCustomId(customId('monitor_list')).setLabel('ดูบัญชีทั้งหมด').setStyle(ButtonStyle.Secondary).setDisabled(!monitors.length),
+  )] });
+}
+
+function monitorHealthLine(result) {
+  const monitor = result.monitor;
+  const state = monitor.state === 'DISABLED' && result.healthState === 'READY' ? '⚪ พักใช้งาน (Token ปกติ)'
+    : monitor.state === 'DISABLED' ? '⚪ พักใช้งาน (Token มีปัญหา)'
+    : result.healthState === 'READY' ? '🟢 พร้อม'
+    : result.healthState === 'DEGRADED' ? '🟡 มีปัญหาชั่วคราว' : '🔴 ใช้ไม่ได้';
+  const detail = result.healthState === 'READY'
+    ? `อ่าน Quest ได้ ${result.questCount} รายการ`
+    : `สาเหตุ: ${result.errorCode}`;
+  return `${state} **${monitor.username ?? 'ไม่ระบุ'}** (\`${monitor.account_id}\`) — ${detail}`;
+}
+
+async function renderMonitorList(interaction, runtime) {
+  ownerOnly(interaction, runtime, 'Monitor Accounts ใช้ได้เฉพาะ Owner');
+  const monitors = (await runtime.pool.query(`SELECT * FROM monitor_accounts
+    ORDER BY priority DESC,created_at LIMIT 25`)).rows;
+  const description = monitors.length
+    ? 'เลือกบัญชีเพื่อดูสถานะ เช็ค Token เปลี่ยน Token หรือพักใช้งาน'
+    : 'ยังไม่มี Token Monitor ให้เพิ่ม Token ก่อน';
+  const components = monitors.length ? [new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId(customId('monitor_select')).setPlaceholder('เลือกบัญชี Monitor')
+      .addOptions(monitors.map((monitor) => ({
+        label: String(monitor.username ?? monitor.account_id).slice(0, 100), value: monitor.id,
+        description: `${monitor.account_id} • ${monitor.health_state} • ${monitor.state}`.slice(0, 100),
+      }))),
+  )] : [];
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'รายการ Monitor Accounts', description)], components });
+}
+
+async function renderMonitorDetail(interaction, runtime, monitorId) {
+  ownerOnly(interaction, runtime, 'Monitor Accounts ใช้ได้เฉพาะ Owner');
+  const monitor = (await runtime.pool.query('SELECT * FROM monitor_accounts WHERE id=$1', [monitorId])).rows[0];
+  if (!monitor) throw new QuestshopError('MONITOR_NOT_FOUND', 'ไม่พบบัญชี Monitor');
+  const health = monitor.health_state === 'READY' ? '🟢 พร้อมใช้งาน'
+    : monitor.health_state === 'DEGRADED' ? '🟡 มีปัญหาชั่วคราว'
+      : monitor.health_state === 'INVALID' ? '🔴 Token ใช้ไม่ได้' : '⚫ ยังไม่ตรวจ';
+  const checked = monitor.last_health_checked_at
+    ? `<t:${Math.floor(new Date(monitor.last_health_checked_at).getTime() / 1000)}:R>` : 'ยังไม่เคยตรวจ';
+  const description = [
+    `**บัญชี:** ${monitor.username ?? 'ไม่ระบุ'}`, `**Account ID:** \`${monitor.account_id}\``,
+    `**สถานะ:** ${monitor.state}`, `**สุขภาพ Token:** ${health}`,
+    `**ตรวจล่าสุด:** ${checked}`, `**Quest ตอนตรวจ:** ${monitor.last_health_quest_count ?? 'ไม่ระบุ'}`,
+    `**Error ล่าสุด:** ${monitor.last_health_error_code ?? 'ไม่มี'}`,
+    '', 'ปุ่มเช็คบัญชีนี้อ่านข้อมูลบัญชี/Quest เท่านั้น ไม่ทำ Quest จริง',
+  ].join('\n');
+  const toggle = monitor.state === 'DISABLED' ? 'เปิดใช้งาน' : 'พักบัญชี';
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'รายละเอียด Monitor', description)],
+  components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('monitor_check_one', monitor.id)).setLabel('เช็คบัญชีนี้').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(customId('monitor_rotate', monitor.id)).setLabel('เปลี่ยน Token').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(customId('monitor_toggle', monitor.id)).setLabel(toggle).setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(customId('monitor_list')).setLabel('กลับไปรายการ').setStyle(ButtonStyle.Secondary),
   )] });
 }
 
@@ -1275,8 +1357,6 @@ if (route.route === 'monitor_add' && interaction.isButton()) {
     payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'monitor_session'), { pool: runtime.pool });
   return interaction.showModal(fieldsModal('monitor_add_submit', session.id, 'เพิ่ม Monitor Account', [
     { id: 'token', label: 'Discord Token', long: true, max: 300 },
-    { id: 'capabilities', label: 'Capabilities', placeholder: 'SCAN,TEST', max: 20 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
   ]));
 }
 }
@@ -1288,48 +1368,94 @@ if (route.route === 'monitor_add_submit' && interaction.isModalSubmit()) {
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'MONITOR_ADD' },
   contextFor(interaction, 'monitor_load'), { pool: runtime.pool });
-  const monitor = await addMonitor({ token: interaction.fields.getTextInputValue('token'),
-    capabilities: interaction.fields.getTextInputValue('capabilities').split(',').map((value) => value.trim().toUpperCase()),
-    env: runtime.env, reason: interaction.fields.getTextInputValue('reason').trim() },
+  const monitor = await addMonitor({ token: interaction.fields.getTextInputValue('token'), env: runtime.env },
   contextFor(interaction, 'monitor_add_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`เพิ่ม Monitor **${monitor.username}** (\`${monitor.account_id}\`) แล้ว โดย Token ถูกเข้ารหัสและไม่สามารถเปิดดูจาก Admin ได้`);
+  return interaction.editReply(`เพิ่ม Monitor **${monitor.username}** (\`${monitor.account_id}\`) แล้ว\nระบบกำหนดสิทธิ์สแกนและทดสอบ Quest ให้ทุก Token อัตโนมัติ โดย Token ถูกเข้ารหัสและไม่สามารถเปิดดูจาก Admin ได้`);
 }
 }
 
-async function handleMonitorManage({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'monitor_manage' && interaction.isButton()) {
+async function handleMonitorCheckAll({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'monitor_check_all' && interaction.isButton()) {
   if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Monitor ใช้ได้เฉพาะ Owner');
+  await interaction.deferReply({ ephemeral: true });
+  const results = await checkAllMonitorHealth({ env: runtime.env },
+    contextFor(interaction, 'monitor_check_all_execute'), { pool: runtime.pool });
+  const ready = results.filter((result) => result.healthState === 'READY').length;
+  const paused = results.filter((result) => result.monitor.state === 'DISABLED').length;
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'ผลตรวจระบบ Token', [
+    `ตรวจ **${results.length}** Token • Token ปกติ **${ready}** • มีปัญหา/ใช้ไม่ได้ **${results.length - ready}** • พักใช้งาน **${paused}**`, '',
+    listRows(results, monitorHealthLine, 'ยังไม่มี Token Monitor'),
+    '', 'การตรวจนี้เช็คการถอดรหัส Token, ล็อกอิน และอ่านรายการ Quest เท่านั้น — ไม่ทำ Quest จริง',
+  ].join('\n'))] });
+}
+}
+
+async function handleMonitorList({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'monitor_list' && interaction.isButton()) {
+  ownerOnly(interaction, runtime, 'Monitor Accounts ใช้ได้เฉพาะ Owner');
+  await interaction.deferUpdate();
+  return renderMonitorList(interaction, runtime);
+}
+}
+
+async function handleMonitorSelect({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'monitor_select' && interaction.isStringSelectMenu()) {
+  ownerOnly(interaction, runtime, 'Monitor Accounts ใช้ได้เฉพาะ Owner');
+  const monitorId = interaction.values[0];
+  await interaction.deferUpdate();
+  return renderMonitorDetail(interaction, runtime, monitorId);
+}
+}
+
+async function handleMonitorCheckOne({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'monitor_check_one' && interaction.isButton()) {
+  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Monitor ใช้ได้เฉพาะ Owner');
+  await interaction.deferReply({ ephemeral: true });
+  const result = await checkMonitorHealth({ monitorId: route.sessionId, env: runtime.env },
+    contextFor(interaction, 'monitor_check_one_execute'), { pool: runtime.pool });
+  return interaction.editReply(`${monitorHealthLine(result)}\nการตรวจนี้ไม่สั่งทำ Quest จริง`);
+}
+}
+
+async function handleMonitorRotate({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'monitor_rotate' && interaction.isButton()) {
+  ownerOnly(interaction, runtime, 'Monitor ใช้ได้เฉพาะ Owner');
   const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'MONITOR_MANAGE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'monitor_manage_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('monitor_manage_submit', session.id, 'Manage Monitor', [
-    { id: 'monitor_id', label: 'Monitor ID', max: 36 },
-    { id: 'state', label: 'State', placeholder: 'ACTIVE / QUARANTINED / DISABLED', max: 16 },
-    { id: 'token', label: 'Token ใหม่ (เว้นว่างถ้าไม่ Rotate)', long: true, required: false, max: 300 },
-    { id: 'reason', label: 'เหตุผล / หลักฐาน', long: true, max: 500 },
+    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'MONITOR_ROTATE',
+    payload: { monitorId: route.sessionId }, configVersion: runtime.config.version },
+  contextFor(interaction, 'monitor_rotate_session'), { pool: runtime.pool });
+  return interaction.showModal(fieldsModal('monitor_rotate_submit', session.id, 'เปลี่ยน Token Monitor', [
+    { id: 'token', label: 'Discord Token ใหม่', long: true, max: 300 },
   ]));
 }
 }
 
-async function handleMonitorManageSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'monitor_manage_submit' && interaction.isModalSubmit()) {
-  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Monitor ใช้ได้เฉพาะ Owner');
+async function handleMonitorRotateSubmit({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'monitor_rotate_submit' && interaction.isModalSubmit()) {
+  ownerOnly(interaction, runtime, 'Monitor ใช้ได้เฉพาะ Owner');
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'MONITOR_MANAGE' },
-  contextFor(interaction, 'monitor_manage_load'), { pool: runtime.pool });
-  const monitorId = interaction.fields.getTextInputValue('monitor_id').trim();
-  const state = interaction.fields.getTextInputValue('state').trim().toUpperCase();
-  const token = interaction.fields.getTextInputValue('token').trim();
-  const reason = interaction.fields.getTextInputValue('reason').trim();
-  let monitor;
-  if (token) monitor = await rotateMonitorCredential({ monitorId, token, env: runtime.env, reason },
-    contextFor(interaction, 'monitor_rotate_execute'), { pool: runtime.pool });
-  if (!token || state !== 'ACTIVE') monitor = await setMonitorState({ monitorId, state, reason },
-    contextFor(interaction, 'monitor_state_execute'), { pool: runtime.pool });
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'MONITOR_ROTATE' },
+  contextFor(interaction, 'monitor_rotate_load'), { pool: runtime.pool });
+  const monitor = await rotateMonitorCredential({ monitorId: session.payload.monitorId,
+    token: interaction.fields.getTextInputValue('token'), env: runtime.env },
+  contextFor(interaction, 'monitor_rotate_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`Monitor \`${monitor.id}\` เป็น **${monitor.state}** แล้ว${token ? ' และ Token ถูก Rotate แบบเข้ารหัส' : ''}`);
+  return interaction.editReply(`เปลี่ยน Token ของ **${monitor.username ?? monitor.account_id}** เรียบร้อยแล้ว และเปิดใช้งานบัญชีนี้อีกครั้ง`);
+}
+}
+
+async function handleMonitorToggle({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'monitor_toggle' && interaction.isButton()) {
+  ownerOnly(interaction, runtime, 'Monitor ใช้ได้เฉพาะ Owner');
+  await interaction.deferReply({ ephemeral: true });
+  const monitor = (await runtime.pool.query('SELECT * FROM monitor_accounts WHERE id=$1', [route.sessionId])).rows[0];
+  if (!monitor) throw new QuestshopError('MONITOR_NOT_FOUND', 'ไม่พบบัญชี Monitor');
+  const nextState = monitor.state === 'DISABLED' ? 'ACTIVE' : 'DISABLED';
+  const changed = await setMonitorState({ monitorId: monitor.id, state: nextState },
+    contextFor(interaction, 'monitor_toggle_execute'), { pool: runtime.pool });
+  return interaction.editReply(`${nextState === 'ACTIVE' ? 'เปิดใช้งาน' : 'พักใช้งาน'} **${changed.username ?? changed.account_id}** แล้ว`);
 }
 }
 
@@ -1597,8 +1723,13 @@ const ROUTE_HANDLERS = Object.freeze({
   "receiver_activate_confirm": handleReceiverActivateConfirm,
   "monitor_add": handleMonitorAdd,
   "monitor_add_submit": handleMonitorAddSubmit,
-  "monitor_manage": handleMonitorManage,
-  "monitor_manage_submit": handleMonitorManageSubmit,
+  "monitor_check_all": handleMonitorCheckAll,
+  "monitor_list": handleMonitorList,
+  "monitor_select": handleMonitorSelect,
+  "monitor_check_one": handleMonitorCheckOne,
+  "monitor_rotate": handleMonitorRotate,
+  "monitor_rotate_submit": handleMonitorRotateSubmit,
+  "monitor_toggle": handleMonitorToggle,
   "dlq_replay": handleDlqAction,
   "dlq_discard": handleDlqAction,
   "dlq_replay_submit": handleDlqSubmit,

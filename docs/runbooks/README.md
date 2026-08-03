@@ -11,7 +11,7 @@ Every incident follows: Detect → Contain → Preserve evidence → Recover →
 | Financial DLQ | Keep item reserved; never discard | Owner replay with new attempt and parent reference |
 | Non-financial DLQ | Preserve delivery evidence | Owner replay or discard with reason/audit |
 | Quest schema/executor failure | Pause affected Quest only | Pin compatible engine, retest, reopen sale |
-| Monitor token invalid | Quarantine account immediately | Owner rotates credential and revalidates capabilities |
+| Monitor token invalid | Quarantine account immediately | Owner rotates credential, then uses **เช็คระบบ Token** to verify login and Quest-list access |
 | Permission drift | Disable exposed surface only | Owner reviews diff and explicitly repairs/validates |
 | Discord outage / 429 | Retain outbox; obey Retry-After | Resume coalesced delivery after health recovers |
 | Backup / restore failure | Block migrations/deploy | Repair storage/key/role, then complete a verified drill |

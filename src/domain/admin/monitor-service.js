@@ -1,32 +1,45 @@
 import { v7 as uuidv7 } from 'uuid';
-import { encryptSecret } from '../../adapters/crypto/keyring.js';
+import { decryptSecret, encryptSecret } from '../../adapters/crypto/keyring.js';
 import { createQuestApiClient, profileFromEnv } from '../../quest-engine/api/client.js';
 import { withTransaction } from '../../db/transaction.js';
 import { appendAdminAudit } from './audit.js';
 
-export async function addMonitor({ token, capabilities, env, reason }, context, options = {}) {
-  if (!Array.isArray(capabilities) || !capabilities.length
-    || capabilities.some((item) => !['SCAN', 'TEST'].includes(item)) || !reason?.trim()) {
-    throw new TypeError('invalid monitor request');
-  }
+const MONITOR_CAPABILITIES = Object.freeze(['SCAN', 'TEST']);
+
+function monitorName(profile) {
+  return profile.global_name ?? profile.username ?? String(profile.id);
+}
+
+function healthErrorCode(error) {
+  if (error?.fatalAuth || [401, 403].includes(error?.status)) return 'TOKEN_REJECTED';
+  if (error?.code === 'SECRET_DECRYPT_FAILED') return 'SECRET_DECRYPT_FAILED';
+  if (error?.status === 429) return 'RATE_LIMITED';
+  if (Number(error?.status) >= 500 || error?.name === 'DiscordApiTransportError') return 'DISCORD_UNAVAILABLE';
+  return error?.code ?? error?.name ?? 'HEALTH_CHECK_FAILED';
+}
+
+export async function addMonitor({ token, env }, context, options = {}) {
+  if (!token?.trim()) throw new TypeError('monitor token is required');
   const questApiFactory = options.questApiFactory ?? createQuestApiClient;
   const profile = await questApiFactory({ token, profile: profileFromEnv(env) }).fetchCurrentUser();
+  if (!profile?.id) throw new TypeError('monitor token profile is invalid');
   const id = uuidv7();
   const encrypted = encryptSecret(token, env.DATA_ENCRYPTION_KEYS_JSON, `monitor:${id}:${context.guildId}`);
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const row = (await client.query(`INSERT INTO monitor_accounts(id,account_id,username,capabilities,state)
-      VALUES($1,$2,$3,$4,'ACTIVE') RETURNING *`, [id, String(profile.id), profile.global_name ?? profile.username,
-      [...new Set(capabilities)]])).rows[0];
+      VALUES($1,$2,$3,$4,'ACTIVE') RETURNING *`, [id, String(profile.id), monitorName(profile),
+      MONITOR_CAPABILITIES])).rows[0];
     await client.query(`INSERT INTO monitor_credentials(monitor_id,key_version,nonce,ciphertext,auth_tag)
       VALUES($1,$2,$3,$4,$5)`, [id, encrypted.keyVersion, encrypted.nonce, encrypted.ciphertext, encrypted.authTag]);
     await appendAdminAudit(client, { action: 'ADD_MONITOR', targetType: 'MONITOR', targetId: id,
-      actorId: context.actorId, after: { accountId: row.account_id, capabilities: row.capabilities }, reason, context });
+      actorId: context.actorId, after: { accountId: row.account_id, capabilities: row.capabilities },
+      reason: 'Owner added Monitor token', context });
     return row;
   });
 }
 
-export async function rotateMonitorCredential({ monitorId, token, env, reason }, context, options = {}) {
-  if (!token?.trim() || !reason?.trim()) throw new TypeError('token and reason are required');
+export async function rotateMonitorCredential({ monitorId, token, env }, context, options = {}) {
+  if (!token?.trim()) throw new TypeError('token is required');
   const questApiFactory = options.questApiFactory ?? createQuestApiClient;
   const profile = await questApiFactory({ token, profile: profileFromEnv(env) }).fetchCurrentUser();
   const encrypted = encryptSecret(token, env.DATA_ENCRYPTION_KEYS_JSON,
@@ -44,13 +57,14 @@ export async function rotateMonitorCredential({ monitorId, token, env, reason },
     await appendAdminAudit(client, { action: 'ROTATE_MONITOR_CREDENTIAL', targetType: 'MONITOR',
       targetId: monitorId, actorId: context.actorId,
       before: { state: monitor.state, keyVersion: credential.key_version },
-      after: { state: updated.state, keyVersion: encrypted.keyVersion }, reason, context });
+      after: { state: updated.state, keyVersion: encrypted.keyVersion },
+      reason: 'Owner rotated Monitor token', context });
     return updated;
   });
 }
 
-export async function setMonitorState({ monitorId, state, reason }, context, options = {}) {
-  if (!['ACTIVE', 'QUARANTINED', 'DISABLED'].includes(state) || !reason?.trim()) {
+export async function setMonitorState({ monitorId, state }, context, options = {}) {
+  if (!['ACTIVE', 'QUARANTINED', 'DISABLED'].includes(state)) {
     throw new TypeError('invalid monitor state change');
   }
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
@@ -61,7 +75,78 @@ export async function setMonitorState({ monitorId, state, reason }, context, opt
       updated_at=transaction_timestamp() WHERE id=$1 RETURNING *`, [monitorId, state])).rows[0];
     await appendAdminAudit(client, { action: 'MONITOR_STATE_CHANGE', targetType: 'MONITOR',
       targetId: monitorId, actorId: context.actorId, before: { state: before.state },
-      after: { state: updated.state }, reason, context });
+      after: { state: updated.state }, reason: `Owner set Monitor ${state}`, context });
     return updated;
   });
+}
+
+async function loadMonitorCredential(monitorId, options) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => (
+    (await client.query(`SELECT m.*,c.key_version,c.nonce,c.ciphertext,c.auth_tag
+      FROM monitor_accounts m JOIN monitor_credentials c ON c.monitor_id=m.id
+      WHERE m.id=$1`, [monitorId])).rows[0]
+  ));
+}
+
+async function persistHealth({ monitor, outcome, context }, options) {
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const row = (await client.query(`UPDATE monitor_accounts m SET
+      health_state=$2,last_health_checked_at=clock_timestamp(),last_health_error_code=$3,
+      last_health_quest_count=$4,last_health_account_id=$5,
+      state=CASE WHEN $2='INVALID' THEN 'QUARANTINED' ELSE m.state END,
+      consecutive_failures=CASE WHEN $2='INVALID' THEN m.consecutive_failures+1
+        WHEN $2='READY' THEN 0 ELSE m.consecutive_failures END,
+      updated_at=clock_timestamp()
+      WHERE m.id=$1 AND EXISTS(SELECT 1 FROM monitor_credentials c WHERE c.monitor_id=m.id
+        AND c.key_version=$6 AND c.nonce=$7 AND c.ciphertext=$8 AND c.auth_tag=$9)
+      RETURNING m.*`, [monitor.id, outcome.healthState, outcome.errorCode ?? null,
+      outcome.questCount ?? null, outcome.accountId ?? null, monitor.key_version,
+      monitor.nonce, monitor.ciphertext, monitor.auth_tag])).rows[0];
+    if (!row) return null;
+    await appendAdminAudit(client, { action: 'MONITOR_HEALTH_CHECK', targetType: 'MONITOR',
+      targetId: row.id, actorId: context.actorId,
+      before: { state: monitor.state, healthState: monitor.health_state },
+      after: { state: row.state, healthState: row.health_state, questCount: row.last_health_quest_count,
+        errorCode: row.last_health_error_code }, reason: 'Owner requested Monitor health check', context });
+    return row;
+  });
+}
+
+// A health check is read-only: it confirms credential decryption, identity
+// binding and Quest-list access. It never enrolls or progresses a Quest.
+export async function checkMonitorHealth({ monitorId, env }, context, options = {}) {
+  const monitor = await loadMonitorCredential(monitorId, options);
+  if (!monitor) throw new TypeError('monitor not found');
+  const questApiFactory = options.questApiFactory ?? createQuestApiClient;
+  let outcome;
+  try {
+    const token = decryptSecret({ keyVersion: monitor.key_version, nonce: monitor.nonce,
+      ciphertext: monitor.ciphertext, authTag: monitor.auth_tag }, env.DATA_ENCRYPTION_KEYS_JSON,
+    `monitor:${monitor.id}:${context.guildId}`);
+    const api = questApiFactory({ token, profile: profileFromEnv(env) });
+    const [profile, quests] = await Promise.all([api.fetchCurrentUser(), api.fetchQuests()]);
+    if (!profile?.id || String(profile.id) !== monitor.account_id) {
+      const mismatch = Object.assign(new Error('Monitor account mismatch'), { fatalAuth: true });
+      throw mismatch;
+    }
+    outcome = { healthState: 'READY', accountId: String(profile.id), questCount: quests.length };
+  } catch (error) {
+    const code = healthErrorCode(error);
+    outcome = { healthState: code === 'TOKEN_REJECTED' || code === 'SECRET_DECRYPT_FAILED' ? 'INVALID' : 'DEGRADED',
+      errorCode: code };
+  }
+  const persisted = await persistHealth({ monitor, outcome, context }, options);
+  return { monitor: persisted ?? monitor, ...outcome, staleCredential: !persisted };
+}
+
+export async function checkAllMonitorHealth({ env }, context, options = {}) {
+  const monitors = await withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => (
+    (await client.query(`SELECT id FROM monitor_accounts
+      ORDER BY priority DESC,last_used_at NULLS FIRST,created_at`)).rows
+  ));
+  const results = [];
+  for (const monitor of monitors) {
+    results.push(await checkMonitorHealth({ monitorId: monitor.id, env }, context, options));
+  }
+  return results;
 }
