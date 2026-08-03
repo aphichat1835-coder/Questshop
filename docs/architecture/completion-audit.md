@@ -44,7 +44,7 @@ or live check runs.  It does **not** replace the live evidence required for a pr
 
 | Evidence | Result |
 |---|---|
-| Node `22.22.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 69 tests |
+| Node `22.22.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 70 tests |
 | `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
 | `git diff --check` | Passed |
 | Git tracked files | Neither legacy reference project is tracked; both are ignored locally |

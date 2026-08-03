@@ -18,6 +18,11 @@ test('backup settings can be explicitly disabled without requiring S3 and backup
   assert.equal(env.DATABASE_BACKUP_URL, undefined);
 });
 
+test('non-production defaults backups off when no backup settings are supplied', () => {
+  const env = loadEnvironment({ ...base, NODE_ENV: 'development' });
+  assert.equal(env.BACKUP_ENABLED, undefined);
+});
+
 test('enabled backup settings fail as configuration validation when incomplete', () => {
   assert.throws(() => loadEnvironment({ ...base, BACKUP_ENABLED: 'true' }), /BACKUP_ENABLED=true requires/);
 });

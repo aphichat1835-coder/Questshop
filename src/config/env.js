@@ -42,7 +42,7 @@ const schema = z.object({
   STATUS_TOKEN: z.string().min(32),
   DATABASE_POOL_URL: z.string().url(),
   DATABASE_DIRECT_URL: z.string().url(),
-  BACKUP_ENABLED: z.string().default('true').transform((value) => value === 'true'),
+  BACKUP_ENABLED: z.string().optional().transform((value) => value == null ? undefined : value === 'true'),
   DATABASE_BACKUP_URL: z.string().url().optional(),
   DATABASE_RESTORE_URL: z.string().url().optional(),
   DATABASE_SSL_CA_BASE64: z.string().min(1),
@@ -72,10 +72,11 @@ const schema = z.object({
   }
   const backupKeys = ['DATABASE_BACKUP_URL', 'DATABASE_RESTORE_URL', 'S3_ENDPOINT', 'S3_BUCKET',
     'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'BACKUP_ENCRYPTION_KEYS_JSON'];
-  if (value.BACKUP_ENABLED && backupKeys.some((key) => value[key] == null || value[key] === '')) {
+  const backupEnabled = value.BACKUP_ENABLED ?? value.NODE_ENV === 'production';
+  if (backupEnabled && backupKeys.some((key) => value[key] == null || value[key] === '')) {
     ctx.addIssue({ code: 'custom', message: 'BACKUP_ENABLED=true requires backup database, S3 and encryption settings' });
   }
-  for (const key of ['DATABASE_POOL_URL', 'DATABASE_DIRECT_URL', ...(value.BACKUP_ENABLED
+  for (const key of ['DATABASE_POOL_URL', 'DATABASE_DIRECT_URL', ...(backupEnabled
     ? ['DATABASE_BACKUP_URL', 'DATABASE_RESTORE_URL'] : [])]) {
     if (!value[key]) continue;
     const url = new URL(value[key]);

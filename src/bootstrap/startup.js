@@ -29,8 +29,9 @@ export async function startup({ health = createHealthState(), server: existingSe
   let pool;
   try {
     const env = loadEnvironment();
+    const backupEnabled = env.BACKUP_ENABLED ?? env.NODE_ENV === 'production';
     health.checks.config = 'OK';
-    if (env.NODE_ENV === 'production' && env.BACKUP_ENABLED) {
+    if (env.NODE_ENV === 'production' && backupEnabled) {
       await validateBackupTools(env);
       health.checks.backupTools = 'OK';
     } else health.checks.backupTools = env.NODE_ENV === 'production'
@@ -41,10 +42,10 @@ export async function startup({ health = createHealthState(), server: existingSe
     if (migrationTable) {
       const schemaVersion = Number((await directPool.query('SELECT COALESCE(max(version),0) AS value FROM schema_migrations')).rows[0].value);
       const latestVersion = Math.max(...(await listMigrations()).map((migration) => migration.version));
-      if (env.BACKUP_ENABLED && schemaVersion < latestVersion) {
+      if (backupEnabled && schemaVersion < latestVersion) {
         preMigrationBackup = await createEncryptedBackup({ env, schemaVersion, reason: 'pre-migration' });
         health.checks.preMigrationBackup = 'VERIFIED';
-      } else health.checks.preMigrationBackup = env.BACKUP_ENABLED
+      } else health.checks.preMigrationBackup = backupEnabled
         ? 'NO_PENDING_MIGRATION' : 'DISABLED_BY_CONFIG';
     } else health.checks.preMigrationBackup = 'FIRST_INSTALL_NOT_APPLICABLE';
     await runMigrations({ gitSha: env.GIT_SHA,

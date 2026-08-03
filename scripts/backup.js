@@ -4,7 +4,9 @@ import { createEncryptedBackup } from '../src/adapters/s3/backup.js';
 import { v7 as uuidv7 } from 'uuid';
 
 const env = loadEnvironment();
-if (!env.BACKUP_ENABLED) throw new Error('BACKUP_ENABLED=false; enable backups before running scripts/backup.js');
+if (env.BACKUP_ENABLED === false || (env.BACKUP_ENABLED == null && env.NODE_ENV !== 'production')) {
+  throw new Error('Backups are disabled; enable BACKUP_ENABLED before running scripts/backup.js');
+}
 const pool = getRuntimePool(env);
 const runId = uuidv7();
 try {

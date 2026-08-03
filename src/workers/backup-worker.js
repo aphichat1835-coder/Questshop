@@ -24,7 +24,7 @@ export async function pruneExpiredBackups({ env, pool }) {
 }
 
 export async function runScheduledBackup({ env, pool }) {
-  if (!env.BACKUP_ENABLED) return false;
+  if (env.BACKUP_ENABLED === false || (env.BACKUP_ENABLED == null && env.NODE_ENV !== 'production')) return false;
   try { await pruneExpiredBackups({ env, pool }); }
   catch (error) {
     await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)

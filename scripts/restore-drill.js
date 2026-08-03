@@ -9,7 +9,9 @@ import { decryptSecret } from '../src/adapters/crypto/keyring.js';
 
 const { Pool } = pg;
 const env = loadEnvironment();
-if (!env.BACKUP_ENABLED) throw new Error('BACKUP_ENABLED=false; enable backups before running scripts/restore-drill.js');
+if (env.BACKUP_ENABLED === false || (env.BACKUP_ENABLED == null && env.NODE_ENV !== 'production')) {
+  throw new Error('Backups are disabled; enable BACKUP_ENABLED before running scripts/restore-drill.js');
+}
 const source = getRuntimePool(env);
 const backup = (await source.query("SELECT * FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1")).rows[0];
 if (!backup) throw new Error('No verified backup is available for restore drill');
