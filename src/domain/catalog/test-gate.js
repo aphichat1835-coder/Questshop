@@ -2,7 +2,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { enqueueProjection } from '../outbox/service.js';
 import { recordTransition } from '../shared/transition.js';
 
-const ACTIVE_BATCH_STATES = ['QUEUED', 'RUNNING'];
+const ACTIVE_BATCH_STATES = new Set(['QUEUED', 'RUNNING']);
 
 export async function hasCurrentTestPass(client, quest) {
   if (quest.public_test_gate_override) return true;
@@ -82,7 +82,7 @@ async function failBatch(client, batch, quest, error, context) {
 export async function createMonitorTestBatch(client, { quest, context, requestedBy = 'SYSTEM', force = false }) {
   const existing = (await client.query(`SELECT * FROM quest_test_batches
     WHERE quest_id=$1 ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id])).rows[0];
-  if (existing && (ACTIVE_BATCH_STATES.includes(existing.state) || !force)) {
+  if (existing && (ACTIVE_BATCH_STATES.has(existing.state) || !force)) {
     return { batch: existing, queued: null, reused: true };
   }
   const monitorOrder = await activeTestMonitorIds(client);
@@ -107,7 +107,7 @@ export async function createMonitorTestBatch(client, { quest, context, requested
 export async function advanceMonitorTestBatch(client, { run, quest, error, context }) {
   if (!run.batch_id) return null;
   const batch = (await client.query('SELECT * FROM quest_test_batches WHERE id=$1 FOR UPDATE', [run.batch_id])).rows[0];
-  if (!batch || !ACTIVE_BATCH_STATES.includes(batch.state)) return null;
+  if (!batch || !ACTIVE_BATCH_STATES.has(batch.state)) return null;
   const monitorOrder = batch.monitor_order ?? [];
   const currentIndex = Math.max(0, monitorOrder.indexOf(run.target_monitor_id ?? run.monitor_id));
   const sameMonitor = Number(run.attempt_in_monitor ?? 1) < Number(batch.max_attempts_per_monitor);
@@ -128,7 +128,7 @@ export async function advanceMonitorTestBatch(client, { run, quest, error, conte
 export async function markMonitorTestBatchPassed(client, { run, context }) {
   if (!run.batch_id) return null;
   const before = (await client.query(`SELECT * FROM quest_test_batches WHERE id=$1 FOR UPDATE`, [run.batch_id])).rows[0];
-  if (!before || !ACTIVE_BATCH_STATES.includes(before.state)) return null;
+  if (!before || !ACTIVE_BATCH_STATES.has(before.state)) return null;
   const batch = (await client.query(`UPDATE quest_test_batches SET state='PASSED',
     state_version=state_version+1,completed_at=clock_timestamp(),updated_at=clock_timestamp()
     WHERE id=$1 AND state_version=$2 RETURNING *`, [run.batch_id, before.state_version])).rows[0];
@@ -148,7 +148,7 @@ export async function markMonitorTestBatchPassed(client, { run, context }) {
 
 export async function retryFailedTestAlert(client, { alertId, context }) {
   const alert = (await client.query(`SELECT * FROM quest_test_failure_alerts WHERE id=$1 FOR UPDATE`, [alertId])).rows[0];
-  if (!alert || alert.state !== 'OPEN') return { alert, batch: null, idempotent: true };
+  if (alert?.state !== 'OPEN') return { alert, batch: null, idempotent: true };
   const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [alert.quest_id])).rows[0];
   const retrying = (await client.query(`UPDATE quest_test_failure_alerts SET state='RETRYING',
     state_version=state_version+1,trace_id=$2,updated_at=clock_timestamp()

@@ -6,13 +6,12 @@ import { materializeNextOrderItem, requeueDueRunnerJobsInTransaction } from '../
 import { RUNNER_JOB_TRANSITIONS } from '../domain/runner/states.js';
 import { ORDER_ITEM_TRANSITIONS } from '../domain/orders/states.js';
 import { TOPUP_TRANSITIONS } from '../domain/payments/states.js';
-import { TEST_TRANSITIONS } from '../domain/catalog/states.js';
+import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS, TEST_TRANSITIONS } from '../domain/catalog/states.js';
 import { enqueueProjection } from '../domain/outbox/service.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
 import { appendAdminAudit } from '../domain/admin/audit.js';
 import { releaseReservation } from '../domain/wallet/service.js';
 import { evaluateExpiryAdmission } from '../domain/catalog/expiry.js';
-import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS } from '../domain/catalog/states.js';
 import { resolvePrice } from '../domain/pricing/resolver.js';
 import { pauseQuestForRetest } from '../domain/catalog/service.js';
 import { advanceMonitorTestBatch, hasCurrentTestPass } from '../domain/catalog/test-gate.js';

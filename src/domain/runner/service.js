@@ -47,6 +47,12 @@ function retryStateForRunnerJob(state) {
   return 'MANUAL_REVIEW';
 }
 
+function terminalJobStateForItem(itemState) {
+  if (itemState === 'READY_TO_CLAIM') return 'COMPLETED';
+  if (itemState === 'MANUAL_REVIEW') return 'MANUAL_REVIEW';
+  return 'FAILED';
+}
+
 function retryAfterMs(error) {
   const raw = Number(error?.data?.retry_after ?? error?.retryAfter ?? error?.retry_after);
   if (!Number.isFinite(raw) || raw < 0) return null;
@@ -66,8 +72,7 @@ async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_
     const itemFinal = ['READY_TO_CLAIM', 'EXPIRED_RELEASED', 'EXTERNAL_COMPLETED_RELEASED',
       'STOPPED_RELEASED', 'FAILED_RELEASED', 'MANUAL_REVIEW'].includes(item?.state);
     if (itemFinal) {
-      const terminalJobState = item.state === 'READY_TO_CLAIM' ? 'COMPLETED'
-        : item.state === 'MANUAL_REVIEW' ? 'MANUAL_REVIEW' : 'FAILED';
+      const terminalJobState = terminalJobStateForItem(item.state);
       assertJobTransition(current.state, terminalJobState);
       const terminal = (await client.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
         lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
@@ -627,55 +632,79 @@ async function executeAndSettleRunner({ state, attempt, data, api, quest: initia
   return { outcome: 'READY_TO_CLAIM', quest: verified };
 }
 
+async function loadReviewableRunnerJob(client, job) {
+  const current = (await client.query(`SELECT *,lease_expires_at>clock_timestamp() AS lease_valid
+    FROM runner_jobs WHERE id = $1 FOR UPDATE`, [job.id])).rows[0];
+  if (!current || ['COMPLETED', 'FAILED', 'MANUAL_REVIEW'].includes(current.state)) return null;
+  const ownershipLost = current.lease_owner !== job.lease_owner
+    || String(current.fencing_token) !== String(job.fencing_token)
+    || !current.lease_valid;
+  if (ownershipLost) throw new FencingLostError(`runner:${job.id}`);
+  return current;
+}
+
+async function transitionItemToManualReview(client, job, error, context) {
+  const item = (await client.query('SELECT * FROM order_items WHERE id=$1 FOR UPDATE',
+    [job.order_item_id])).rows[0];
+  const terminalStates = ['READY_TO_CLAIM', 'EXPIRED_RELEASED', 'EXTERNAL_COMPLETED_RELEASED',
+    'STOPPED_RELEASED', 'FAILED_RELEASED'];
+  if (!item || terminalStates.includes(item.state)) {
+    throw new QuestshopError('ITEM_STATE_CONFLICT', 'Order item is already terminal');
+  }
+  const updatedItem = (await client.query(`UPDATE order_items SET state='MANUAL_REVIEW',state_version=state_version+1,
+    updated_at=clock_timestamp() WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+  [item.id, item.state, item.state_version])).rows[0];
+  if (!updatedItem) throw new QuestshopError('ITEM_STATE_CONFLICT', 'Order item changed during Manual Review');
+  await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
+    fromState: item.state, toState: 'MANUAL_REVIEW', stateVersion: updatedItem.state_version,
+    reasonCode: error.code ?? error.name, context });
+  return updatedItem;
+}
+
+async function pauseQuestAfterContractFailure(client, job, error, context) {
+  const quest = (await client.query(`SELECT q.* FROM quests q JOIN order_items i ON i.quest_id=q.quest_id
+    WHERE i.id=$1 FOR UPDATE OF q`, [job.order_item_id])).rows[0];
+  if (quest?.sale_state !== 'OPEN') return;
+  const paused = (await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
+    updated_at=clock_timestamp() WHERE quest_id=$1 AND sale_state='OPEN' AND sale_version=$2 RETURNING *`,
+  [quest.quest_id, quest.sale_version])).rows[0];
+  if (!paused) return;
+  await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: paused.quest_id,
+    fromState: 'OPEN', toState: 'PAUSED', stateVersion: paused.sale_version,
+    reasonCode: error.code ?? error.name, context });
+}
+
+async function recordQuestContractIncident(client, job, error, context) {
+  await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
+    VALUES(gen_random_uuid(),'QUEST_CONTRACT_FAILURE',$1,'OPEN','CRITICAL',$2,$3)
+    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
+    DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
+  [job.order_item_id, { errorCode: error.code ?? error.name }, context.traceId]);
+}
+
+async function moveRunnerReviewTransaction(client, { job, context, error, contractFailure }) {
+  const current = await loadReviewableRunnerJob(client, job);
+  if (!current) return;
+  const updatedJob = await updateOwnedJob(client, current, 'MANUAL_REVIEW', {
+    releaseLease: true, reasonCode: error.code ?? error.name,
+  }, context);
+  const updatedItem = await transitionItemToManualReview(client, job, error, context);
+  await enqueueProjection(client, { projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM',
+    aggregateId: updatedItem.id, aggregateVersion: updatedItem.state_version,
+    surfaceKey: 'QUEST_HISTORY', context });
+  await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
+    aggregateId: updatedJob.id, aggregateVersion: updatedJob.state_version,
+    surfaceKey: 'LOG_QUEST_OPERATIONS', context });
+  await openReview(client, { subjectType: 'ORDER_ITEM', subjectId: job.order_item_id,
+    reason: error.code, financial: true, ownerOnly: false, context });
+  if (!contractFailure) return;
+  await pauseQuestAfterContractFailure(client, job, error, context);
+  await recordQuestContractIncident(client, job, error, context);
+}
+
 export async function moveRunnerToManualReview(job, context, options, error, contractFailure) {
-  await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const current = (await client.query(`SELECT *,lease_expires_at>clock_timestamp() AS lease_valid
-      FROM runner_jobs WHERE id = $1 FOR UPDATE`, [job.id])).rows[0];
-    if (!current || ['COMPLETED', 'FAILED', 'MANUAL_REVIEW'].includes(current.state)) return;
-    if (current.lease_owner !== job.lease_owner || String(current.fencing_token) !== String(job.fencing_token)
-      || !current.lease_valid) {
-      throw new FencingLostError(`runner:${job.id}`);
-    }
-    const updatedJob = await updateOwnedJob(client, current, 'MANUAL_REVIEW', {
-      releaseLease: true, reasonCode: error.code ?? error.name,
-    }, context);
-    const item = (await client.query('SELECT * FROM order_items WHERE id=$1 FOR UPDATE',
-      [job.order_item_id])).rows[0];
-    if (!item || ['READY_TO_CLAIM', 'EXPIRED_RELEASED', 'EXTERNAL_COMPLETED_RELEASED', 'STOPPED_RELEASED', 'FAILED_RELEASED'].includes(item.state)) {
-      throw new QuestshopError('ITEM_STATE_CONFLICT', 'Order item is already terminal');
-    }
-    const updatedItem = (await client.query(`UPDATE order_items SET state='MANUAL_REVIEW',state_version=state_version+1,
-      updated_at=clock_timestamp() WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
-    [item.id, item.state, item.state_version])).rows[0];
-    if (!updatedItem) throw new QuestshopError('ITEM_STATE_CONFLICT', 'Order item changed during Manual Review');
-    await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
-      fromState: item.state, toState: 'MANUAL_REVIEW', stateVersion: updatedItem.state_version,
-      reasonCode: error.code ?? error.name, context });
-    await enqueueProjection(client, { projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM',
-      aggregateId: item.id, aggregateVersion: updatedItem.state_version,
-      surfaceKey: 'QUEST_HISTORY', context });
-    await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
-      aggregateId: updatedJob.id, aggregateVersion: updatedJob.state_version,
-      surfaceKey: 'LOG_QUEST_OPERATIONS', context });
-    await openReview(client, { subjectType: 'ORDER_ITEM', subjectId: job.order_item_id,
-      reason: error.code, financial: true, ownerOnly: false, context });
-    if (!contractFailure) return;
-    const quest = (await client.query(`SELECT q.* FROM quests q JOIN order_items i ON i.quest_id=q.quest_id
-      WHERE i.id=$1 FOR UPDATE OF q`, [job.order_item_id])).rows[0];
-    if (quest?.sale_state === 'OPEN') {
-      const paused = (await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
-        updated_at=clock_timestamp() WHERE quest_id=$1 AND sale_state='OPEN' AND sale_version=$2 RETURNING *`,
-      [quest.quest_id, quest.sale_version])).rows[0];
-      if (paused) await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: paused.quest_id,
-        fromState: 'OPEN', toState: 'PAUSED', stateVersion: paused.sale_version,
-        reasonCode: error.code ?? error.name, context });
-    }
-    await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-      VALUES(gen_random_uuid(),'QUEST_CONTRACT_FAILURE',$1,'OPEN','CRITICAL',$2,$3)
-      ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
-      DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-    [job.order_item_id, { errorCode: error.code ?? error.name }, context.traceId]);
-  });
+  await withTransaction({ ...options, isolation: 'SERIALIZABLE' },
+    (client) => moveRunnerReviewTransaction(client, { job, context, error, contractFailure }));
 }
 
 function needsManualReview(error) {

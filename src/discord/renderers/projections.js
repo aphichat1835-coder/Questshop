@@ -7,6 +7,20 @@ const escape = (value) => escapeMarkdown(String(value ?? 'ไม่ระบุ'
 const baht = (cents) => `${(Number(cents ?? 0) / 100).toFixed(2)} บาท`;
 const timestamp = (value, style = 'F') => value ? `<t:${Math.floor(new Date(value).getTime() / 1000)}:${style}>` : 'ไม่ระบุ';
 const noMentions = { parse: [] };
+function orderItemLinks(historyUrl, claimUrl) {
+  return [historyUrl ? `[ประวัติ](${historyUrl})` : null, claimUrl ? `[รับรางวัล](${claimUrl})` : null]
+    .filter(Boolean).join(' • ');
+}
+function orderItemLine(item, links) {
+  const suffix = links ? ` • ${links}` : '';
+  return `${item.sequence_number}. **${escape(item.quest_name)}** — ${escape(item.state)} — ${baht(item.price_cents)}${suffix}`;
+}
+function questSaleStatus(saleState) {
+  if (saleState === 'OPEN') return 'เปิดขาย';
+  if (saleState === 'PAUSED') return 'พักขายชั่วคราว';
+  if (saleState === 'EXPIRED') return 'หมดอายุ';
+  return 'ประกาศแล้วแต่ยังไม่เปิดขายทั่วไป';
+}
 function safeHttpsUrl(value) {
   try {
     const url = new URL(String(value));
@@ -75,9 +89,7 @@ async function renderOrderDm(pool, projection, { env = {} } = {}) {
   const itemLines = items.map((item) => {
     const historyUrl = historyBase && item.message_id ? `${historyBase}/${item.message_id}` : null;
     const claimUrl = safeHttpsUrl(item.claim_url);
-    const links = [historyUrl ? `[ประวัติ](${historyUrl})` : null, claimUrl ? `[รับรางวัล](${claimUrl})` : null]
-      .filter(Boolean).join(' • ');
-    return `${item.sequence_number}. **${escape(item.quest_name)}** — ${escape(item.state)} — ${baht(item.price_cents)}${links ? ` • ${links}` : ''}`;
+    return orderItemLine(item, orderItemLinks(historyUrl, claimUrl));
   });
   const description = [
     `**Order ID:** \`${aggregate.id}\``, `**บัญชี:** ${escape(aggregate.account_username)}`,
@@ -134,8 +146,7 @@ async function renderQuestNew(pool, projection) {
       ORDER BY CASE p.rule_type WHEN 'TEMPORARY' THEN 1 WHEN 'QUEST' THEN 2 WHEN 'TYPE' THEN 3 ELSE 4 END,
         p.priority DESC,p.created_at DESC LIMIT 1) resolved ON true WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
   const price = quest.price_cents == null ? 'ยังไม่กำหนด' : baht(quest.price_cents);
-  const saleStatus = quest.sale_state === 'OPEN' ? 'เปิดขาย' : quest.sale_state === 'PAUSED'
-    ? 'พักขายชั่วคราว' : quest.sale_state === 'EXPIRED' ? 'หมดอายุ' : 'ประกาศแล้วแต่ยังไม่เปิดขายทั่วไป';
+  const saleStatus = questSaleStatus(quest.sale_state);
   const description = [
     `**Quest ID:** \`${escape(quest.quest_id)}\``, `**ประเภท:** ${escape(quest.task_type)}`,
     `**เป้าหมาย:** ${escape(quest.task_target)}`, `**Orbs:** ${quest.orbs ?? 'ไม่ระบุ'}`,

@@ -1,0 +1,10 @@
+---
+# Questshop migrations are PostgreSQL and are protected by immutable checksums.
+# Codacy's SQLint rule set currently applies SQL Server's QUOTED_IDENTIFIER
+# requirement to them, which is invalid PostgreSQL syntax. Keep migration
+# verification in PostgreSQL integration tests and exclude only this misrouted
+# analyzer.
+engines:
+  SQLint:
+    exclude_paths:
+      - "migrations/**"

@@ -104,6 +104,30 @@ export async function addEvidence({ reviewId, evidenceType, payload }, context, 
   });
 }
 
+async function advanceReviewState(client, review, nextState, context) {
+  assertTransition(REVIEW_TRANSITIONS, review.state, nextState);
+  const updated = (await client.query(`UPDATE manual_reviews SET state=$2,state_version=state_version+1
+    WHERE id=$1 AND state=$3 AND state_version=$4 RETURNING *`,
+  [review.id, nextState, review.state, review.state_version])).rows[0];
+  if (!updated) throw new StaleStateError('manual_review', review.id);
+  await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: review.id,
+    fromState: review.state, toState: nextState, stateVersion: updated.state_version, context });
+  return updated;
+}
+
+async function prepareReviewDecision(client, review, context) {
+  let prepared = review;
+  if (prepared.state === 'OPEN') {
+    prepared = await advanceReviewState(client, prepared, 'ASSIGNED', context);
+    await client.query('UPDATE manual_reviews SET assigned_to=$2 WHERE id=$1', [prepared.id, context.actorId]);
+    prepared.assigned_to = context.actorId;
+  }
+  if (prepared.state === 'ASSIGNED') prepared = await advanceReviewState(client, prepared, 'EVIDENCE_PENDING', context);
+  if (prepared.state === 'EVIDENCE_PENDING') prepared = await advanceReviewState(client, prepared, 'DECISION_READY', context);
+  if (prepared.state !== 'DECISION_READY') throw new StaleStateError('manual_review', prepared.id);
+  return prepared;
+}
+
 export async function resolveReview({
   reviewId,
   decision,
@@ -122,40 +146,10 @@ export async function resolveReview({
       throw new StaleStateError('manual_review', reviewId);
     }
     if (review.owner_only && !isOwner) throw new AuthorizationError('รายการนี้ให้ Owner ตัดสินเท่านั้น');
-    if (review.state === 'OPEN') {
-      assertTransition(REVIEW_TRANSITIONS, review.state, 'ASSIGNED');
-      const assigned = (await client.query(`UPDATE manual_reviews SET state='ASSIGNED',assigned_to=$2,
-        state_version=state_version+1 WHERE id=$1 AND state='OPEN' AND state_version=$3 RETURNING *`,
-      [reviewId, context.actorId, review.state_version])).rows[0];
-      if (!assigned) throw new StaleStateError('manual_review', reviewId);
-      await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
-        fromState: 'OPEN', toState: 'ASSIGNED', stateVersion: assigned.state_version, context });
-      review = assigned;
-    }
     if (decisionEvidence) await client.query(`INSERT INTO review_evidence(id,review_id,evidence_type,
       payload,actor_type,actor_id,trace_id) VALUES($1,$2,'DECISION_INPUT',$3,$4,$5,$6)`,
     [uuidv7(), reviewId, redact(decisionEvidence), context.actorType, context.actorId, context.traceId]);
-    if (review.state === 'ASSIGNED') {
-      assertTransition(REVIEW_TRANSITIONS, review.state, 'EVIDENCE_PENDING');
-      const pending = (await client.query(`UPDATE manual_reviews SET state='EVIDENCE_PENDING',
-        state_version=state_version+1 WHERE id=$1 AND state='ASSIGNED' AND state_version=$2 RETURNING *`,
-      [reviewId, review.state_version])).rows[0];
-      if (!pending) throw new StaleStateError('manual_review', reviewId);
-      await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
-        fromState: 'ASSIGNED', toState: 'EVIDENCE_PENDING', stateVersion: pending.state_version, context });
-      review = pending;
-    }
-    if (review.state === 'EVIDENCE_PENDING') {
-      assertTransition(REVIEW_TRANSITIONS, review.state, 'DECISION_READY');
-      const ready = (await client.query(`UPDATE manual_reviews SET state='DECISION_READY',
-        state_version=state_version+1 WHERE id=$1 AND state='EVIDENCE_PENDING' AND state_version=$2 RETURNING *`,
-      [reviewId, review.state_version])).rows[0];
-      if (!ready) throw new StaleStateError('manual_review', reviewId);
-      await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
-        fromState: 'EVIDENCE_PENDING', toState: 'DECISION_READY', stateVersion: ready.state_version, context });
-      review = ready;
-    }
-    if (review.state !== 'DECISION_READY') throw new StaleStateError('manual_review', reviewId);
+    review = await prepareReviewDecision(client, review, context);
     assertTransition(REVIEW_TRANSITIONS, review.state, 'RESOLVED');
     const applied = await applyDecision(client, review);
     await client.query(`
@@ -221,113 +215,91 @@ async function applyTopupDecision(client, review, decision, input, context) {
     transactionId: credited.transaction.id };
 }
 
-async function applyOrderItemDecision(client, review, decision, input, context) {
+async function loadReviewedOrderItem(client, review) {
   const item = (await client.query(`SELECT i.*,q.url AS quest_url FROM order_items i
     JOIN quests q ON q.quest_id=i.quest_id WHERE i.id=$1 FOR UPDATE OF i`,
   [review.subject_id])).rows[0];
   if (item?.state !== 'MANUAL_REVIEW') throw new StaleStateError('order_item', review.subject_id);
-  if (decision === 'RETRY') {
-    assertTransition(ORDER_ITEM_TRANSITIONS, item.state, 'QUEUED');
-    const updated = (await client.query(`UPDATE order_items SET state='QUEUED',state_version=state_version+1,
-      updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
-    [item.id, item.state_version])).rows[0];
-    if (!updated) throw new StaleStateError('order_item', item.id);
-    const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [item.id])).rows;
-    const retryJobs = jobs.filter((job) => job.state === 'MANUAL_REVIEW');
-    if (!retryJobs.length) throw new StaleStateError('runner_job', item.id);
-    for (const job of retryJobs) {
-      assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'QUEUED');
-      const updatedJob = (await client.query(`UPDATE runner_jobs SET state='QUEUED',state_version=state_version+1,
-        available_at=clock_timestamp(),lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-        WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
-      [job.id, job.state_version])).rows[0];
-      if (!updatedJob) throw new StaleStateError('runner_job', job.id);
-      await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
-        fromState: job.state, toState: 'QUEUED', stateVersion: updatedJob.state_version,
-        reasonCode: 'ADMIN_RETRY', context });
-    }
-    await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
-      fromState: 'MANUAL_REVIEW', toState: 'QUEUED', stateVersion: updated.state_version,
-      reasonCode: 'ADMIN_RETRY', context });
-    await enqueueProjection(client, { projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM',
-      aggregateId: item.id, aggregateVersion: updated.state_version,
-      surfaceKey: 'QUEST_HISTORY', context });
-    return { orderItemId: item.id, status: updated.state };
-  }
-  if (decision === 'CAPTURE') {
-    assertTransition(ORDER_ITEM_TRANSITIONS, item.state, 'SETTLING');
-    const settling = (await client.query(`UPDATE order_items SET state='SETTLING',state_version=state_version+1,
-      updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
-    [item.id, item.state_version])).rows[0];
-    if (!settling) throw new StaleStateError('order_item', item.id);
-    const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [item.id])).rows;
-    const settlingJobs = jobs.filter((job) => job.state === 'MANUAL_REVIEW');
-    if (!settlingJobs.length) throw new StaleStateError('runner_job', item.id);
-    for (const job of settlingJobs) {
-      assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'SETTLING');
-      const updatedJob = (await client.query(`UPDATE runner_jobs SET state='SETTLING',state_version=state_version+1,
-        lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-        WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
-      [job.id, job.state_version])).rows[0];
-      if (!updatedJob) throw new StaleStateError('runner_job', job.id);
-      await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
-        fromState: job.state, toState: 'SETTLING', stateVersion: updatedJob.state_version,
-        reasonCode: 'ADMIN_CAPTURE', context });
-    }
-    await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
-      fromState: 'MANUAL_REVIEW', toState: 'SETTLING', stateVersion: settling.state_version,
-      reasonCode: 'ADMIN_CAPTURE', context });
-    const captured = await captureReservationInTransaction(client,
-      { orderItemId: item.id, claimUrl: input.claimUrl ?? item.claim_url ?? item.quest_url }, context);
-    for (const job of settlingJobs) {
-      assertTransition(RUNNER_JOB_TRANSITIONS, 'SETTLING', 'COMPLETED');
-      const completedJob = (await client.query(`UPDATE runner_jobs SET state='COMPLETED',state_version=state_version+1,
-        updated_at=clock_timestamp() WHERE id=$1 AND state='SETTLING' AND state_version=$2 RETURNING *`,
-      [job.id, Number(job.state_version) + 1])).rows[0];
-      if (!completedJob) throw new StaleStateError('runner_job', job.id);
-      await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
-        fromState: 'SETTLING', toState: 'COMPLETED', stateVersion: completedJob.state_version,
-        reasonCode: 'ADMIN_CAPTURE', context });
-    }
-    return { orderItemId: item.id, status: captured.state };
-  }
-  const terminalState = ORDER_RELEASE_DECISIONS[decision];
-  if (!terminalState) throw new TypeError('invalid order-item review decision');
+  return item;
+}
+
+async function loadReviewedJobs(client, itemId, onlyManual = false) {
+  const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [itemId])).rows;
+  return onlyManual ? jobs.filter((job) => job.state === 'MANUAL_REVIEW') : jobs;
+}
+
+async function transitionReviewedJob(client, job, nextState, reasonCode, context, { availableNow = false } = {}) {
+  assertTransition(RUNNER_JOB_TRANSITIONS, job.state, nextState);
+  const updated = (await client.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
+    available_at=CASE WHEN $3 THEN clock_timestamp() ELSE available_at END,
+    lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+    WHERE id=$1 AND state=$4 AND state_version=$5 RETURNING *`,
+  [job.id, nextState, availableNow, job.state, job.state_version])).rows[0];
+  if (!updated) throw new StaleStateError('runner_job', job.id);
+  await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+    fromState: job.state, toState: nextState, stateVersion: updated.state_version, reasonCode, context });
+  return updated;
+}
+
+async function retryReviewedOrderItem(client, item, context) {
+  assertTransition(ORDER_ITEM_TRANSITIONS, item.state, 'QUEUED');
+  const updated = (await client.query(`UPDATE order_items SET state='QUEUED',state_version=state_version+1,
+    updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
+  [item.id, item.state_version])).rows[0];
+  if (!updated) throw new StaleStateError('order_item', item.id);
+  const jobs = await loadReviewedJobs(client, item.id, true);
+  for (const job of jobs) await transitionReviewedJob(client, job, 'QUEUED', 'ADMIN_RETRY', context, { availableNow: true });
+  await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
+    fromState: item.state, toState: 'QUEUED', stateVersion: updated.state_version, reasonCode: 'ADMIN_RETRY', context });
+  await enqueueProjection(client, { projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM',
+    aggregateId: item.id, aggregateVersion: updated.state_version, surfaceKey: 'QUEST_HISTORY', context });
+  return { orderItemId: item.id, status: updated.state };
+}
+
+async function captureReviewedOrderItem(client, item, input, context) {
+  assertTransition(ORDER_ITEM_TRANSITIONS, item.state, 'SETTLING');
+  const settling = (await client.query(`UPDATE order_items SET state='SETTLING',state_version=state_version+1,
+    updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
+  [item.id, item.state_version])).rows[0];
+  if (!settling) throw new StaleStateError('order_item', item.id);
+  const jobs = await loadReviewedJobs(client, item.id, true);
+  const settlingJobs = [];
+  for (const job of jobs) settlingJobs.push(await transitionReviewedJob(client, job, 'SETTLING', 'ADMIN_CAPTURE', context));
+  await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
+    fromState: item.state, toState: 'SETTLING', stateVersion: settling.state_version, reasonCode: 'ADMIN_CAPTURE', context });
+  const captured = await captureReservationInTransaction(client,
+    { orderItemId: item.id, claimUrl: input.claimUrl ?? item.claim_url ?? item.quest_url }, context);
+  for (const job of settlingJobs) await transitionReviewedJob(client, job, 'COMPLETED', 'ADMIN_CAPTURE', context);
+  return { orderItemId: item.id, status: captured.state };
+}
+
+async function releaseReviewedOrderItem(client, item, terminalState, input, context) {
   assertTransition(ORDER_ITEM_TRANSITIONS, item.state, terminalState);
   const released = await releaseReservationInTransaction(client, { orderItemId: item.id,
     terminalState, reason: input.reason }, context);
-  const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [item.id])).rows;
+  const jobs = await loadReviewedJobs(client, item.id);
   for (const job of jobs) {
-    if (['COMPLETED', 'FAILED'].includes(job.state)) continue;
-    assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'FAILED');
-    const failedJob = (await client.query(`UPDATE runner_jobs SET state='FAILED',state_version=state_version+1,
-      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-      WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
-    [job.id, job.state, job.state_version])).rows[0];
-    if (!failedJob) throw new StaleStateError('runner_job', job.id);
-    await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
-      fromState: job.state, toState: 'FAILED', stateVersion: failedJob.state_version,
-      reasonCode: input.reason, context });
+    if (!['COMPLETED', 'FAILED'].includes(job.state)) await transitionReviewedJob(client, job, 'FAILED', input.reason, context);
   }
   return { orderItemId: item.id, status: released.state };
 }
 
-async function applyQuestDecision(client, review, decision, context) {
-  if (decision !== 'RETRY') {
-    throw new TypeError('Quest Manual Review รองรับเฉพาะ RETRY; ใช้ Catalog action หากต้องการเปลี่ยนสถานะขาย');
-  }
+async function applyOrderItemDecision(client, review, decision, input, context) {
+  const item = await loadReviewedOrderItem(client, review);
+  if (decision === 'RETRY') return retryReviewedOrderItem(client, item, context);
+  if (decision === 'CAPTURE') return captureReviewedOrderItem(client, item, input, context);
+  const terminalState = ORDER_RELEASE_DECISIONS[decision];
+  if (!terminalState) throw new TypeError('invalid order-item review decision');
+  return releaseReviewedOrderItem(client, item, terminalState, input, context);
+}
+
+async function loadQuestReviewContext(client, review) {
   const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
     [review.subject_id])).rows[0];
   if (!quest) throw new StaleStateError('quest', review.subject_id);
-  if (await hasCurrentTestPass(client, quest)) {
-    return { questId: quest.quest_id, status: 'TEST_ALREADY_PASSED' };
-  }
-
   const active = (await client.query(`SELECT id,state FROM quest_test_runs
     WHERE quest_id=$1 AND state IN ('TEST_QUEUED','TESTING')
     ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id])).rows[0];
-  if (active) return { questId: quest.quest_id, status: 'TEST_ALREADY_SCHEDULED', testRunId: active.id };
-
   const manual = (await client.query(`SELECT * FROM quest_test_runs
     WHERE quest_id=$1 AND state='MANUAL_REVIEW'
     ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id])).rows[0];
@@ -337,38 +309,53 @@ async function applyQuestDecision(client, review, decision, context) {
     : null;
   const targetMonitorReady = manual.target_monitor_id && (await client.query(`SELECT 1 FROM monitor_accounts
     WHERE id=$1 AND state='ACTIVE' AND 'TEST'=ANY(capabilities)`, [manual.target_monitor_id])).rowCount > 0;
+  return { quest, active, manual, batch, targetMonitorReady };
+}
+
+async function requeueManualQuestTest(client, manual, batch, review, context) {
+  assertTransition(TEST_TRANSITIONS, manual.state, 'TEST_QUEUED');
+  const queued = (await client.query(`UPDATE quest_test_runs SET state='TEST_QUEUED',
+    state_version=state_version+1,error_class='ADMIN_RETRY',completed_at=NULL,
+    lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp(),
+    evidence=evidence||$3::jsonb
+    WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`, [
+    manual.id, manual.state_version, { reviewId: review.id, decision: 'RETRY' },
+  ])).rows[0];
+  if (!queued) throw new StaleStateError('quest_test', manual.id);
+  await recordTransition(client, { aggregateType: 'QUEST_TEST', aggregateId: queued.id,
+    fromState: manual.state, toState: 'TEST_QUEUED', stateVersion: queued.state_version,
+    reasonCode: 'ADMIN_RETRY', context });
+  return { questId: queued.quest_id, status: queued.state, testRunId: queued.id, batchId: batch.id };
+}
+
+async function retireQuestTestBatch(client, batch, review, context) {
+  if (!batch || !['QUEUED', 'RUNNING'].includes(batch.state)) return;
+  const retired = (await client.query(`UPDATE quest_test_batches SET state='FAILED',
+    state_version=state_version+1,latest_error=latest_error||$3::jsonb,
+    completed_at=clock_timestamp(),updated_at=clock_timestamp()
+    WHERE id=$1 AND state=$2 AND state_version=$4 RETURNING *`, [batch.id, batch.state,
+    { code: 'ADMIN_RETRY_RESEEDED', reviewId: review.id }, batch.state_version])).rows[0];
+  if (!retired) throw new StaleStateError('quest_test_batch', batch.id);
+  await recordTransition(client, { aggregateType: 'QUEST_TEST_BATCH', aggregateId: retired.id,
+    fromState: batch.state, toState: 'FAILED', stateVersion: retired.state_version,
+    reasonCode: 'ADMIN_RETRY_RESEEDED', context });
+}
+
+async function applyQuestDecision(client, review, decision, context) {
+  if (decision !== 'RETRY') {
+    throw new TypeError('Quest Manual Review รองรับเฉพาะ RETRY; ใช้ Catalog action หากต้องการเปลี่ยนสถานะขาย');
+  }
+  const { quest, active, manual, batch, targetMonitorReady } = await loadQuestReviewContext(client, review);
+  if (await hasCurrentTestPass(client, quest)) return { questId: quest.quest_id, status: 'TEST_ALREADY_PASSED' };
+  if (active) return { questId: quest.quest_id, status: 'TEST_ALREADY_SCHEDULED', testRunId: active.id };
 
   // Reuse an active batch only when its original Monitor is still usable.  An
   // auth/quarantine review must seed a fresh batch, otherwise the queued run
   // would be permanently ineligible for acquisition.
   if (batch && ['QUEUED', 'RUNNING'].includes(batch.state) && targetMonitorReady) {
-    assertTransition(TEST_TRANSITIONS, manual.state, 'TEST_QUEUED');
-    const queued = (await client.query(`UPDATE quest_test_runs SET state='TEST_QUEUED',
-      state_version=state_version+1,error_class='ADMIN_RETRY',completed_at=NULL,
-      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp(),
-      evidence=evidence||$3::jsonb
-      WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`, [
-      manual.id, manual.state_version, { reviewId: review.id, decision: 'RETRY' },
-    ])).rows[0];
-    if (!queued) throw new StaleStateError('quest_test', manual.id);
-    await recordTransition(client, { aggregateType: 'QUEST_TEST', aggregateId: queued.id,
-      fromState: manual.state, toState: 'TEST_QUEUED', stateVersion: queued.state_version,
-      reasonCode: 'ADMIN_RETRY', context });
-    return { questId: quest.quest_id, status: queued.state, testRunId: queued.id, batchId: batch.id };
+    return requeueManualQuestTest(client, manual, batch, review, context);
   }
-
-  if (batch && ['QUEUED', 'RUNNING'].includes(batch.state)) {
-    const retired = (await client.query(`UPDATE quest_test_batches SET state='FAILED',
-      state_version=state_version+1,latest_error=latest_error||$3::jsonb,
-      completed_at=clock_timestamp(),updated_at=clock_timestamp()
-      WHERE id=$1 AND state=$2 AND state_version=$4 RETURNING *`, [batch.id, batch.state,
-      { code: 'ADMIN_RETRY_RESEEDED', reviewId: review.id }, batch.state_version])).rows[0];
-    if (!retired) throw new StaleStateError('quest_test_batch', batch.id);
-    await recordTransition(client, { aggregateType: 'QUEST_TEST_BATCH', aggregateId: retired.id,
-      fromState: batch.state, toState: 'FAILED', stateVersion: retired.state_version,
-      reasonCode: 'ADMIN_RETRY_RESEEDED', context });
-  }
-
+  await retireQuestTestBatch(client, batch, review, context);
   const seeded = await createMonitorTestBatch(client, { quest, context,
     requestedBy: context.actorId, force: true });
   return { questId: quest.quest_id, status: seeded.queued ? 'TEST_QUEUED' : 'NO_ACTIVE_MONITOR',

@@ -44,6 +44,63 @@ import { loadRuntimeConfig } from '../../config/runtime-config.js';
 import { APP_VERSION, ENGINE_VERSION } from '../../config/versions.js';
 
 function money(cents) { return `${(Number(cents) / 100).toFixed(2)} บาท`; }
+function monitorHealthLabel(monitorState, healthState) {
+  if (monitorState === 'DISABLED') {
+    return healthState === 'READY' ? '⚪ พักใช้งาน (Token ปกติ)' : '⚪ พักใช้งาน (Token มีปัญหา)';
+  }
+  if (healthState === 'READY') return '🟢 พร้อม';
+  if (healthState === 'DEGRADED') return '🟡 มีปัญหาชั่วคราว';
+  return '🔴 ใช้ไม่ได้';
+}
+function monitorDetailHealthLabel(healthState) {
+  if (healthState === 'READY') return '🟢 พร้อมใช้งาน';
+  if (healthState === 'DEGRADED') return '🟡 มีปัญหาชั่วคราว';
+  if (healthState === 'INVALID') return '🔴 Token ใช้ไม่ได้';
+  return '⚫ ยังไม่ตรวจ';
+}
+function capacitySummary(overview, rssMb) {
+  const memory = overview.memoryPercent == null ? '' : ` (${overview.memoryPercent.toFixed(1)}%)`;
+  const eventLoop = overview.eventLoopLagP99Ms == null ? 'ยังไม่มี' : `${overview.eventLoopLagP99Ms.toFixed(1)} ms`;
+  return `Capacity: **${rssMb}**${memory} • Event-loop p99: **${eventLoop}**`;
+}
+function valueOr(value, fallback) { return value ?? fallback; }
+function latestBackupTime(rows) {
+  const completedAt = rows[0]?.completed_at;
+  return typeof completedAt?.toISOString === 'function' ? completedAt.toISOString() : 'ยังไม่มี';
+}
+function websocketPing(client) {
+  const ping = client.ws?.ping;
+  return Number.isFinite(ping) && ping >= 0 ? `${ping} ms` : 'กำลังเชื่อมต่อ';
+}
+function overviewRuntimeMetrics(interaction, runtime) {
+  const health = runtime.health ?? {};
+  const overview = health.overview ?? {};
+  const workers = Object.values(health.workers ?? {});
+  const healthyWorkers = workers.filter((worker) => worker.state === 'RUNNING').length;
+  const uptimeMs = Math.max(0, Date.now() - Date.parse(health.startedAt ?? Date.now()));
+  return {
+    overview,
+    workers,
+    healthyWorkers,
+    uptimeMinutes: Math.floor(uptimeMs / 60_000),
+    backupAge: overview.backupAgeMs == null ? 'ยังไม่มี' : `${Math.floor(overview.backupAgeMs / 3_600_000)} ชม.`,
+    rssMb: overview.memoryRssBytes == null ? 'ยังไม่มี' : `${Math.round(overview.memoryRssBytes / 1024 / 1024)} MB`,
+    ping: websocketPing(interaction.client),
+  };
+}
+function overviewDescription({ backup, incidents, metrics, queue, reviews, row }) {
+  const { overview, workers, healthyWorkers, uptimeMinutes, backupAge, rssMb, ping } = metrics;
+  const slo = overview.slo ?? {};
+  return [
+    `Wallet users: **${row.users}**`, `Available: **${money(row.available)}**`, `Reserved: **${money(row.reserved)}**`,
+    `Queue: **${queue.rows[0].count}**`, `Reviews: **${reviews.rows[0].count}**`, `Incidents: **${incidents.rows[0].count}**`,
+    `Backup ล่าสุด: **${latestBackupTime(backup.rows)}**`,
+    `Backup age: **${backupAge}** • Queue limits: **${valueOr(overview.queueSoftLimit, 400)}/${valueOr(overview.queueHardLimit, 500)}**`,
+    `Workers: **${healthyWorkers}/${workers.length} running** • Ping: **${ping}** • Uptime: **${uptimeMinutes} นาที**`,
+    capacitySummary(overview, rssMb),
+    `SLO p95: ACK **${valueOr(slo.interactionAckP95Ms, 0)} ms** • Panel **${valueOr(slo.panelP95Ms, 0)} ms** • Top-up **${valueOr(slo.topupP95Ms, 0)} ms** • Outbox **${valueOr(slo.outboxP95Ms, 0)} ms**`,
+  ].join('\n');
+}
 function runnerConcurrency(runtime) {
   return Math.max(1, Math.min(runtime.env.RUNNER_CONCURRENCY_HARD_MAX,
     Number(runtime.config.values?.runnerConcurrency ?? runtime.env.RUNNER_CONCURRENCY)));
@@ -313,10 +370,7 @@ async function renderMonitorsPanel(interaction, runtime) {
 
 function monitorHealthLine(result) {
   const monitor = result.monitor;
-  const state = monitor.state === 'DISABLED' && result.healthState === 'READY' ? '⚪ พักใช้งาน (Token ปกติ)'
-    : monitor.state === 'DISABLED' ? '⚪ พักใช้งาน (Token มีปัญหา)'
-    : result.healthState === 'READY' ? '🟢 พร้อม'
-    : result.healthState === 'DEGRADED' ? '🟡 มีปัญหาชั่วคราว' : '🔴 ใช้ไม่ได้';
+  const state = monitorHealthLabel(monitor.state, result.healthState);
   const detail = result.healthState === 'READY'
     ? `อ่าน Quest ได้ ${result.questCount} รายการ`
     : `สาเหตุ: ${result.errorCode}`;
@@ -344,9 +398,7 @@ async function renderMonitorDetail(interaction, runtime, monitorId) {
   ownerOnly(interaction, runtime, 'Monitor Accounts ใช้ได้เฉพาะ Owner');
   const monitor = (await runtime.pool.query('SELECT * FROM monitor_accounts WHERE id=$1', [monitorId])).rows[0];
   if (!monitor) throw new QuestshopError('MONITOR_NOT_FOUND', 'ไม่พบบัญชี Monitor');
-  const health = monitor.health_state === 'READY' ? '🟢 พร้อมใช้งาน'
-    : monitor.health_state === 'DEGRADED' ? '🟡 มีปัญหาชั่วคราว'
-      : monitor.health_state === 'INVALID' ? '🔴 Token ใช้ไม่ได้' : '⚫ ยังไม่ตรวจ';
+  const health = monitorDetailHealthLabel(monitor.health_state);
   const checked = monitor.last_health_checked_at
     ? `<t:${Math.floor(new Date(monitor.last_health_checked_at).getTime() / 1000)}:R>` : 'ยังไม่เคยตรวจ';
   const description = [
@@ -440,24 +492,8 @@ async function renderOverviewPanel(interaction, runtime) {
   ]);
   const row = wallets.rows[0];
   const selected = interaction.values?.[0] ?? 'overview';
-  const overview = runtime.health?.overview ?? {};
-  const workers = Object.values(runtime.health?.workers ?? {});
-  const healthyWorkers = workers.filter((worker) => worker.state === 'RUNNING').length;
-  const uptimeMs = Math.max(0, Date.now() - Date.parse(runtime.health?.startedAt ?? Date.now()));
-  const uptimeMinutes = Math.floor(uptimeMs / 60_000);
-  const backupAge = overview.backupAgeMs == null ? 'ยังไม่มี' : `${Math.floor(overview.backupAgeMs / 3_600_000)} ชม.`;
-  const rssMb = overview.memoryRssBytes == null ? 'ยังไม่มี' : `${Math.round(overview.memoryRssBytes / 1024 / 1024)} MB`;
-  const ping = Number.isFinite(interaction.client.ws?.ping) && interaction.client.ws.ping >= 0
-    ? `${interaction.client.ws.ping} ms` : 'กำลังเชื่อมต่อ';
-  const description = [
-    `Wallet users: **${row.users}**`, `Available: **${money(row.available)}**`, `Reserved: **${money(row.reserved)}**`,
-    `Queue: **${queue.rows[0].count}**`, `Reviews: **${reviews.rows[0].count}**`, `Incidents: **${incidents.rows[0].count}**`,
-    `Backup ล่าสุด: **${backup.rows[0]?.completed_at?.toISOString?.() ?? 'ยังไม่มี'}**`,
-    `Backup age: **${backupAge}** • Queue limits: **${overview.queueSoftLimit ?? 400}/${overview.queueHardLimit ?? 500}**`,
-    `Workers: **${healthyWorkers}/${workers.length} running** • Ping: **${ping}** • Uptime: **${uptimeMinutes} นาที**`,
-    `Capacity: **${rssMb}**${overview.memoryPercent == null ? '' : ` (${overview.memoryPercent.toFixed(1)}%)`} • Event-loop p99: **${overview.eventLoopLagP99Ms == null ? 'ยังไม่มี' : `${overview.eventLoopLagP99Ms.toFixed(1)} ms`}**`,
-    `SLO p95: ACK **${overview.slo?.interactionAckP95Ms ?? 0} ms** • Panel **${overview.slo?.panelP95Ms ?? 0} ms** • Top-up **${overview.slo?.topupP95Ms ?? 0} ms** • Outbox **${overview.slo?.outboxP95Ms ?? 0} ms**`,
-  ].join('\n');
+  const metrics = overviewRuntimeMetrics(interaction, runtime);
+  const description = overviewDescription({ backup, incidents, metrics, queue, reviews, row });
   return interaction.editReply({ embeds: [panelEmbed(0x5865f2, `Admin • ${selected}`, description)] });
 }
 
@@ -498,7 +534,7 @@ function isBackofficeRoute(route) {
 async function assertTestFailureAlertBinding(interaction, alertId, runtime) {
   const alert = await withTransaction({ pool: runtime.pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
     (client) => loadTestFailureAlert(client, alertId, { messageId: interaction.message?.id }));
-  if (!alert || alert.surface_key !== 'LOG_QUEST_OPERATIONS') {
+  if (alert?.surface_key !== 'LOG_QUEST_OPERATIONS') {
     throw new QuestshopError('TEST_ALERT_BINDING_INVALID', 'ปุ่มนี้ไม่ใช่ข้อความแจ้งเตือน Quest ที่ใช้งานอยู่');
   }
   const surface = (await runtime.pool.query(`SELECT * FROM surfaces

@@ -98,6 +98,28 @@ test('large checkout reserves all items but materializes one account job', async
   const afterStop = (await pool.query('SELECT * FROM wallets WHERE discord_user_id=$1', [user])).rows[0];
   assert.equal(BigInt(afterStop.available_cents), 3_000n);
   assert.equal(BigInt(afterStop.reserved_cents), 2_000n);
+  // Later lazy items do not have Runner jobs yet.  Admin decisions must still
+  // work atomically: RETRY returns one to the lazy queue, while CAPTURE is an
+  // explicit financial decision that does not depend on a Runner job existing.
+  const retryReview = await openOrderItemReview({ orderItemId: order.items[1].id,
+    reason: 'retry later lazy item' }, adminContext, { pool });
+  const retryResolution = await resolveSubjectReview({ reviewId: retryReview.id, decision: 'RETRY',
+    reason: 'return later item to lazy queue', isOwner: false, expectedVersion: retryReview.state_version },
+  createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
+    guildId: '10000000000000002', idempotencyKey: 'admin-review-retry-lazy' }), { pool });
+  assert.equal(retryResolution.applied.status, 'QUEUED');
+  assert.equal(Number((await pool.query('SELECT count(*)::integer AS count FROM runner_jobs WHERE order_item_id=$1',
+    [order.items[1].id])).rows[0].count), 0);
+  const captureReview = await openOrderItemReview({ orderItemId: order.items[2].id,
+    reason: 'capture later lazy item' }, adminContext, { pool });
+  const captureResolution = await resolveSubjectReview({ reviewId: captureReview.id, decision: 'CAPTURE',
+    reason: 'confirmed external completion', isOwner: false, expectedVersion: captureReview.state_version },
+  createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
+    guildId: '10000000000000002', idempotencyKey: 'admin-review-capture-lazy' }), { pool });
+  assert.equal(captureResolution.applied.status, 'READY_TO_CLAIM');
+  const afterCapture = (await pool.query('SELECT * FROM wallets WHERE discord_user_id=$1', [user])).rows[0];
+  assert.equal(BigInt(afterCapture.available_cents), 3_000n);
+  assert.equal(BigInt(afterCapture.reserved_cents), 1_500n);
   const questId = order.items[0].quest_id;
   const paused = await setQuestSaleState({ questId, nextState: 'PAUSED', reason: 'temporary operator pause' },
     createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',

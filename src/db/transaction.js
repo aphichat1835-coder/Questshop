@@ -29,6 +29,31 @@ async function rollbackOrRelease(client, error) {
   }
 }
 
+function retryExhausted(error, attempt, maxAttempts) {
+  return !isRetryableTransactionError(error) || attempt + 1 >= maxAttempts;
+}
+
+async function executeAttempt(pool, isolation, callback, attempt) {
+  const client = await pool.connect();
+  let destroyed = false;
+  try {
+    await client.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+    const transactionTime = (await client.query(
+      'SELECT transaction_timestamp() AS transaction_time',
+    )).rows[0].transaction_time;
+    const result = await callback(client, Object.freeze({ attempt, transactionTime }));
+    await client.query('COMMIT');
+    return { result, retry: false };
+  } catch (error) {
+    const rollback = await rollbackOrRelease(client, error);
+    destroyed = rollback.destroyed;
+    if (destroyed || !isRetryableTransactionError(error)) throw rollback.error;
+    return { result: null, retry: true, error: rollback.error };
+  } finally {
+    if (!destroyed) client.release();
+  }
+}
+
 export function isRetryableTransactionError(error) {
   return RETRYABLE_SQLSTATES.has(error?.code);
 }
@@ -46,29 +71,18 @@ export async function withTransaction({
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (performance.now() - started >= deadlineMs) break;
-    const client = await pool.connect();
-    let destroyed = false;
     try {
-      await client.query(`BEGIN ISOLATION LEVEL ${normalizedIsolation}`);
-      const transactionTime = (await client.query(
-        'SELECT transaction_timestamp() AS transaction_time',
-      )).rows[0].transaction_time;
-      const result = await callback(client, Object.freeze({ attempt, transactionTime }));
-      await client.query('COMMIT');
-      return result;
+      const outcome = await executeAttempt(pool, normalizedIsolation, callback, attempt);
+      if (!outcome.retry) return outcome.result;
+      lastError = outcome.error;
     } catch (error) {
       lastError = error;
-      const rollback = await rollbackOrRelease(client, error);
-      destroyed = rollback.destroyed;
-      if (destroyed && (!isRetryableTransactionError(error) || attempt + 1 >= maxAttempts)) {
-        throw rollback.error;
-      }
-      if (destroyed) continue;
-      if (!isRetryableTransactionError(error) || attempt + 1 >= maxAttempts) throw rollback.error;
-    } finally {
-      if (!destroyed) client.release();
+      if (retryExhausted(error, attempt, maxAttempts)) throw error;
     }
-    await delay(fullJitter(attempt), undefined, { ref: false });
+    if (attempt + 1 >= maxAttempts) break;
+    // A transaction retry owns this wait.  An unref'ed timer can leave an
+    // awaited retry pending while Node exits when this is the final handle.
+    await delay(fullJitter(attempt));
   }
   throw lastError ?? new Error('transaction deadline exceeded');
 }

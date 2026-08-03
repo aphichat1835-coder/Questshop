@@ -12,11 +12,12 @@ import { openReview, resolveSubjectReview } from '../../src/domain/reviews/servi
 let pool;
 before(async () => { pool = await createTestPool(); });
 after(async () => { await pool?.end(); });
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 function normalized(id) {
   return {
     id, name: `Quest ${id}`, eventName: 'WATCH_VIDEO', secondsNeeded: 60,
-    startsAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    startsAt: new Date().toISOString(), expiresAt: new Date(Date.now() + ONE_DAY_MS).toISOString(),
     url: `https://discord.com/quests/${id}`, artworkUrl: null, orbs: 10,
     executorId: 'video', autoSupported: true, coreComplete: true, compatibilityIssues: [],
   };

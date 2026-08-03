@@ -44,10 +44,11 @@ test('monitor credential rotation validates the same account and never exposes p
 test('monitor health check is read-only, records readiness, and quarantines an invalid token', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const calls = [];
+  const invalidMonitorTokens = new Set(['invalid-token']);
   const factory = ({ token }) => ({
     fetchCurrentUser: async () => {
       calls.push(`profile:${token}`);
-      if (token === 'invalid-token') {
+      if (invalidMonitorTokens.has(token)) {
         const error = new Error('unauthorized');
         error.status = 401;
         throw error;
