@@ -23,15 +23,26 @@ async function recoverExpiredLeases(database, context) {
       WHERE state = 'LEASED' AND lease_expires_at <= clock_timestamp() RETURNING *
     `);
   for (const job of leased.rows) {
+    await recordTransition(database, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+      fromState: 'LEASED', toState: 'QUEUED', stateVersion: job.state_version,
+      reasonCode: 'LEASE_EXPIRED_BEFORE_RUN', context });
     const item = (await database.query(`UPDATE order_items SET state='QUEUED',state_version=state_version+1,
         updated_at=clock_timestamp() WHERE id=$1 AND state='LEASED' RETURNING *`, [job.order_item_id])).rows[0];
     if (item) await recordTransition(database, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
       fromState: 'LEASED', toState: 'QUEUED', stateVersion: item.state_version,
       reasonCode: 'LEASE_EXPIRED_BEFORE_RUN', context });
   }
-  await database.query(`UPDATE runner_jobs j SET state='COMPLETED',state_version=j.state_version+1,
-      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() FROM order_items i
-      WHERE i.id=j.order_item_id AND i.state='READY_TO_CLAIM' AND j.state<>'COMPLETED'`);
+  const completed = await database.query(`WITH candidates AS (
+      SELECT j.id,j.state AS previous_state FROM runner_jobs j JOIN order_items i ON i.id=j.order_item_id
+      WHERE i.state='READY_TO_CLAIM' AND j.state<>'COMPLETED' FOR UPDATE OF j
+    ) UPDATE runner_jobs j SET state='COMPLETED',state_version=j.state_version+1,
+      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() FROM candidates
+      WHERE j.id=candidates.id RETURNING j.*,candidates.previous_state`);
+  for (const job of completed.rows) await recordTransition(database, {
+    aggregateType: 'RUNNER_JOB', aggregateId: job.id, fromState: job.previous_state,
+    toState: 'COMPLETED', stateVersion: job.state_version,
+    reasonCode: 'ITEM_ALREADY_READY_TO_CLAIM', context,
+  });
 }
 
 async function recoverCrashedRunnerJobs(database, context) {
@@ -46,6 +57,10 @@ async function recoverCrashedRunnerJobs(database, context) {
     await database.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
         available_at=clock_timestamp()+interval '5 seconds',lease_owner=NULL,lease_expires_at=NULL,
         updated_at=clock_timestamp() WHERE id=$1`, [job.id, next]);
+    const recoveredJob = (await database.query('SELECT * FROM runner_jobs WHERE id=$1', [job.id])).rows[0];
+    await recordTransition(database, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+      fromState: job.state, toState: next, stateVersion: recoveredJob.state_version,
+      reasonCode: 'WORKER_CRASH_RECOVERY', context });
     const item = (await database.query(`UPDATE order_items SET state=$2,state_version=state_version+1,
         updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [job.order_item_id, next])).rows[0];
     await recordTransition(database, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
@@ -61,6 +76,9 @@ async function requeueRetryJobs(database, context) {
   const retryJobs = await database.query(`UPDATE runner_jobs SET state='QUEUED',state_version=state_version+1,
       updated_at=clock_timestamp() WHERE state='WAITING_RETRY' AND available_at<=clock_timestamp() RETURNING *`);
   for (const job of retryJobs.rows) {
+    await recordTransition(database, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+      fromState: 'WAITING_RETRY', toState: 'QUEUED', stateVersion: job.state_version,
+      reasonCode: 'RETRY_DUE', context });
     const item = (await database.query(`UPDATE order_items SET state='QUEUED',state_version=state_version+1,
         updated_at=clock_timestamp() WHERE id=$1 AND state='WAITING_RETRY' RETURNING *`, [job.order_item_id])).rows[0];
     if (item) await recordTransition(database, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
@@ -204,15 +222,23 @@ async function runTransactionalMaintenance(pool, context) {
 }
 
 async function releaseExpiredOrderItems(pool, context) {
-  const expiredItems = (await pool.query(`SELECT i.id,j.id AS job_id FROM order_items i
+  const expiredItems = (await pool.query(`SELECT i.id,j.id AS job_id,j.state AS job_state FROM order_items i
     LEFT JOIN runner_jobs j ON j.order_item_id=i.id
     WHERE i.state IN ('RESERVED','QUEUED') AND i.deadline_at<=clock_timestamp() LIMIT 100`)).rows;
   for (const item of expiredItems) {
     await releaseReservation({ orderItemId: item.id, terminalState: 'EXPIRED_RELEASED',
       reason: 'QUEST_EXPIRED_BEFORE_START' }, { ...context,
       idempotencyKey: `${context.idempotencyKey}:expiry:${item.id}` }, { pool });
-    if (item.job_id) await pool.query(`UPDATE runner_jobs SET state='FAILED',state_version=state_version+1,
-      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE id=$1`, [item.job_id]);
+    if (item.job_id) {
+      const failedJob = (await pool.query(`UPDATE runner_jobs SET state='FAILED',state_version=state_version+1,
+        lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+        WHERE id=$1 AND state NOT IN ('COMPLETED','FAILED') RETURNING *`, [item.job_id])).rows[0];
+      if (failedJob) await withTransaction({ pool, isolation: 'READ COMMITTED' }, (database) => recordTransition(database, {
+        aggregateType: 'RUNNER_JOB', aggregateId: failedJob.id, fromState: item.job_state,
+        toState: 'FAILED', stateVersion: failedJob.state_version,
+        reasonCode: 'QUEST_EXPIRED_BEFORE_START', context,
+      }));
+    }
   }
 }
 

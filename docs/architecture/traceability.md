@@ -13,7 +13,7 @@ This matrix separates implemented controls from evidence that can only be produc
 | Catalog discovery, metadata, sale/test axes | `domain/catalog`, discovery/test workers | contract/state tests, including Retest pause while no TEST Monitor is available | live Quest API metadata drift |
 | Checkout, quote revalidation, account lock | `domain/checkout`, interaction router | signed-preflight, large-order/account uniqueness and simultaneous-confirm tests | mobile Discord UAT |
 | Fair queue, lazy jobs, dynamic expiry | runner/catalog expiry services | fair queue and lazy materialization tests | runtime p95 calibration |
-| Runner checkpoints, lease/fencing, no claim | runner service, Quest executor registry | crash/fencing, stale Manual-Review denial, contract-failure containment and no-claim source scan | live video/desktop Quest UAT |
+| Runner checkpoints, lease/fencing, no claim | runner service, Quest executor registry | crash/fencing, stale Manual-Review denial, contract-failure containment, restart-recovery transition audit and no-claim source scan | live video/desktop Quest UAT |
 | Outbox, coalescing, Discord errors, DLQ | outbox services/workers/renderers | event/projection fencing plus state-version CAS, nonce reconciliation, DLQ replay/discard, 403/404/429 fault-contract tests and one-attempt best-effort Order DM | real Discord fault UAT |
 | Customer/admin Discord surfaces | setup/router/renderers | session binding/security tests | production guild layout and permissions |
 | Manual review and money authority | reviews service/Admin panel | atomic ambiguous-credit test | Owner review workflow UAT |
