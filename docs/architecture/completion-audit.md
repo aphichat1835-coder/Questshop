@@ -44,7 +44,7 @@ or live check runs.  It does **not** replace the live evidence required for a pr
 
 | Evidence | Result |
 |---|---|
-| Package target Node `22.22.0`, local runtime Node `24.14.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 76 tests; the local runtime is newer than the pinned production target and CI/Docker still pin Node 22.22.0 |
+| Package target Node `22.22.0`, local runtime Node `24.14.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 78 tests; the local runtime is newer than the pinned production target and CI/Docker still pin Node 22.22.0 |
 | `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
 | `git diff --check` | Passed |
 | Git tracked files | Neither legacy reference project is tracked; both are ignored locally |
@@ -73,12 +73,12 @@ contracts, not evidence for a managed production service.
 | 15. Surface setup permissions | `src/discord/surfaces/setup.js`, surface policy test, migrations `0019_remove_permission_drift.sql` and `0020_remove_surface_expected_permissions.sql` | Runtime Permission Drift detector/repair and its persisted permission snapshot were intentionally removed per Owner decision. One-time setup permission preconditions remain; Discord 403 recovery is manual. |
 | 16. Engine/config versioning | versions, config service, runner pinning and compatibility test | Source-confirmed. N/N-1 deployment drain remains. |
 | 17. Retention and secrets | keyring, retention/key workers, migrations and coverage tests | Source-confirmed. Live key rotation plus restore test remains. |
-| 18. Backup and restore | encrypted S3 adapter, backup/restore scripts and fake-S3 contract tests | Source-confirmed. Real S3 upload and temporary managed-DB restore drill remain. |
+| 18. Backup and restore | encrypted S3 adapter, backup/restore scripts and fake-S3 contract tests | Source-confirmed. The configured database CA is materialized mode `0600` only while `pg_dump`/`pg_restore` run, then removed; an S3 failure terminates an in-flight dump. Real S3 upload and temporary managed-DB restore drill remain. |
 | 19. Deployment, rollback and pre-launch | Docker, CI workflow, pre-launch scripts/docs, an Owner/Admin-only router guard and append-only SHA-bound release evidence | Source-confirmed. Same-SHA deploy, rollback and Owner closeout remain. |
 | 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. External alert delivery and monthly SLO evidence remain. |
 | 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
 | 22. Development sequence and feature gates | feature-gate config, Admin controls and pre-launch document | Source-confirmed. Owner must enable gates in the required live order. |
-| 23. Definition of Done and acceptance | definition-of-done, traceability and 76 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
+| 23. Definition of Done and acceptance | definition-of-done, traceability and 78 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
 
 ## Technical Blueprint plan
 

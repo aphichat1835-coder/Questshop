@@ -4,7 +4,9 @@ import { createCipheriv, createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { setImmediate } from 'node:timers';
+import { access, readFile, stat } from 'node:fs/promises';
 import { createEncryptedBackup, downloadAndDecryptBackup, validateBackupTools } from '../../src/adapters/s3/backup.js';
+import { withPostgresRootCertificate } from '../../src/adapters/s3/postgres-tls.js';
 
 const MAGIC = Buffer.from('QSBK1');
 const key = Buffer.alloc(32, 11);
@@ -67,10 +69,14 @@ test('backup creation streams a pg_dump through encryption then verifies uploade
     return { ContentLength: object.length, VersionId: 'fake-version-1' };
   } };
   const clear = Buffer.from('custom-format-pg-dump'.repeat(8_192));
+  let rootCertificatePath;
+  let rootCertificateContents;
   const spawnProcess = (binary, args, options) => {
     assert.equal(binary, '/usr/local/bin/pg_dump');
     assert.ok(args.includes('--format=custom'));
     assert.equal(options.env.PGPASSWORD, 'backup-password');
+    rootCertificatePath = options.env.PGSSLROOTCERT;
+    rootCertificateContents = readFile(rootCertificatePath);
     const child = new EventEmitter();
     child.stdout = Readable.from([clear]);
     child.stderr = new EventEmitter();
@@ -84,6 +90,7 @@ test('backup creation streams a pg_dump through encryption then verifies uploade
   };
   const env = { S3_BUCKET: 'test', GIT_SHA: 'test-sha',
     DATABASE_BACKUP_URL: 'postgresql://backup-user:backup-password@db.example.test:5432/questshop',
+    DATABASE_SSL_CA_BASE64: Buffer.from('test-root-certificate').toString('base64'),
     BACKUP_ENCRYPTION_KEYS_JSON: keyring, PG_DUMP_PATH: '/usr/local/bin/pg_dump' };
   const backup = await createEncryptedBackup({ env, schemaVersion: 13, reason: 'test',
     backupId: '019fc530-2000-7000-8000-000000000001', s3, spawnProcess, upload });
@@ -101,6 +108,8 @@ test('backup creation streams a pg_dump through encryption then verifies uploade
   for await (const chunk of restored.dumpStream) chunks.push(Buffer.from(chunk));
   assert.deepEqual(Buffer.concat(chunks), clear);
   assert.equal(restored.metadata.schemaVersion, 13);
+  assert.equal((await rootCertificateContents).toString('utf8'), 'test-root-certificate');
+  await assert.rejects(() => access(rootCertificatePath));
 });
 
 test('backup tools are validated through configured executable paths', async () => {
@@ -115,4 +124,37 @@ test('backup tools are validated through configured executable paths', async () 
   await assert.rejects(() => validateBackupTools({ PG_DUMP_PATH: 'missing-pg_dump', PG_RESTORE_PATH: 'pg_restore' }, {
     exec: async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); },
   }), (error) => error.code === 'BACKUP_TOOL_UNAVAILABLE' && /pg_dump/.test(error.message));
+});
+
+test('PostgreSQL tool CA exists only while its child-process action runs', async () => {
+  let certificatePath;
+  await withPostgresRootCertificate({ DATABASE_SSL_CA_BASE64: Buffer.from('private-ca').toString('base64') }, async (path) => {
+    certificatePath = path;
+    assert.equal((await readFile(path)).toString('utf8'), 'private-ca');
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+  });
+  await assert.rejects(() => access(certificatePath));
+  await assert.rejects(() => withPostgresRootCertificate({}, async () => {}),
+    (error) => error.code === 'POSTGRES_CA_UNAVAILABLE');
+});
+
+test('S3 upload failure terminates the in-flight pg_dump before temporary TLS cleanup', async () => {
+  let killed = 0;
+  await assert.rejects(() => createEncryptedBackup({
+    env: { S3_BUCKET: 'test', GIT_SHA: 'test-sha',
+      DATABASE_BACKUP_URL: 'postgresql://backup-user:backup-password@db.example.test:5432/questshop',
+      DATABASE_SSL_CA_BASE64: Buffer.from('test-root-certificate').toString('base64'),
+      BACKUP_ENCRYPTION_KEYS_JSON: keyring, PG_DUMP_PATH: 'pg_dump' },
+    schemaVersion: 13,
+    s3: {},
+    spawnProcess: () => {
+      const child = new EventEmitter();
+      child.stdout = Readable.from([Buffer.from('in-flight-dump')]);
+      child.stderr = new EventEmitter();
+      child.kill = () => { killed += 1; child.killed = true; setImmediate(() => child.emit('close', 1)); };
+      return child;
+    },
+    upload: async () => { throw new Error('S3 unavailable'); },
+  }), /S3 unavailable/);
+  assert.equal(killed, 1);
 });
