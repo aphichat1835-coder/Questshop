@@ -29,6 +29,9 @@ function run(file) {
 
 const roots = process.argv.slice(2).map((root) => resolve(root));
 const selectedRoots = roots.length ? roots : [resolve('test')];
+if (process.env.CI && !process.env.TEST_DATABASE_URL) {
+  throw new Error('TEST_DATABASE_URL is required in CI; refusing to skip PostgreSQL contract tests');
+}
 const files = (await Promise.all(selectedRoots.map(filesUnder))).flat().sort();
 if (!files.length) throw new Error('No test files found');
 for (const file of files) await run(file);

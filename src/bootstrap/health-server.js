@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { safeError } from '../shared/redaction.js';
 
 export function createHealthState() {
@@ -22,6 +23,19 @@ function writeJson(response, status, body) {
   response.end(JSON.stringify(body));
 }
 
+function authorizationDigest(value) {
+  return createHash('sha256').update(String(value ?? ''), 'utf8').digest();
+}
+
+function hasStatusAccess(authorization, statusToken) {
+  // Hash both candidates to a fixed-size value so even malformed/missing
+  // headers follow the same comparison primitive as a valid Bearer token.
+  return timingSafeEqual(
+    authorizationDigest(authorization),
+    authorizationDigest(`Bearer ${statusToken}`),
+  );
+}
+
 export async function startHealthServer({ port, statusToken, state }) {
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, 'http://localhost');
@@ -34,7 +48,7 @@ export async function startHealthServer({ port, statusToken, state }) {
       });
     }
     if (url.pathname === '/statusz') {
-      if (request.headers.authorization !== `Bearer ${statusToken}`) {
+      if (!hasStatusAccess(request.headers.authorization, statusToken)) {
         return writeJson(response, 401, { ok: false });
       }
       return writeJson(response, 200, {

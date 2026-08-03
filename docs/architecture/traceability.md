@@ -8,7 +8,7 @@ This matrix separates implemented controls from evidence that can only be produc
 | Requirement group | Primary implementation | Automated evidence | Live evidence still required |
 |---|---|---|---|
 | Node 22 ESM, config, PostgreSQL pools/TLS/time | `src/config`, `src/db`, migrations 0001–0020 | syntax/lint/migration checksum tests | managed PostgreSQL role and CA validation |
-| State machines, CAS, correlation, audit | domain `states.js`, `state_transitions`, durable interaction sessions and domain services | state/unit and integration tests | production trace sampling |
+| State machines, CAS, correlation, audit | domain `states.js`, `state_transitions`, durable interaction sessions and domain services | state/unit and integration tests; CI refuses a missing PostgreSQL test database rather than skipping contract cases | production trace sampling |
 | Wallet, immutable ledger, reservation/capture/release/refund | `domain/wallet`, secure retention function, `refunds` | concurrent debit, 3/2 settlement, idempotent captured-item refund, checkpoint tests | Owner pre-launch compensation sign-off |
 | TrueMoney Direct, receiver snapshot, HMAC, ambiguity | `adapters/truemoney`, payment worker/services | URL allowlist, pinned-schema, post-send ambiguity, duplicate-voucher and crash-credit tests | real success/ambiguous/schema fixtures |
 | Promotion and pricing precedence | pricing/promotion resolvers and Admin config services | money/unit and PostgreSQL constraints | Owner price/promotion UAT |
@@ -22,7 +22,7 @@ This matrix separates implemented controls from evidence that can only be produc
 | Manual review and money authority | reviews service/Admin panel | atomic ambiguous-credit and Quest-test retry/reseed tests | Owner review workflow UAT |
 | Blocklist and Admin audit | blocklist/Admin services | database constraints and audit paths | Admin role UAT |
 | Surface setup permissions | Discord Surface setup, migration `0020_remove_surface_expected_permissions.sql` | reject missing bot access/private-room exposure at install time; no persisted drift snapshot; 403 delivery incidents remain manual | production channel-layout setup test |
-| Health, metrics, SLO alerts, gates | bootstrap health and alert worker | financial invariant and scheduler-lag alerts; syntax/lint coverage for duplicate-credit and latency-SLO paths | external alert delivery/monthly uptime observation |
+| Health, metrics, SLO alerts, gates | bootstrap health and alert worker | financial invariant and scheduler-lag alerts; authenticated `/statusz` HTTP contract; syntax/lint coverage for duplicate-credit and latency-SLO paths | external alert delivery/monthly uptime observation |
 | Backup, restore, retention, keys | S3 backup stream, drill script, retention/key worker | fake S3/pg_dump upload-verify-decrypt contract with versioned manifest, temporary CA hand-off/cleanup for `pg_dump` and `pg_restore`, dump termination after upload failure, stream code checks and ledger retention test | real S3 backup and temporary-DB restore drill |
 | Deployment, rollback, CI, load | Dockerfile, workflow, scripts, UAT docs | Docker build and fake load test | same-SHA deploy/rollback rehearsal |
 
