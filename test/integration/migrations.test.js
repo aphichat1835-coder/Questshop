@@ -13,9 +13,9 @@ test('migration runner applies and verifies all checksums idempotently', async (
   await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
   const first = await runMigrations({ pool, gitSha: 'integration-test' });
   const second = await runMigrations({ pool, gitSha: 'integration-test' });
-  assert.equal(first.current, 13);
-  assert.equal(second.current, 13);
+  assert.equal(first.current, 14);
+  assert.equal(second.current, 14);
   const rows = (await pool.query('SELECT version,checksum FROM schema_migrations ORDER BY version')).rows;
-  assert.equal(rows.length, 13);
+  assert.equal(rows.length, 14);
   assert.ok(rows.every((row) => /^[a-f0-9]{64}$/.test(row.checksum)));
 });

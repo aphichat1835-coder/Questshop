@@ -189,6 +189,7 @@ test('an old outbox delivery holder cannot acknowledge after a newer projection 
   const secondHolder = uuidv7();
   const second = await acquireDelivery({ holder: secondHolder }, { pool });
   assert.equal(second.id, event);
+  assert.ok(BigInt(second.state_version) > BigInt(first.state_version));
   assert.ok(BigInt(second.fencing_token) > BigInt(first.fencing_token));
   assert.ok(BigInt(second.projection_fencing_token) > BigInt(first.projection_fencing_token));
 
@@ -202,6 +203,12 @@ test('an old outbox delivery holder cannot acknowledge after a newer projection 
   assert.equal(delivered.state, 'DELIVERED');
   assert.equal((await pool.query('SELECT message_id FROM message_projections WHERE id=$1', [projection])).rows[0].message_id,
     'current-message');
+  const transitions = (await pool.query(`SELECT from_state,to_state FROM state_transitions
+    WHERE aggregate_type='OUTBOX_EVENT' AND aggregate_id=$1 ORDER BY created_at`, [event])).rows;
+  assert.deepEqual(transitions, [
+    { from_state: 'PENDING', to_state: 'LEASED' },
+    { from_state: 'LEASED', to_state: 'DELIVERED' },
+  ]);
 });
 
 test('quest-new role ping is durable and is not repeated when the message is recreated', async (t) => {

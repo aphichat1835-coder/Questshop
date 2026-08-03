@@ -2,9 +2,19 @@ import { createHash } from 'node:crypto';
 import { v7 as uuidv7 } from 'uuid';
 import { withTransaction } from '../../db/transaction.js';
 import { FencingLostError } from '../../shared/errors.js';
+import { recordTransition } from '../shared/transition.js';
 
 function projectionNonce(id) {
   return createHash('sha256').update(String(id)).digest('base64url').slice(0, 25);
+}
+
+function outboxContext(event, actorId) {
+  return {
+    traceId: event.trace_id,
+    causationId: event.causation_id ?? null,
+    actorType: 'SYSTEM',
+    actorId,
+  };
 }
 
 export async function enqueueProjection(client, {
@@ -50,7 +60,7 @@ export async function acquireDelivery({ holder, ttlSeconds = 30 }, options = {})
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const result = await client.query(`
       WITH candidate AS (
-        SELECT o.id FROM outbox_events o
+        SELECT o.id,o.state AS previous_state FROM outbox_events o
         JOIN message_projections p ON p.id=o.projection_id
         WHERE (p.surface_key IS DISTINCT FROM 'QUEST_NEW' OR EXISTS(
           SELECT 1 FROM feature_gates g WHERE g.gate='QUEST_ANNOUNCEMENT_ENABLED' AND g.enabled=true
@@ -65,13 +75,14 @@ export async function acquireDelivery({ holder, ttlSeconds = 30 }, options = {})
       )
       UPDATE outbox_events o
       SET state = 'LEASED',
+          state_version = o.state_version + 1,
           lease_owner = $1,
           lease_expires_at = clock_timestamp() + make_interval(secs => $2),
           fencing_token = o.fencing_token + 1,
           attempt_count = o.attempt_count + 1
       FROM candidate
       WHERE o.id = candidate.id
-      RETURNING o.*
+      RETURNING o.*,candidate.previous_state
     `, [holder, ttlSeconds]);
     const event = result.rows[0] ?? null;
     if (event?.projection_id) {
@@ -84,6 +95,11 @@ export async function acquireDelivery({ holder, ttlSeconds = 30 }, options = {})
       [event.id, holder, event.fencing_token, projection.fencing_token])).rows[0];
       if (!updated) throw new FencingLostError(`outbox:${event.id}`);
       event.projection_fencing_token = updated.projection_fencing_token;
+    }
+    if (event && event.previous_state !== 'LEASED') {
+      await recordTransition(client, { aggregateType: 'OUTBOX_EVENT', aggregateId: event.id,
+        fromState: event.previous_state, toState: 'LEASED', stateVersion: event.state_version,
+        reasonCode: 'OUTBOX_LEASED', context: outboxContext(event, holder) });
     }
     return event;
   });
@@ -125,12 +141,17 @@ export async function recordDelivery({
     const delivered = (await client.query(`
       UPDATE outbox_events
       SET state = 'DELIVERED', delivered_at = clock_timestamp(),
+          state_version = state_version + 1,
           lease_owner = NULL, lease_expires_at = NULL
       WHERE id = $1 AND lease_owner = $2 AND fencing_token = $3
-        AND lease_expires_at > clock_timestamp()
+        AND state_version = $4 AND lease_expires_at > clock_timestamp()
       RETURNING *
-    `, [outboxId, holder, fencingToken])).rows[0];
+    `, [outboxId, holder, fencingToken, event.state_version])).rows[0];
     if (!delivered) throw new FencingLostError(`outbox:${outboxId}`);
+    const context = outboxContext(event, holder);
+    await recordTransition(client, { aggregateType: 'OUTBOX_EVENT', aggregateId: event.id,
+      fromState: 'LEASED', toState: 'DELIVERED', stateVersion: delivered.state_version,
+      reasonCode: 'OUTBOX_DELIVERED', context });
     await client.query(`INSERT INTO delivery_attempts(id,outbox_id,attempt_number,outcome)
       VALUES($1,$2,$3,'DELIVERED') ON CONFLICT(outbox_id,attempt_number) DO NOTHING`,
     [uuidv7(), event.id, event.attempt_count]);
@@ -150,13 +171,26 @@ export async function recordDelivery({
       // One successful render is the latest state of the projection. Older
       // queued notifications for the same message must not edit that message
       // again; they are durably coalesced rather than silently discarded.
-      await client.query(`UPDATE outbox_events SET state='DELIVERED',delivered_at=clock_timestamp(),
-        lease_owner=NULL,lease_expires_at=NULL
-        WHERE projection_id=$1 AND id<>$2 AND state IN ('PENDING','RETRY_WAIT')`,
+      const coalesced = await client.query(`WITH obsolete AS (
+        SELECT id,state AS previous_state FROM outbox_events
+        WHERE projection_id=$1 AND id<>$2 AND state IN ('PENDING','RETRY_WAIT') FOR UPDATE
+      ) UPDATE outbox_events SET state='DELIVERED',state_version=outbox_events.state_version+1,
+        delivered_at=clock_timestamp(),lease_owner=NULL,lease_expires_at=NULL
+        FROM obsolete WHERE outbox_events.id=obsolete.id
+        RETURNING outbox_events.*,obsolete.previous_state`,
       [event.projection_id, event.id]);
+      for (const obsolete of coalesced.rows) await recordTransition(client, {
+        aggregateType: 'OUTBOX_EVENT', aggregateId: obsolete.id, fromState: obsolete.previous_state,
+        toState: 'DELIVERED', stateVersion: obsolete.state_version,
+        reasonCode: 'COALESCED_BY_NEWER_PROJECTION', context: outboxContext(obsolete, holder),
+      });
     }
-    await client.query(`UPDATE dead_letter_items SET state='RESOLVED',resolved_at=clock_timestamp()
-      WHERE state='PENDING' AND evidence->>'replayOutboxId'=$1`, [event.id]);
+    const resolvedDlq = await client.query(`UPDATE dead_letter_items SET state='RESOLVED',state_version=state_version+1,
+      resolved_at=clock_timestamp() WHERE state='PENDING' AND evidence->>'replayOutboxId'=$1 RETURNING *`, [event.id]);
+    for (const dlq of resolvedDlq.rows) await recordTransition(client, {
+      aggregateType: 'DEAD_LETTER', aggregateId: dlq.id, fromState: 'PENDING', toState: 'RESOLVED',
+      stateVersion: dlq.state_version, reasonCode: 'REPLAY_DELIVERED', context,
+    });
     return delivered;
   });
 }

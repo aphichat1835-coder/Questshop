@@ -2,6 +2,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { withTransaction } from '../../db/transaction.js';
 import { AuthorizationError, QuestshopError } from '../../shared/errors.js';
 import { appendAdminAudit } from '../admin/audit.js';
+import { recordTransition } from '../shared/transition.js';
 
 export async function replayDeadLetter({ dlqId, reason }, context, options = {}) {
   if (!reason?.trim()) throw new TypeError('DLQ replay reason is required');
@@ -17,9 +18,14 @@ export async function replayDeadLetter({ dlqId, reason }, context, options = {})
       VALUES($1,$2,$3,$4,$5,$6,'PENDING',clock_timestamp(),$7,$8)`, [replayId,
       `REPLAY:${dlq.id}`, source.aggregate_type, source.aggregate_id, source.aggregate_version,
       source.projection_id, replayTraceId, source.trace_id]);
-    const updated = (await client.query(`UPDATE dead_letter_items SET state='PENDING',replay_trace_id=$2,
-      evidence=evidence||$3::jsonb WHERE id=$1 RETURNING *`, [dlq.id, replayTraceId,
-      { replayOutboxId: replayId, reason, parentOutboxId: source.id }])).rows[0];
+    const updated = (await client.query(`UPDATE dead_letter_items SET state='PENDING',state_version=state_version+1,
+      replay_trace_id=$2,evidence=evidence||$3::jsonb WHERE id=$1 AND state='DEAD_LETTER'
+        AND state_version=$4 RETURNING *`, [dlq.id, replayTraceId,
+      { replayOutboxId: replayId, reason, parentOutboxId: source.id }, dlq.state_version])).rows[0];
+    if (!updated) throw new QuestshopError('DLQ_STALE', 'DLQ changed during replay');
+    await recordTransition(client, { aggregateType: 'DEAD_LETTER', aggregateId: dlq.id,
+      fromState: 'DEAD_LETTER', toState: 'PENDING', stateVersion: updated.state_version,
+      reasonCode: 'ADMIN_REPLAY', context });
     await appendAdminAudit(client, { action: 'DLQ_REPLAY', targetType: 'DLQ', targetId: dlq.id,
       actorId: context.actorId, before: dlq, after: updated, reason, context });
     return { dlq: updated, replayOutboxId: replayId, replayTraceId };
@@ -35,8 +41,13 @@ export async function discardDeadLetter({ dlqId, reason, isOwner }, context, opt
     if (['FINANCIAL', 'AUDIT'].includes(dlq.category)) {
       throw new QuestshopError('DLQ_DISCARD_FORBIDDEN', 'Financial/Audit DLQ ห้าม Discard');
     }
-    const updated = (await client.query(`UPDATE dead_letter_items SET state='DISCARDED',resolved_at=clock_timestamp(),
-      evidence=evidence||$2::jsonb WHERE id=$1 RETURNING *`, [dlq.id, { discardReason: reason }])).rows[0];
+    const updated = (await client.query(`UPDATE dead_letter_items SET state='DISCARDED',state_version=state_version+1,
+      resolved_at=clock_timestamp(),evidence=evidence||$2::jsonb WHERE id=$1 AND state='DEAD_LETTER'
+        AND state_version=$3 RETURNING *`, [dlq.id, { discardReason: reason }, dlq.state_version])).rows[0];
+    if (!updated) throw new QuestshopError('DLQ_STALE', 'DLQ changed during discard');
+    await recordTransition(client, { aggregateType: 'DEAD_LETTER', aggregateId: dlq.id,
+      fromState: 'DEAD_LETTER', toState: 'DISCARDED', stateVersion: updated.state_version,
+      reasonCode: 'OWNER_DISCARD', context });
     await appendAdminAudit(client, { action: 'DLQ_DISCARD', targetType: 'DLQ', targetId: dlq.id,
       actorId: context.actorId, before: dlq, after: updated, reason, context });
     return updated;

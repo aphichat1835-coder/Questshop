@@ -216,7 +216,7 @@ async function releaseExpiredOrderItems(pool, context) {
   }
 }
 
-async function reconcileSellableQuests(pool, context, runnerConcurrency) {
+export async function reconcileSellableQuests(pool, context, runnerConcurrency) {
   const sellable = (await pool.query("SELECT * FROM quests WHERE sale_state IN ('OPEN','PAUSED') LIMIT 100")).rows;
   for (const quest of sellable) {
     const admission = await withTransaction({ pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
@@ -230,7 +230,18 @@ async function reconcileSellableQuests(pool, context, runnerConcurrency) {
           sale_version=sale_version+CASE WHEN sale_state<>$2 THEN 1 ELSE 0 END,
           analysis_version=analysis_version+CASE WHEN $2='EXPIRED' AND analysis_state<>'EXPIRED' THEN 1 ELSE 0 END,
           updated_at=clock_timestamp() WHERE quest_id=$1 AND sale_state<>$2 RETURNING *`, [quest.quest_id, next])).rows[0];
-        if (updated) await enqueueProjection(database, { projectionType: 'QUEST_NEW', aggregateType: 'QUEST',
+        if (!updated) return;
+        if (quest.sale_state !== updated.sale_state) {
+          await recordTransition(database, { aggregateType: 'QUEST_SALE', aggregateId: updated.quest_id,
+            fromState: quest.sale_state, toState: updated.sale_state,
+            stateVersion: updated.sale_version, reasonCode: admission.reason, context });
+        }
+        if (quest.analysis_state !== updated.analysis_state) {
+          await recordTransition(database, { aggregateType: 'QUEST_ANALYSIS', aggregateId: updated.quest_id,
+            fromState: quest.analysis_state, toState: updated.analysis_state,
+            stateVersion: updated.analysis_version, reasonCode: admission.reason, context });
+        }
+        await enqueueProjection(database, { projectionType: 'QUEST_NEW', aggregateType: 'QUEST',
           aggregateId: updated.quest_id, aggregateVersion: updated.sale_version,
           surfaceKey: 'QUEST_NEW', context });
       });

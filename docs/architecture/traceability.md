@@ -14,7 +14,7 @@ This matrix separates implemented controls from evidence that can only be produc
 | Checkout, quote revalidation, account lock | `domain/checkout`, interaction router | signed-preflight, large-order/account uniqueness and simultaneous-confirm tests | mobile Discord UAT |
 | Fair queue, lazy jobs, dynamic expiry | runner/catalog expiry services | fair queue and lazy materialization tests | runtime p95 calibration |
 | Runner checkpoints, lease/fencing, no claim | runner service, Quest executor registry | crash/fencing and no-claim source scan | live video/desktop Quest UAT |
-| Outbox, coalescing, Discord errors, DLQ | outbox services/workers/renderers | projection fencing, nonce reconciliation, DLQ replay/discard plus 403/404/429 fault-contract tests and one-attempt best-effort Order DM | real Discord fault UAT |
+| Outbox, coalescing, Discord errors, DLQ | outbox services/workers/renderers | event/projection fencing plus state-version CAS, nonce reconciliation, DLQ replay/discard, 403/404/429 fault-contract tests and one-attempt best-effort Order DM | real Discord fault UAT |
 | Customer/admin Discord surfaces | setup/router/renderers | session binding/security tests | production guild layout and permissions |
 | Manual review and money authority | reviews service/Admin panel | atomic ambiguous-credit test | Owner review workflow UAT |
 | Blocklist and Admin audit | blocklist/Admin services | database constraints and audit paths | Admin role UAT |

@@ -3,6 +3,7 @@ import { withTransaction } from '../db/transaction.js';
 import { renderProjection } from '../discord/renderers/projections.js';
 import { renewDeliveryLease } from '../domain/outbox/service.js';
 import { FencingLostError } from '../shared/errors.js';
+import { recordTransition } from '../domain/shared/transition.js';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const BACKOFF = [1, 5, 15, 60, 300, 900];
@@ -77,17 +78,23 @@ async function failDelivery(event, error, pool) {
       && projection.surface_key.startsWith('DM:');
     const dead = !terminalDmFailure && (details.forbidden || event.attempt_count > BACKOFF.length);
     const nextState = terminalDmFailure ? 'DELIVERED' : (dead ? 'DEAD_LETTER' : 'RETRY_WAIT');
-    const updated = (await client.query(`UPDATE outbox_events SET state = $4, available_at = clock_timestamp()
+    const updated = (await client.query(`UPDATE outbox_events SET state = $4, state_version=state_version+1,
+      available_at = clock_timestamp()
       + make_interval(secs => $5), delivered_at=CASE WHEN $6 THEN clock_timestamp() ELSE delivered_at END,
       lease_owner = NULL, lease_expires_at = NULL
       WHERE id = $1 AND lease_owner = $2 AND fencing_token = $3
-        AND lease_expires_at>clock_timestamp()
+        AND state_version=$7 AND lease_expires_at>clock_timestamp()
       RETURNING *`,
     [event.id, event.lease_owner, event.fencing_token, nextState,
-      retryDelaySeconds(event, error), terminalDmFailure])).rows[0];
+      retryDelaySeconds(event, error), terminalDmFailure, event.state_version])).rows[0];
     // The lease belongs to a newer worker or has expired.  That worker will
     // reconcile the event; a stale worker must not create retry/DLQ evidence.
     if (!updated) return false;
+    await recordTransition(client, { aggregateType: 'OUTBOX_EVENT', aggregateId: event.id,
+      fromState: 'LEASED', toState: nextState, stateVersion: updated.state_version,
+      reasonCode: terminalDmFailure ? 'ORDER_DM_FAILED_ONCE' : (dead ? 'OUTBOX_DEAD_LETTER' : 'OUTBOX_RETRY'),
+      context: { traceId: event.trace_id, causationId: event.causation_id ?? null,
+        actorType: 'SYSTEM', actorId: event.lease_owner } });
     await client.query(`INSERT INTO delivery_attempts(id,outbox_id,attempt_number,outcome,discord_status,error_code,evidence)
       VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6) ON CONFLICT(outbox_id,attempt_number) DO NOTHING`,
     [event.id, event.attempt_count, dead || terminalDmFailure ? 'FAILED' : 'RETRY', Number(error.status) || null,
