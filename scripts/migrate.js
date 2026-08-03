@@ -1,3 +1,4 @@
+import '../src/config/load-local-environment.js';
 import { loadEnvironment } from '../src/config/env.js';
 import { runMigrations } from '../src/db/migrations.js';
 import { closePools } from '../src/db/pools.js';

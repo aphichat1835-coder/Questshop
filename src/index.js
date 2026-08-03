@@ -1,3 +1,4 @@
+import './config/load-local-environment.js';
 import { closeHealthServer, createHealthState, startHealthServer } from './bootstrap/health-server.js';
 
 let runtime;

@@ -1,3 +1,4 @@
+import '../src/config/load-local-environment.js';
 import { REST, Routes } from 'discord.js';
 import { loadEnvironment } from '../src/config/env.js';
 import { commandData } from '../src/discord/commands/definitions.js';

@@ -1,3 +1,4 @@
+import '../src/config/load-local-environment.js';
 import { loadEnvironment } from '../src/config/env.js';
 import { getRuntimePool, closePools } from '../src/db/pools.js';
 import { createEncryptedBackup } from '../src/adapters/s3/backup.js';

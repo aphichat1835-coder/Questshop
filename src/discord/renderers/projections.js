@@ -1,25 +1,22 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, escapeMarkdown } from 'discord.js';
 import { decryptSecret } from '../../adapters/crypto/keyring.js';
 import { supportCode } from '../../shared/correlation.js';
+import {
+  orderStateIcon,
+  orderStateLabel,
+  questTargetLabel,
+  questTypeLabel,
+  reservationStateLabel,
+  terminalReasonLabel,
+} from './labels.js';
+import { baht } from './checkout.js';
 
 const color = { pending: 0xf0b232, success: 0x23a55a, failure: 0xf23f43, info: 0x5865f2 };
 const escape = (value) => escapeMarkdown(String(value ?? 'ไม่ระบุ').replaceAll('@', '@\u200b')).slice(0, 1000);
-const baht = (cents) => `${(Number(cents ?? 0) / 100).toFixed(2)} บาท`;
 const timestamp = (value, style = 'F') => value ? `<t:${Math.floor(new Date(value).getTime() / 1000)}:${style}>` : 'ไม่ระบุ';
 const noMentions = { parse: [] };
-function orderItemLinks(historyUrl, claimUrl) {
-  return [historyUrl ? `[ประวัติ](${historyUrl})` : null, claimUrl ? `[รับรางวัล](${claimUrl})` : null]
-    .filter(Boolean).join(' • ');
-}
-function orderItemLine(item, links) {
-  const suffix = links ? ` • ${links}` : '';
-  return `${item.sequence_number}. **${escape(item.quest_name)}** — ${escape(item.state)} — ${baht(item.price_cents)}${suffix}`;
-}
-function questSaleStatus(saleState) {
-  if (saleState === 'OPEN') return 'เปิดขาย';
-  if (saleState === 'PAUSED') return 'พักขายชั่วคราว';
-  if (saleState === 'EXPIRED') return 'หมดอายุ';
-  return 'ประกาศแล้วแต่ยังไม่เปิดขายทั่วไป';
+function orderItemLine(item) {
+  return `${item.sequence_number}. ${orderStateIcon(item.state)} **${escape(item.quest_name)}** — ${orderStateLabel(item.state)} — ${baht(item.price_cents)}`;
 }
 function safeHttpsUrl(value) {
   try {
@@ -53,13 +50,23 @@ async function renderRefund(pool, projection, { client }) {
 }
 
 async function renderTopupReceipt(pool, projection) {
-  const topup = (await pool.query(`SELECT t.*,w.available_cents FROM topups t
-    JOIN wallets w ON w.discord_user_id=t.discord_user_id WHERE t.id=$1`, [projection.aggregate_id])).rows[0];
+  const topup = (await pool.query(`SELECT t.*,w.available_cents,p.name AS promotion_name,
+    ledger.available_before_cents,ledger.available_after_cents
+    FROM topups t JOIN wallets w ON w.discord_user_id=t.discord_user_id
+    LEFT JOIN promotions p ON p.id=t.promotion_id
+    LEFT JOIN LATERAL (SELECT x.available_before_cents,x.available_after_cents
+      FROM wallet_transactions x WHERE x.reference_type='TOPUP' AND x.reference_id=t.id::text
+        AND x.transaction_type='TOPUP_CREDIT' ORDER BY x.created_at DESC LIMIT 1) ledger ON true
+    WHERE t.id=$1`, [projection.aggregate_id])).rows[0];
+  const total = BigInt(topup.amount_cents ?? 0) + BigInt(topup.bonus_cents ?? 0);
   const description = [
     `**Top-up ID:** \`${topup.id}\``, `**Provider transaction:** \`${escape(topup.provider_transaction_id)}\``,
-    `**เงินต้น:** ${baht(topup.amount_cents)}`, `**โบนัส:** ${baht(topup.bonus_cents)}`,
-    `**ยอดคงเหลือ:** ${baht(topup.available_cents)}`,
-  ].join('\n');
+    `**ยอดก่อนเติม:** ${baht(topup.available_before_cents)}`,
+    `**เงินจากซอง:** ${baht(topup.amount_cents)}`, `**โบนัส:** ${baht(topup.bonus_cents)}`,
+    topup.promotion_name ? `**โปรโมชั่น:** ${escape(topup.promotion_name)}` : null,
+    `**ได้รับทั้งหมด:** ${baht(total)}`,
+    `**ยอดคงเหลือใหม่:** ${baht(topup.available_after_cents ?? topup.available_cents)}`,
+  ].filter(Boolean).join('\n');
   return { embeds: [new EmbedBuilder().setColor(color.success).setTitle('ใบเสร็จเติมเงิน Questshop')
     .setDescription(description).setFooter({ text: 'ใบเสร็จ Discord Embed — ไม่ใช่ใบกำกับภาษี' }).setTimestamp(topup.credited_at)],
   allowedMentions: noMentions };
@@ -86,11 +93,7 @@ async function renderOrderDm(pool, projection, { env = {} } = {}) {
   const historySurface = (await pool.query("SELECT guild_id,channel_id FROM surfaces WHERE surface_key='QUEST_HISTORY'")).rows[0];
   const historyBase = historySurface && env.DISCORD_GUILD_ID
     ? `https://discord.com/channels/${historySurface.guild_id ?? env.DISCORD_GUILD_ID}/${historySurface.channel_id}` : null;
-  const itemLines = items.map((item) => {
-    const historyUrl = historyBase && item.message_id ? `${historyBase}/${item.message_id}` : null;
-    const claimUrl = safeHttpsUrl(item.claim_url);
-    return orderItemLine(item, orderItemLinks(historyUrl, claimUrl));
-  });
+  const itemLines = items.map(orderItemLine);
   const description = [
     `**Order ID:** \`${aggregate.id}\``, `**บัญชี:** ${escape(aggregate.account_username)}`,
     `**ทั้งหมด:** ${aggregate.total_items}`, `**สำเร็จ:** ${aggregate.captured_items}`,
@@ -100,19 +103,30 @@ async function renderOrderDm(pool, projection, { env = {} } = {}) {
     `**Wallet ปัจจุบัน:** ${baht(wallet?.available_cents)} พร้อมใช้ / ${baht(wallet?.reserved_cents)} จอง`,
     '', '**รายละเอียดรายเควส:**', ...(itemLines.length ? itemLines : ['ยังไม่มีรายการ']),
   ].join('\n');
+  const firstClaimUrl = items.filter((item) => item.state === 'READY_TO_CLAIM')
+    .map((item) => safeHttpsUrl(item.claim_url)).find(Boolean);
+  const claimButtons = firstClaimUrl
+    ? [new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(firstClaimUrl).setLabel('รับรางวัลทั้งหมด')]
+    : [];
+  const navigationButtons = historyBase
+    ? [new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(historyBase).setLabel('ดูประวัติ Quest ทั้งหมด')]
+    : [];
+  const components = [...claimButtons, ...navigationButtons].length
+    ? [new ActionRowBuilder().addComponents(...claimButtons, ...navigationButtons)] : [];
   return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('สรุป Order Questshop').setDescription(description.slice(0, 4000))],
-    allowedMentions: noMentions };
+    components, allowedMentions: noMentions };
 }
 
 async function renderPaymentLog(pool, projection, { env, client }) {
   const topup = (await pool.query(`SELECT t.*,p.key_version,p.nonce,p.ciphertext,p.auth_tag,
     r.encrypted_phone,r.encryption_key_version,r.nonce AS receiver_nonce,r.auth_tag AS receiver_auth_tag,
     (SELECT count(*)::integer FROM payment_attempts a WHERE a.topup_id=t.id) AS attempts,
-    l.available_before,l.available_after,l.reserved_before,l.reserved_after,l.id AS wallet_transaction_id
+    l.available_before_cents AS available_before,l.available_after_cents AS available_after,
+    l.reserved_before_cents AS reserved_before,l.reserved_after_cents AS reserved_after,l.id AS wallet_transaction_id
     FROM topups t LEFT JOIN topup_sensitive_payloads p ON p.topup_id=t.id
     JOIN receiver_versions r ON r.id=t.receiver_version_id
     LEFT JOIN LATERAL (SELECT w.* FROM wallet_transactions w WHERE w.reference_type='TOPUP'
-      AND w.reference_id=t.id ORDER BY w.created_at DESC LIMIT 1) l ON true WHERE t.id=$1`, [projection.aggregate_id])).rows[0];
+      AND w.reference_id=t.id::text ORDER BY w.created_at DESC LIMIT 1) l ON true WHERE t.id=$1`, [projection.aggregate_id])).rows[0];
   const sensitive = topup.key_version == null ? null : JSON.parse(decryptSecret({
     keyVersion: topup.key_version, nonce: topup.nonce, ciphertext: topup.ciphertext, authTag: topup.auth_tag,
   }, env.DATA_ENCRYPTION_KEYS_JSON, `topup:${topup.id}:${env.DISCORD_GUILD_ID}`));
@@ -146,16 +160,20 @@ async function renderQuestNew(pool, projection) {
       ORDER BY CASE p.rule_type WHEN 'TEMPORARY' THEN 1 WHEN 'QUEST' THEN 2 WHEN 'TYPE' THEN 3 ELSE 4 END,
         p.priority DESC,p.created_at DESC LIMIT 1) resolved ON true WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
   const price = quest.price_cents == null ? 'ยังไม่กำหนด' : baht(quest.price_cents);
-  const saleStatus = questSaleStatus(quest.sale_state);
+  const questUrl = safeHttpsUrl(quest.url);
   const description = [
-    `**Quest ID:** \`${escape(quest.quest_id)}\``, `**ประเภท:** ${escape(quest.task_type)}`,
-    `**เป้าหมาย:** ${escape(quest.task_target)}`, `**Orbs:** ${quest.orbs ?? 'ไม่ระบุ'}`,
-    `**ราคา:** ${price}`, `**สถานะการรับงาน:** ${saleStatus}`,
+    `**ประเภท:** ${questTypeLabel(quest.task_type)}`,
+    `**เป้าหมาย:** ${questTargetLabel(quest.task_type, quest.task_target)}`, `**รางวัล:** ${quest.orbs ?? 'ไม่ระบุ'} Orbs`,
+    `**ค่าบริการ:** ${price}`,
+    questUrl ? `**[ดู Quest ได้ที่นี่](${questUrl})**` : null,
+    '',
     `**ตรวจพบ:** ${timestamp(quest.detected_at)}`, `**อัปเดต:** ${timestamp(quest.updated_at, 'R')}`,
     `**หมดอายุ:** ${timestamp(quest.expires_at)}`,
-  ].join('\n');
-  const embed = new EmbedBuilder().setColor(color.info).setTitle(escape(quest.name)).setDescription(description).setTimestamp(quest.updated_at);
-  if (quest.url) embed.setURL(quest.url);
+  ].filter(Boolean).join('\n');
+  const title = `🎉 พบ Quest ใหม่: ${escape(quest.name)}`.slice(0, 256);
+  const embed = new EmbedBuilder().setColor(color.info).setTitle(title)
+    .setDescription(description).setTimestamp(quest.updated_at);
+  if (questUrl) embed.setURL(questUrl);
   if (quest.artwork_url) embed.setImage(quest.artwork_url);
   return { embeds: [embed], allowedMentions: noMentions };
 }
@@ -316,22 +334,17 @@ async function renderQuestHistory(pool, projection) {
     FROM order_items i JOIN orders o ON o.id=i.order_id
     LEFT JOIN wallet_reservations r ON r.order_item_id=i.id WHERE i.id=$1`, [projection.aggregate_id])).rows[0];
   if (!item) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบประวัติ Quest')], allowedMentions: noMentions };
-  const states = {
-    READY_TO_CLAIM: { title: '✅ Quest เสร็จสมบูรณ์', tone: color.success },
-    EXPIRED_RELEASED: { title: '↩️ คืนเงิน — Quest หมดอายุก่อนเริ่ม', tone: color.failure },
-    EXTERNAL_COMPLETED_RELEASED: { title: '↩️ คืนเงิน — บัญชีทำ Quest เสร็จจากที่อื่น', tone: color.failure },
-    STOPPED_RELEASED: { title: '↩️ คืนเงิน — งานถูกหยุด', tone: color.failure },
-    FAILED_RELEASED: { title: '↩️ คืนเงิน — ทำ Quest ไม่สำเร็จ', tone: color.failure },
-    MANUAL_REVIEW: { title: '🟠 รอแอดมินตรวจสอบ', tone: color.pending },
-  };
-  const status = states[item.state] ?? { title: `⏳ กำลังดำเนินการ — ${escape(item.state)}`, tone: color.pending };
+  let tone = color.pending;
+  if (item.state === 'READY_TO_CLAIM') tone = color.success;
+  else if (item.state?.endsWith('_RELEASED')) tone = color.failure;
+  const status = { title: `${orderStateIcon(item.state)} ${orderStateLabel(item.state)}`, tone };
   const claimUrl = safeHttpsUrl(item.claim_url);
   const description = [
     `**บัญชี:** ${escape(item.account_username)}`, `**Account ID:** \`${escape(item.account_id)}\``,
     `**Quest:** ${escape(item.quest_name)}`, `**Order:** \`${escape(item.order_id)}\``,
-    `**สถานะการเงิน:** ${escape(item.reservation_state)}`, `**ราคา/ยอดจอง:** ${baht(item.reservation_amount ?? item.price_cents)}`,
-    `**Progress:** ${item.progress_bucket}%`, `**Support:** \`${supportCode(item.trace_id)}\``,
-    item.terminal_reason ? `**เหตุผล:** ${escape(item.terminal_reason)}` : null,
+    `**สถานะเครดิต:** ${reservationStateLabel(item.reservation_state)}`, `**ราคา/ยอดจอง:** ${baht(item.reservation_amount ?? item.price_cents)}`,
+    `${orderStateIcon(item.state)} **${escape(item.quest_name)} — ${item.progress_bucket}%**`, `**Support:** \`${supportCode(item.trace_id)}\``,
+    item.terminal_reason ? `**เหตุผล:** ${terminalReasonLabel(item.terminal_reason)}` : null,
   ].filter(Boolean).join('\n');
   const embed = new EmbedBuilder().setColor(status.tone).setTitle(status.title).setDescription(description).setTimestamp(item.updated_at);
   if (item.account_avatar_url) embed.setThumbnail(item.account_avatar_url);

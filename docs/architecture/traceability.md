@@ -7,7 +7,7 @@ This matrix separates implemented controls from evidence that can only be produc
 
 | Requirement group | Primary implementation | Automated evidence | Live evidence still required |
 |---|---|---|---|
-| Node 22 ESM, config, PostgreSQL pools/TLS/time | `src/config`, `src/db`, migrations 0001–0020 | syntax/lint/migration checksum tests | managed PostgreSQL role and CA validation |
+| Node 22 ESM, first-run setup, PostgreSQL pools/TLS/time | `src/config`, `scripts/setup.js`, `src/db`, migrations 0001–0020 | syntax/lint/setup idempotency and secret-conflict tests/migration checksum tests | durable secret-manager mount plus managed PostgreSQL role and CA validation |
 | State machines, CAS, correlation, audit | domain `states.js`, `state_transitions`, durable interaction sessions and domain services | state/unit and integration tests; CI refuses a missing PostgreSQL test database rather than skipping contract cases | production trace sampling |
 | Wallet, immutable ledger, reservation/capture/release/refund | `domain/wallet`, secure retention function, `refunds` | concurrent debit, 3/2 settlement, idempotent captured-item refund, checkpoint tests | Owner pre-launch compensation sign-off |
 | TrueMoney Direct, receiver snapshot, HMAC, ambiguity | `adapters/truemoney`, payment worker/services | URL allowlist, pinned-schema, post-send ambiguity, duplicate-voucher and crash-credit tests | real success/ambiguous/schema fixtures |

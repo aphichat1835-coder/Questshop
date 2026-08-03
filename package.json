@@ -8,6 +8,7 @@
     "node": ">=22.22.0 <23"
   },
   "scripts": {
+    "setup": "node scripts/setup.js",
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "register": "node scripts/register-commands.js",

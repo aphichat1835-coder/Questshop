@@ -1,3 +1,4 @@
+import '../src/config/load-local-environment.js';
 import { spawn } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
 import pg from 'pg';

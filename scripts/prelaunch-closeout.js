@@ -1,3 +1,4 @@
+import '../src/config/load-local-environment.js';
 import { loadEnvironment } from '../src/config/env.js';
 import { getRuntimePool, closePools } from '../src/db/pools.js';
 import { createContext } from '../src/shared/correlation.js';

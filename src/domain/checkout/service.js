@@ -226,11 +226,17 @@ async function lockAuthorizedSession(client, { sessionId, actorId, guildId, chan
 }
 
 async function orderResult(client, orderId) {
+  const order = (await client.query('SELECT * FROM orders WHERE id=$1', [orderId])).rows[0];
+  if (!order) throw new QuestshopError('CHECKOUT_RESULT_MISSING', 'ไม่พบผลลัพธ์ Order เดิม');
   const items = (await client.query(`
-    SELECT * FROM order_items WHERE order_id = $1 ORDER BY sequence_number, id
+    SELECT i.*,q.orbs FROM order_items i LEFT JOIN quests q ON q.quest_id=i.quest_id
+    WHERE i.order_id = $1 ORDER BY i.sequence_number, i.id
   `, [orderId])).rows;
   if (!items.length) throw new QuestshopError('CHECKOUT_RESULT_MISSING', 'ไม่พบผลลัพธ์ Order เดิม');
-  return { orderId, items, totalCents: sumCents(items.map((item) => item.price_cents)) };
+  const wallet = (await client.query(`SELECT available_cents,reserved_cents FROM wallets
+    WHERE discord_user_id=$1`, [order.discord_user_id])).rows[0];
+  return { orderId, order, items, wallet,
+    totalCents: sumCents(items.map((item) => item.price_cents)) };
 }
 
 async function loadConfirmedOrder({ sessionId, actorId, guildId, channelId = null,
@@ -281,10 +287,11 @@ export async function getSelectionPage({ sessionId, actorId, guildId, channelId 
   messageId = null, direction = 0 }, _context, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
-    const count = Number((await client.query(
-      'SELECT count(*)::integer AS value FROM checkout_quest_options WHERE session_id = $1',
-      [sessionId],
-    )).rows[0].value);
+    const summary = (await client.query(`SELECT count(*)::integer AS count,
+      count(*) FILTER (WHERE selected)::integer AS selected_count,
+      COALESCE(sum(price_cents) FILTER (WHERE selected),0)::bigint AS selected_total_cents
+      FROM checkout_quest_options WHERE session_id=$1`, [sessionId])).rows[0];
+    const count = Number(summary.count);
     const pages = Math.max(1, Math.ceil(count / 25));
     const oldPage = Number(session.payload?.page ?? 0);
     const page = Math.max(0, Math.min(pages - 1, oldPage + direction));
@@ -296,11 +303,17 @@ export async function getSelectionPage({ sessionId, actorId, guildId, channelId 
       `, [sessionId, page]);
     }
     const rows = (await client.query(`
-      SELECT line_id, quest_id, quest_name, task_type, price_cents, selected
-      FROM checkout_quest_options WHERE session_id = $1
-      ORDER BY created_at, id OFFSET $2 LIMIT 25
+      SELECT option.line_id,option.quest_id,option.quest_name,option.task_type,
+        option.price_cents,option.selected,option.progress_actual,option.deadline_at,quest.orbs
+      FROM checkout_quest_options option LEFT JOIN quests quest ON quest.quest_id=option.quest_id
+      WHERE option.session_id = $1
+      ORDER BY option.created_at,option.id OFFSET $2 LIMIT 25
     `, [sessionId, page * 25])).rows;
-    return { session: { ...session, payload: { ...session.payload, page } }, rows, page, pages, count };
+    const wallet = (await client.query('SELECT available_cents FROM wallets WHERE discord_user_id=$1',
+      [actorId])).rows[0];
+    return { session: { ...session, payload: { ...session.payload, page } }, rows, page, pages, count,
+      selectedCount: Number(summary.selected_count), selectedTotalCents: summary.selected_total_cents,
+      walletAvailableCents: wallet?.available_cents ?? 0 };
   });
 }
 
@@ -320,8 +333,9 @@ export async function buildQuote({ sessionId, actorId, guildId, channelId = null
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
     const items = (await client.query(`
-      SELECT * FROM checkout_quest_options
-      WHERE session_id = $1 AND selected = true ORDER BY created_at, id
+      SELECT option.*,quest.orbs FROM checkout_quest_options option
+      LEFT JOIN quests quest ON quest.quest_id=option.quest_id
+      WHERE option.session_id = $1 AND option.selected = true ORDER BY option.created_at,option.id
     `, [sessionId])).rows;
     if (!items.length) throw new QuestshopError('NO_QUEST_SELECTED', 'กรุณาเลือก Quest อย่างน้อยหนึ่งรายการ');
     for (const item of items) {
@@ -336,12 +350,19 @@ export async function buildQuote({ sessionId, actorId, guildId, channelId = null
       if (!expiry.eligible) throw new QuestshopError('QUEST_INSUFFICIENT_TIME',
         `เวลา Quest ${item.quest_name} ไม่เพียงพอ`);
     }
+    const totalCents = sumCents(items.map((item) => item.price_cents));
+    const wallet = (await client.query('SELECT available_cents,reserved_cents FROM wallets WHERE discord_user_id=$1',
+      [actorId])).rows[0];
+    if (BigInt(wallet?.available_cents ?? 0) < totalCents) {
+      throw new QuestshopError('WALLET_INSUFFICIENT', 'เครดิตไม่เพียงพอสำหรับรายการที่เลือก กรุณาเติมเครดิตหรือลดจำนวน Quest');
+    }
     const quoteHash = selectionHash(items, session.config_version);
     const updated = (await client.query(`UPDATE interaction_sessions SET
       payload=payload||jsonb_build_object('quoteHash',$2::text,'quotedAt',transaction_timestamp()),
       state_version=state_version+1,updated_at=transaction_timestamp() WHERE id=$1 RETURNING *`,
     [sessionId, quoteHash])).rows[0];
-    return { session: updated, items, quoteHash, totalCents: sumCents(items.map((item) => item.price_cents)) };
+    return { session: updated, items, quoteHash, totalCents,
+      walletAvailableCents: wallet.available_cents, walletReservedCents: wallet.reserved_cents };
   });
 }
 
@@ -623,7 +644,7 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
     await queueFirstOrderItem(client, itemRows, actorId, preflight, correlatedContext);
     await enqueueOrderHistory(client, itemRows, correlatedContext);
     await finishCheckout(client, sessionId, orderId);
-    return { orderId, items: itemRows, totalCents: sumCents(itemRows.map((item) => item.price_cents)) };
+    return orderResult(client, orderId);
   });
 }
 

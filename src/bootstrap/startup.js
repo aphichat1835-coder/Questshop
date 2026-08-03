@@ -171,8 +171,12 @@ export async function startup({ health = createHealthState(), server: existingSe
     const heartbeat = startRuntimeHeartbeat({ abortController, env, holder, pool, runtimeLease,
       health, logger, onRuntimeLeaseLost });
     await markRuntimeReady({ env, health, logger, pool });
-    return { env, logger, health, server, pool, client, config, workers, abortController, heartbeat,
+    const runtime = { env, logger, health, server, pool, client, config, workers, abortController, heartbeat,
       runtimeLease, runtimeHolder: holder, acceptingInteractions: true, shutdownPromise: null };
+    // Interaction handlers must observe the same runtime object that shutdown
+    // fences. This also gives bounded customer waits the process AbortSignal.
+    client.questshop = runtime;
+    return runtime;
   } catch (error) {
     await cleanupFailedStartup({ abortController, client, error, health, logger, pool, server });
     throw error;
