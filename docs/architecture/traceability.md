@@ -5,7 +5,7 @@ This matrix separates implemented controls from evidence that can only be produc
 
 | Requirement group | Primary implementation | Automated evidence | Live evidence still required |
 |---|---|---|---|
-| Node 22 ESM, config, PostgreSQL pools/TLS/time | `src/config`, `src/db`, migrations 0001–0013 | syntax/lint/migration checksum tests | managed PostgreSQL role and CA validation |
+| Node 22 ESM, config, PostgreSQL pools/TLS/time | `src/config`, `src/db`, migrations 0001–0014 | syntax/lint/migration checksum tests | managed PostgreSQL role and CA validation |
 | State machines, CAS, correlation, audit | domain `states.js`, `state_transitions`, domain services | state/unit and integration tests | production trace sampling |
 | Wallet, immutable ledger, reservation/capture/release/refund | `domain/wallet`, secure retention function, `refunds` | concurrent debit, 3/2 settlement, idempotent captured-item refund, checkpoint tests | Owner pre-launch compensation sign-off |
 | TrueMoney Direct, receiver snapshot, HMAC, ambiguity | `adapters/truemoney`, payment worker/services | URL allowlist, pinned-schema, post-send ambiguity, duplicate-voucher and crash-credit tests | real success/ambiguous/schema fixtures |
@@ -28,3 +28,7 @@ Completion labels:
 - `implemented-but-unverified`: source and automated controls pass, but one or more live boundaries above are missing.
 - `done`: all automated evidence and every live boundary pass on the exact same Git SHA.
 - `production-ready` is forbidden before concurrent money tests, payment crash tests, restore drill and Owner UAT pass.
+
+The requirement-by-requirement audit for the plans is maintained in
+[`completion-audit.md`](./completion-audit.md).  It is deliberately an evidence record, not a
+claim that a source-only checkout has passed Discord, TrueMoney, S3, managed PostgreSQL or Owner UAT.
