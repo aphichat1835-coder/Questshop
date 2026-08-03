@@ -10,6 +10,15 @@ after(async () => { await pool?.end(); });
 const ring = (versions) => ({ current: versions.at(-1),
   keys: Object.fromEntries(versions.map((version) => [version, Buffer.alloc(32, version).toString('base64')])) });
 
+test('backup keyring is optional when no verified backups exist', async () => {
+  const emptyPool = { query: async () => ({ rows: [] }) };
+  const result = await validateKeyringCoverage(emptyPool, {
+    DATA_ENCRYPTION_KEYS_JSON: ring([1]),
+    VOUCHER_HMAC_KEYS_JSON: ring([1]),
+  });
+  assert.deepEqual(result, { data: [], vouchers: [], backups: [] });
+});
+
 test('startup refuses removal of encryption, voucher HMAC, and backup keys still required by durable rows', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7(); const receiver = uuidv7();
