@@ -630,18 +630,27 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
 export async function expireSessions(_input, _context, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const result = await client.query(`
-      UPDATE interaction_sessions SET state = 'EXPIRED', state_version = state_version + 1,
+      WITH expired AS (
+        SELECT id FROM interaction_sessions
+        WHERE state = 'ACTIVE' AND expires_at <= clock_timestamp()
+        ORDER BY expires_at,id LIMIT 500 FOR UPDATE SKIP LOCKED
+      )
+      UPDATE interaction_sessions AS session SET state = 'EXPIRED', state_version = session.state_version + 1,
         updated_at = clock_timestamp()
-      WHERE state = 'ACTIVE' AND expires_at <= clock_timestamp() RETURNING id
+      FROM expired WHERE session.id = expired.id RETURNING session.id
     `);
     if (result.rows.length) {
       await client.query('DELETE FROM checkout_credentials WHERE session_id=ANY($1::uuid[])',
         [result.rows.map((row) => row.id)]);
     }
     await client.query(`
-      DELETE FROM interaction_sessions
-      WHERE state IN ('EXPIRED','CANCELLED','TERMINAL')
-        AND updated_at < clock_timestamp() - interval '7 days'
+      WITH stale AS (
+        SELECT id FROM interaction_sessions
+        WHERE state IN ('CONFIRMED','EXPIRED','CANCELLED','TERMINAL')
+          AND updated_at < clock_timestamp() - interval '7 days'
+        ORDER BY updated_at,id LIMIT 500 FOR UPDATE SKIP LOCKED
+      )
+      DELETE FROM interaction_sessions AS session USING stale WHERE session.id = stale.id
     `);
     return result.rowCount;
   });

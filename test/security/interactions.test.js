@@ -11,6 +11,7 @@ import {
   terminateAdminSession,
 } from '../../src/domain/admin/session-service.js';
 import { createContext } from '../../src/shared/correlation.js';
+import { expireSessions } from '../../src/domain/checkout/service.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -102,4 +103,35 @@ test('session message binding and terminal transition are domain-owned compare-a
     WHERE aggregate_type='INTERACTION_SESSION' AND aggregate_id=$1 AND to_state='TERMINAL'`, [session.id])).rows[0].count), 1);
   await assert.rejects(() => terminateAdminSession({ sessionId: session.id, actorId: 'actor-a', guildId: 'guild-a',
     expectedVersion: terminal.state_version }, context, { pool }), (error) => error.code === 'STALE_SESSION');
+});
+
+test('confirmed checkout sessions and their encrypted credentials are pruned after seven days', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const context = createContext({ actorType: 'SYSTEM', actorId: 'retention', guildId: 'guild-a',
+    idempotencyKey: 'confirmed-checkout-retention' });
+  const sessionId = '019fc530-2000-7000-8000-000000000099';
+  await pool.query(`INSERT INTO interaction_sessions(id,actor_id,guild_id,channel_id,operation,state,
+    config_version,payload,trace_id,expires_at,updated_at) VALUES($1,'customer','guild-a','channel-a',
+    'CHECKOUT','CONFIRMED',1,'{"accountId":"account-a"}',$2,clock_timestamp()-interval '8 days',
+    clock_timestamp()-interval '8 days')`, [sessionId, context.traceId]);
+  await pool.query(`INSERT INTO checkout_credentials(session_id,account_id,key_version,nonce,ciphertext,auth_tag)
+    VALUES($1,'account-a',1,$2,$3,$4)`, [sessionId, Buffer.alloc(12), Buffer.from('encrypted'), Buffer.alloc(16)]);
+  await expireSessions({}, context, { pool });
+  assert.equal(Number((await pool.query('SELECT count(*)::integer AS count FROM interaction_sessions WHERE id=$1', [sessionId]))
+    .rows[0].count), 0);
+  assert.equal(Number((await pool.query('SELECT count(*)::integer AS count FROM checkout_credentials WHERE session_id=$1', [sessionId]))
+    .rows[0].count), 0);
+});
+
+test('session expiration and retention are bounded to 500 rows per maintenance batch', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const context = createContext({ actorType: 'SYSTEM', actorId: 'retention', guildId: 'guild-a',
+    idempotencyKey: 'session-expiration-batch' });
+  await pool.query(`INSERT INTO interaction_sessions(id,actor_id,guild_id,channel_id,operation,
+    config_version,payload,trace_id,expires_at)
+    SELECT gen_random_uuid(),'customer','guild-a','channel-a','CHECKOUT',1,'{}',$1,
+      clock_timestamp()-interval '1 minute' FROM generate_series(1,501)`, [context.traceId]);
+  assert.equal(await expireSessions({}, context, { pool }), 500);
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM interaction_sessions
+    WHERE state='ACTIVE' AND expires_at<=clock_timestamp()`)).rows[0].count), 1);
 });
