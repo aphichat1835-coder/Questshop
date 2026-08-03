@@ -10,7 +10,7 @@ let pool;
 before(async () => { pool = await createTestPool(); });
 after(async () => { await pool?.end(); });
 
-test('a quest awaiting retest pauses only while no TEST monitor is available', async (t) => {
+test('an overdue Monitor retest pauses sale and creates the next three-attempt batch', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const traceId = uuidv7();
   const context = createContext({ actorType: 'SYSTEM', actorId: 'maintenance', guildId: 'guild',
@@ -21,23 +21,29 @@ test('a quest awaiting retest pauses only while no TEST monitor is available', a
       'https://discord.com/quests/retest-no-monitor','1','1','1')`);
   const testRun = uuidv7();
   await pool.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,executor_version,
-    contract_version,trace_id) VALUES($1,'retest-no-monitor','RETEST_REQUIRED','1','1','1',$2)`,
+    contract_version,trace_id,completed_at) VALUES($1,'retest-no-monitor','TEST_PASSED','1','1','1',$2,
+      clock_timestamp()-interval '25 hours')`,
   [testRun, traceId]);
 
   await withTransaction({ pool, isolation: 'SERIALIZABLE' },
     (client) => maintainQuestRetests(client, context));
   assert.equal((await pool.query("SELECT sale_state FROM quests WHERE quest_id='retest-no-monitor'"))
     .rows[0].sale_state, 'PAUSED');
-  assert.equal((await pool.query('SELECT state FROM quest_test_runs WHERE id=$1', [testRun])).rows[0].state,
-    'RETEST_REQUIRED');
+  assert.equal((await pool.query(`SELECT state FROM quest_test_batches WHERE quest_id='retest-no-monitor'
+    ORDER BY created_at DESC LIMIT 1`)).rows[0].state, 'FAILED');
   assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM state_transitions
     WHERE aggregate_type='QUEST_SALE' AND aggregate_id='retest-no-monitor'
       AND from_state='OPEN' AND to_state='PAUSED' AND reason_code='RETEST_REQUIRED'`)).rows[0].count), 1);
 
+  const monitorId = uuidv7();
   await pool.query(`INSERT INTO monitor_accounts(id,account_id,capabilities,state)
-    VALUES($1,'monitor-retest',ARRAY['TEST'],'ACTIVE')`, [uuidv7()]);
+    VALUES($1,'monitor-retest',ARRAY['TEST'],'ACTIVE')`, [monitorId]);
   await withTransaction({ pool, isolation: 'SERIALIZABLE' },
     (client) => maintainQuestRetests(client, context));
-  assert.equal((await pool.query('SELECT state FROM quest_test_runs WHERE id=$1', [testRun])).rows[0].state,
-    'TEST_QUEUED');
+  const batch = (await pool.query(`SELECT * FROM quest_test_batches WHERE quest_id='retest-no-monitor'
+    ORDER BY created_at DESC LIMIT 1`)).rows[0];
+  assert.equal(batch.state, 'RUNNING');
+  const queued = (await pool.query(`SELECT * FROM quest_test_runs WHERE batch_id=$1`, [batch.id])).rows[0];
+  assert.deepEqual({ state: queued.state, monitor: queued.target_monitor_id, attempt: queued.attempt_in_monitor },
+    { state: 'TEST_QUEUED', monitor: monitorId, attempt: 1 });
 });

@@ -38,6 +38,10 @@ test('large checkout reserves all items but materializes one account job', async
   await adjustBalance({ discordUserId: user, amountCents: 5_000n, reason: 'seed' }, context('seed'), { pool });
   const created = await createSession({ discordUserId: user, guildId: '10000000000000002',
     channelId: '10000000000000003', messageId: null, token: 'test-token-value', env }, context('session'), options);
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM checkout_quest_options
+    WHERE session_id=$1 AND admission_scope='CUSTOMER_ACCOUNT'`, [created.session.id])).rows[0].count), 5);
+  assert.equal(Number((await pool.query("SELECT count(*)::integer AS count FROM quests WHERE sale_state='CLOSED'"))
+    .rows[0].count), 5);
   await assert.rejects(() => getSelectionPage({ sessionId: created.session.id, actorId: user,
     guildId: '10000000000000002', channelId: 'wrong-channel' }, context('wrong-channel'), options),
   (error) => error.code === 'NOT_AUTHORIZED');
@@ -90,6 +94,7 @@ test('large checkout reserves all items but materializes one account job', async
     createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
       guildId: '10000000000000002', idempotencyKey: 'quest-pause' }), { pool });
   assert.equal(paused.sale_state, 'PAUSED');
+  await pool.query(`UPDATE quests SET public_test_gate_override=true WHERE quest_id=$1`, [questId]);
   const reopened = await setQuestSaleState({ questId, nextState: 'OPEN', reason: 'validation passed',
     runnerConcurrency: 3 }, createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
     guildId: '10000000000000002', idempotencyKey: 'quest-open' }), { pool });

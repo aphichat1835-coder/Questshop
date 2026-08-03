@@ -5,6 +5,23 @@ This is an evidence ledger for the two authoritative plans:
 - `แผน Questshop ฉบับ Final Decision-Complete`
 - `Technical Blueprint: Questshop Production`
 
+## Later Owner policy decision — Monitor test gate
+
+The Owner superseded the earlier “test is not a gate” rule with this operational policy:
+
+1. A Quest first discovered by a Monitor stays private and closed for public sale.
+2. The system tries a Monitor up to three times, then moves to the next active Monitor; the
+   first verified pass stops the batch and permits `quest-new` publication and public sale.
+3. If every available Monitor fails, it creates a detailed `LOG_QUEST_OPERATIONS` alert with
+   **ส่งเลย** (audited Admin override, never a forged `TEST_PASSED`) and **ลองทดสอบอีกครั้ง**.
+4. A supported Quest newly discovered from a customer checkout may be admitted only for that
+   authenticated Quest account. It is logged with the customer and account identity, never a raw Token,
+   and it does not open general public sale.
+
+Implementation: migration `0017_monitor_test_sale_gate.sql`, `domain/catalog/test-gate.js`, catalog,
+checkout, test worker, admin override and Discord projection/router changes. Automated evidence:
+`test/integration/monitor-test-gate.test.js` and `checkout-lazy.test.js`.
+
 The Final Decision-Complete plan wins if the documents differ.  This record is a source and
 automated-test audit; release evidence must record `git rev-parse HEAD` at the time each command
 or live check runs.  It does **not** replace the live evidence required for a production release.
@@ -13,7 +30,7 @@ or live check runs.  It does **not** replace the live evidence required for a pr
 
 | Evidence | Result |
 |---|---|
-| Node `22.22.0`, PostgreSQL `16`, `npm run verify` | Passed: syntax, ESLint and 59 tests |
+| Node `22.22.0`, PostgreSQL `16`, `npm run verify` | Passed: syntax, ESLint and 60 tests |
 | `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
 | `git diff --check` | Passed |
 | Git tracked files | Neither legacy reference project is tracked; both are ignored locally |
@@ -47,7 +64,7 @@ contracts, not evidence for a managed production service.
 | 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. External alert delivery and monthly SLO evidence remain. |
 | 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
 | 22. Development sequence and feature gates | feature-gate config, Admin controls and pre-launch document | Source-confirmed. Owner must enable gates in the required live order. |
-| 23. Definition of Done and acceptance | definition-of-done, traceability and 59 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
+| 23. Definition of Done and acceptance | definition-of-done, traceability and 60 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
 
 ## Technical Blueprint plan
 

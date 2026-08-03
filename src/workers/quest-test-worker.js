@@ -11,38 +11,51 @@ import { secureJitter } from '../shared/random.js';
 import { withTransaction } from '../db/transaction.js';
 import { RUNNER_VERSION_COMPATIBILITY } from '../config/versions.js';
 import { recordTransition } from '../domain/shared/transition.js';
+import { advanceMonitorTestBatch, markMonitorTestBatchPassed } from '../domain/catalog/test-gate.js';
 
 export async function acquireTestRun({ holder, pool }) {
   const engineVersions = RUNNER_VERSION_COMPATIBILITY.map((item) => item.engine);
   const executorVersions = RUNNER_VERSION_COMPATIBILITY.map((item) => item.executor);
   const contractVersions = RUNNER_VERSION_COMPATIBILITY.map((item) => item.contract);
   return withTransaction({ pool, isolation: 'READ COMMITTED' }, async (client) => {
-    const monitor = (await client.query(`SELECT m.*,c.key_version,c.nonce,c.ciphertext,c.auth_tag
-      FROM monitor_accounts m JOIN monitor_credentials c ON c.monitor_id=m.id
-      WHERE m.state='ACTIVE' AND 'TEST'=ANY(m.capabilities)
-      ORDER BY m.last_used_at NULLS FIRST,m.priority DESC FOR UPDATE OF m SKIP LOCKED LIMIT 1`)).rows[0];
-    if (!monitor) return null;
-    const run = (await client.query(`WITH candidate AS (
-      SELECT tr.id FROM quest_test_runs tr JOIN quests q ON q.quest_id=tr.quest_id
+    const candidate = (await client.query(`SELECT tr.*,q.task_type,q.executor_id,
+      q.contract_version AS current_contract,m.id AS selected_monitor_id,m.account_id AS selected_account_id,
+      m.username AS selected_username,m.capabilities AS selected_capabilities,m.state AS selected_state,
+      m.priority AS selected_priority,m.consecutive_failures AS selected_failures,
+      m.cooldown_until AS selected_cooldown,m.last_used_at AS selected_last_used,
+      c.key_version,c.nonce,c.ciphertext,c.auth_tag
+      FROM quest_test_runs tr JOIN quests q ON q.quest_id=tr.quest_id
+      JOIN monitor_accounts m ON (tr.target_monitor_id IS NULL OR m.id=tr.target_monitor_id)
+      JOIN monitor_credentials c ON c.monitor_id=m.id
       WHERE tr.state='TEST_QUEUED'
-        AND EXISTS (SELECT 1 FROM unnest($3::text[],$4::text[],$5::text[])
+        AND m.state='ACTIVE' AND 'TEST'=ANY(m.capabilities)
+        AND EXISTS (SELECT 1 FROM unnest($1::text[],$2::text[],$3::text[])
           AS supported(engine,executor,contract)
           WHERE supported.engine=tr.engine_version AND supported.executor=tr.executor_version
             AND supported.contract=tr.contract_version)
-      ORDER BY tr.created_at FOR UPDATE OF tr SKIP LOCKED LIMIT 1
-    ) UPDATE quest_test_runs tr SET state='TESTING',state_version=state_version+1,
+      ORDER BY tr.created_at,m.last_used_at NULLS FIRST,m.priority DESC
+      FOR UPDATE OF tr,m SKIP LOCKED LIMIT 1`, [engineVersions, executorVersions, contractVersions])).rows[0];
+    if (!candidate) return null;
+    const run = (await client.query(`UPDATE quest_test_runs SET state='TESTING',state_version=state_version+1,
       monitor_id=$1,lease_owner=$2,lease_expires_at=clock_timestamp()+interval '120 seconds',
       fencing_token=fencing_token+1,started_at=clock_timestamp(),updated_at=clock_timestamp()
-      FROM candidate,quests q WHERE tr.id=candidate.id AND q.quest_id=tr.quest_id
-      RETURNING tr.*,q.task_type,q.executor_id,q.contract_version AS current_contract`,
-    [monitor.id, holder, engineVersions, executorVersions, contractVersions])).rows[0];
+      WHERE id=$3 AND state='TEST_QUEUED' RETURNING *`, [candidate.selected_monitor_id, holder, candidate.id])).rows[0];
     if (!run) return null;
+    const monitor = {
+      id: candidate.selected_monitor_id, account_id: candidate.selected_account_id,
+      username: candidate.selected_username, capabilities: candidate.selected_capabilities,
+      state: candidate.selected_state, priority: candidate.selected_priority,
+      consecutive_failures: candidate.selected_failures, cooldown_until: candidate.selected_cooldown,
+      last_used_at: candidate.selected_last_used, key_version: candidate.key_version,
+      nonce: candidate.nonce, ciphertext: candidate.ciphertext, auth_tag: candidate.auth_tag,
+    };
     await client.query('UPDATE monitor_accounts SET last_used_at=clock_timestamp() WHERE id=$1', [monitor.id]);
     await recordTransition(client, { aggregateType: 'QUEST_TEST', aggregateId: run.id,
       fromState: 'TEST_QUEUED', toState: 'TESTING', stateVersion: run.state_version,
       reasonCode: 'TEST_LEASED', context: { traceId: run.trace_id, causationId: null,
         actorType: 'SYSTEM', actorId: holder } });
-    return { run, monitor };
+    return { run: { ...run, task_type: candidate.task_type, executor_id: candidate.executor_id,
+      current_contract: candidate.current_contract }, monitor };
   });
 }
 
@@ -197,11 +210,14 @@ async function executeTestQuest({ pool, run, monitor, env, runnerConcurrency, te
   if (!execution.verified || !current.completed || !current.completedAt) {
     throw Object.assign(new Error('Background test completion not verified'), { code: 'TEST_COMPLETION_NOT_VERIFIED' });
   }
-  await updateOwned(pool, run, `UPDATE quest_test_runs SET state='TEST_PASSED',
+  const passed = await updateOwned(pool, run, `UPDATE quest_test_runs SET state='TEST_PASSED',
       state_version=state_version+1,evidence=$4,completed_at=clock_timestamp(),
       lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE true`,
   [{ accountVisible: true, executorId: executor.id, completedAt: current.completedAt,
       traceId: context.traceId }], 'TEST_PASSED', 'TEST_COMPLETION_VERIFIED', context);
+  await withTransaction({ pool, isolation: 'SERIALIZABLE' }, (client) => markMonitorTestBatchPassed(client, {
+    run: passed, context,
+  }));
   await pool.query(`UPDATE monitor_accounts SET consecutive_failures=0,updated_at=clock_timestamp()
       WHERE id=$1`, [monitor.id]);
   await ingestDiscovery({ normalized: current, source: 'MONITOR',
@@ -216,7 +232,7 @@ function monitorFailureState(error, failures) {
 
 async function finishFailedTestRun(pool, run, error, context) {
   const nextTestState = error.fatalAuth ? 'MANUAL_REVIEW' : 'TEST_FAILED';
-  await updateOwned(pool, run, `UPDATE quest_test_runs SET state=$4,state_version=state_version+1,
+  return updateOwned(pool, run, `UPDATE quest_test_runs SET state=$4,state_version=state_version+1,
     error_class=$5,evidence=$6,completed_at=clock_timestamp(),lease_owner=NULL,
     lease_expires_at=NULL,updated_at=clock_timestamp() WHERE true`, [
     nextTestState, error.code ?? error.name,
@@ -265,8 +281,15 @@ async function pauseQuestForTestFailure(pool, run, error, context) {
 }
 
 async function handleTestFailure(pool, run, monitor, error, context) {
-  await finishFailedTestRun(pool, run, error, context);
+  const failedRun = await finishFailedTestRun(pool, run, error, context);
   await updateMonitorForFailure(pool, monitor, error, context);
+  if (failedRun.batch_id) {
+    await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
+      const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [failedRun.quest_id])).rows[0];
+      if (quest) await advanceMonitorTestBatch(client, { run: failedRun, quest, error, context });
+    });
+    return;
+  }
   await queueAlternativeMonitorTest(pool, run, monitor, error);
   await pauseQuestForTestFailure(pool, run, error, context);
 }

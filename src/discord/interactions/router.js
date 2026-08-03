@@ -14,7 +14,7 @@ import { SURFACE_COMMANDS } from '../commands/definitions.js';
 import { customId, parseCustomId } from '../components/custom-id.js';
 import { setupSurface } from '../surfaces/setup.js';
 import { assertRateLimitAvailable, consumeRateLimit } from '../../domain/admin/rate-limits.js';
-import { minimumSellablePrice } from '../../domain/pricing/resolver.js';
+import { minimumConfiguredPrice, minimumSellablePrice } from '../../domain/pricing/resolver.js';
 import { withTransaction } from '../../db/transaction.js';
 import { FEATURE_GATES } from '../../config/feature-gates.js';
 import {
@@ -35,8 +35,9 @@ import { repairPermissionDrift } from '../permissions/drift.js';
 import { activateReceiver } from '../../domain/admin/receiver-service.js';
 import { addMonitor, rotateMonitorCredential, setMonitorState } from '../../domain/admin/monitor-service.js';
 import {
-  openOrderItemReview, setCircuitBreakerState, setQuestSaleState,
+  forcePublishFailedMonitorTest, openOrderItemReview, setCircuitBreakerState, setQuestSaleState,
 } from '../../domain/admin/operations-service.js';
+import { loadTestFailureAlert, retryFailedTestAlert } from '../../domain/catalog/test-gate.js';
 import { discardDeadLetter, replayDeadLetter } from '../../domain/outbox/dlq-service.js';
 import { loadRuntimeConfig } from '../../config/runtime-config.js';
 import { APP_VERSION, ENGINE_VERSION } from '../../config/versions.js';
@@ -408,8 +409,46 @@ async function assertSurfaceBinding(interaction, route, runtime) {
 
 function isBackofficeRoute(route) {
   const prefixes = ['admin', 'gate_', 'wallet_', 'refund_', 'block_', 'review_', 'perm_',
-    'price_', 'promo_', 'receiver_', 'monitor_', 'catalog_', 'adminorder_', 'dlq_', 'config_', 'breaker_'];
+    'price_', 'promo_', 'receiver_', 'monitor_', 'catalog_', 'adminorder_', 'dlq_', 'config_', 'breaker_', 'test_fail_'];
   return prefixes.some((prefix) => route === prefix || route.startsWith(prefix));
+}
+
+async function assertTestFailureAlertBinding(interaction, alertId, runtime) {
+  const alert = await withTransaction({ pool: runtime.pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
+    (client) => loadTestFailureAlert(client, alertId, { messageId: interaction.message?.id }));
+  if (!alert || alert.surface_key !== 'LOG_QUEST_OPERATIONS') {
+    throw new QuestshopError('TEST_ALERT_BINDING_INVALID', 'ปุ่มนี้ไม่ใช่ข้อความแจ้งเตือน Quest ที่ใช้งานอยู่');
+  }
+  const surface = (await runtime.pool.query(`SELECT * FROM surfaces
+    WHERE surface_key='LOG_QUEST_OPERATIONS' AND state='ACTIVE'`)).rows[0];
+  if (!surface || surface.guild_id !== interaction.guildId || surface.channel_id !== interaction.channelId) {
+    throw new QuestshopError('TEST_ALERT_SURFACE_INVALID', 'ห้อง Log นี้ไม่ใช่ Surface ที่ใช้งานอยู่');
+  }
+  return alert;
+}
+
+async function handleTestFailureSend({ interaction, route, runtime, gates: _gates }) {
+  if (route.route !== 'test_fail_send' || !interaction.isButton()) return;
+  await interaction.deferReply({ ephemeral: true });
+  await assertTestFailureAlertBinding(interaction, route.sessionId, runtime);
+  const result = await forcePublishFailedMonitorTest({ alertId: route.sessionId,
+    reason: 'Admin selected ส่งเลย from Monitor test failure log' },
+  contextFor(interaction, 'test_failure_force_publish'), { pool: runtime.pool });
+  return interaction.editReply(result.idempotent
+    ? 'Quest นี้ถูกสั่งส่งประกาศไปแล้ว'
+    : `เปิดขายและส่งประกาศ Quest แล้ว (Admin override) • Support: \`${result.quest.trace_id?.slice(0, 8) ?? 'see-log'}\``);
+}
+
+async function handleTestFailureRetry({ interaction, route, runtime, gates: _gates }) {
+  if (route.route !== 'test_fail_retry' || !interaction.isButton()) return;
+  await interaction.deferReply({ ephemeral: true });
+  await assertTestFailureAlertBinding(interaction, route.sessionId, runtime);
+  const result = await withTransaction({ pool: runtime.pool, isolation: 'SERIALIZABLE' },
+    (client) => retryFailedTestAlert(client, { alertId: route.sessionId,
+      context: contextFor(interaction, 'test_failure_retry') }));
+  return interaction.editReply(result.idempotent
+    ? 'รายการนี้ไม่ได้อยู่ในสถานะที่เริ่มทดสอบใหม่ได้'
+    : 'รับคำสั่งแล้ว ระบบจะทดสอบใหม่สูงสุด 3 ครั้งต่อ Monitor และหยุดทันทีเมื่อผ่าน');
 }
 
 export async function authorizeRoute(interaction, route, runtime) {
@@ -436,7 +475,7 @@ async function handleStart({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'start' && interaction.isButton()) {
   if (!_gates.ORDER_ACCEPTING) throw new QuestshopError('ORDER_CLOSED', 'ระบบรับ Quest ปิดชั่วคราว');
   const minimum = await withTransaction({ pool: runtime.pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
-    (client) => minimumSellablePrice(client));
+    async (client) => (await minimumSellablePrice(client)) ?? minimumConfiguredPrice(client));
   if (minimum == null) throw new QuestshopError('NO_SELLABLE_QUEST', 'ขณะนี้ยังไม่มี Quest ที่เปิดขาย');
   const wallet = (await runtime.pool.query('SELECT available_cents FROM wallets WHERE discord_user_id = $1', [interaction.user.id])).rows[0];
   if (BigInt(wallet?.available_cents ?? 0) < BigInt(minimum)) throw new QuestshopError('WALLET_INSUFFICIENT', `ต้องมีเครดิตขั้นต่ำ ${money(minimum)}`);
@@ -1572,6 +1611,8 @@ const ROUTE_HANDLERS = Object.freeze({
   "config_branding_submit": handleConfigSubmit,
   "breaker_prepare": handleBreakerPrepare,
   "breaker_submit": handleBreakerSubmit,
+  "test_fail_send": handleTestFailureSend,
+  "test_fail_retry": handleTestFailureRetry,
   "admin_gate_pick": handleGatePick,
   "gate_enable": handleGateToggle,
   "gate_disable": handleGateToggle,

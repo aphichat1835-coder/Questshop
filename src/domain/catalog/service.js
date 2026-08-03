@@ -5,6 +5,7 @@ import { resolvePrice } from '../pricing/resolver.js';
 import { enqueueProjection } from '../outbox/service.js';
 import { recordTransition } from '../shared/transition.js';
 import { evaluateExpiryAdmission } from './expiry.js';
+import { createMonitorTestBatch, hasCurrentTestPass } from './test-gate.js';
 
 async function transitionAnalysis(client, quest, next, context) {
   if (quest.analysis_state === next) return quest;
@@ -24,8 +25,9 @@ async function transitionAnalysis(client, quest, next, context) {
 async function reconcileSale(client, quest, normalized, context, runnerConcurrency) {
   const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
   const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency });
+  const testPassed = await hasCurrentTestPass(client, quest);
   const canSell = quest.analysis_state === 'SUPPORTED'
-    && normalized.coreComplete && Boolean(price) && expiry.eligible;
+    && normalized.coreComplete && Boolean(price) && expiry.eligible && testPassed;
   let next = quest.sale_state;
   const expired = (await client.query(
     'SELECT $1::timestamptz <= clock_timestamp() AS value',
@@ -45,7 +47,7 @@ async function reconcileSale(client, quest, normalized, context, runnerConcurren
     fromState: quest.sale_state, toState: next, stateVersion: updated.sale_version,
     reasonCode: expiry.reason, context,
   });
-  return { quest: updated, price, expiry };
+  return { quest: updated, price, expiry, testPassed };
 }
 
 function requiresRetest(previousQuest, normalized) {
@@ -145,24 +147,12 @@ export async function pauseQuestForRetest(client, quest, context) {
   return paused;
 }
 
-async function queueTestIfSupported(client, quest, requiresTest, context) {
-  if (quest.analysis_state !== 'SUPPORTED') return;
-  const testState = requiresTest ? 'RETEST_REQUIRED' : 'TEST_QUEUED';
-  await client.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,executor_version,
-        contract_version,trace_id)
-        SELECT $1,$2,$7,$3,$4,$5,$6
-        WHERE NOT EXISTS(SELECT 1 FROM quest_test_runs WHERE quest_id=$2 AND engine_version=$3
-          AND executor_version=$4 AND contract_version=$5 AND state IN ('TEST_QUEUED','TESTING','TEST_PASSED','RETEST_REQUIRED')
-          AND ($7<>'RETEST_REQUIRED' OR state<>'TEST_PASSED'))`,
-      [uuidv7(), quest.quest_id, ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION,
-        context.traceId, testState]);
-}
-
 async function queueDiscoveryProjections(client, quest, revision, context) {
+  const shouldPublish = quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN';
   const announcementNotBefore = quest.announcement_state === 'ANNOUNCED'
     ? (await client.query("SELECT clock_timestamp()+interval '30 seconds' AS value")).rows[0].value
     : null;
-  await enqueueProjection(client, {
+  if (shouldPublish) await enqueueProjection(client, {
       projectionType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: quest.quest_id,
       aggregateVersion: revision, surfaceKey: 'QUEST_NEW', notBefore: announcementNotBefore, context,
   });
@@ -186,19 +176,38 @@ export async function ingestDiscovery({
     let quest = await upsertQuest(client, merged);
     const metadata = await recordMetadataRevision(client, quest, merged, source, redactedRaw, context);
     quest = await analyzeQuest(client, metadata.quest, merged, context);
+    // A checkout discovery is account-scoped: it may be offered to that
+    // checked account, but it must not consume a Monitor credential or turn
+    // into a public announcement before the scanner has independently seen it.
+    if (quest.analysis_state === 'SUPPORTED' && source === 'MONITOR') {
+      await createMonitorTestBatch(client, { quest, context, force: needsRetest });
+    }
     const sale = await reconcileSale(client, quest, merged, context, runnerConcurrency);
     quest = needsRetest ? await pauseQuestForRetest(client, sale.quest, context) : sale.quest;
-    await queueTestIfSupported(client, quest, needsRetest, context);
     await queueDiscoveryProjections(client, quest, metadata.revision, context);
     return { quest, price: sale.price, expiry: sale.expiry, revision: metadata.revision };
   });
 }
 
-export async function resolveSaleEligibility({ questId, progressActual = 0, runnerConcurrency = 3 }, _context, options = {}) {
+function coreMetadataPresent(quest) {
+  return Boolean(quest?.name && quest.task_type && Number(quest.task_target) > 0
+    && quest.url && quest.starts_at && quest.expires_at && quest.executor_id);
+}
+
+export async function resolveSaleEligibility({
+  questId,
+  progressActual = 0,
+  runnerConcurrency = 3,
+  allowCustomerAccount = false,
+}, _context, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {
     const quest = (await client.query('SELECT * FROM quests WHERE quest_id = $1', [questId])).rows[0];
     if (!quest) return { eligible: false, reason: 'QUEST_NOT_FOUND' };
-    if (quest.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
+    const publicSale = quest.sale_state === 'OPEN' && quest.analysis_state === 'SUPPORTED'
+      && await hasCurrentTestPass(client, quest);
+    const customerAccountSale = allowCustomerAccount && quest.analysis_state === 'SUPPORTED'
+      && coreMetadataPresent(quest);
+    if (!publicSale && !customerAccountSale) {
       return { eligible: false, reason: 'QUEST_NOT_FOR_SALE', quest };
     }
     const price = await resolvePrice(client, { questId, taskType: quest.task_type });
@@ -206,6 +215,7 @@ export async function resolveSaleEligibility({ questId, progressActual = 0, runn
     const expiry = await evaluateExpiryAdmission(client, {
       quest: { ...quest, progress_actual: progressActual }, runnerConcurrency,
     });
-    return { eligible: expiry.eligible, reason: expiry.reason, quest, price, expiry };
+    return { eligible: expiry.eligible, reason: expiry.reason, quest, price, expiry,
+      admissionScope: publicSale ? 'PUBLIC' : 'CUSTOMER_ACCOUNT' };
   });
 }

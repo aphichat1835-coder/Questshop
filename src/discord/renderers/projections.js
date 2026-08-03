@@ -145,6 +145,51 @@ async function renderCheckoutAudit(pool, projection) {
   return { embeds: [embed], allowedMentions: noMentions };
 }
 
+async function renderCustomerQuestDiscovery(pool, projection) {
+  const found = (await pool.query(`SELECT d.*,q.name,q.task_type,q.executor_id,q.sale_state
+    FROM customer_quest_discoveries d JOIN quests q ON q.quest_id=d.quest_id WHERE d.id=$1`,
+  [projection.aggregate_id])).rows[0];
+  const description = [
+    `**ผู้พบ Quest:** <@${found.discord_user_id}> (\`${found.discord_user_id}\`)`,
+    `**บัญชี Quest:** ${escape(found.account_username)} (\`${escape(found.account_id)}\`)`,
+    `**Quest:** ${escape(found.name)} (\`${escape(found.quest_id)}\`)`,
+    `**ประเภท / Executor:** ${escape(found.task_type)} / ${escape(found.executor_id)}`,
+    `**เปิดขายสาธารณะ:** ${escape(found.sale_state)}`,
+    '**Token:** ไม่บันทึกหรือแสดง — ใช้เฉพาะข้อมูลระบุตัวบัญชีที่ผ่านการตรวจ',
+    `**Checkout session:** \`${found.checkout_session_id}\``, `**Trace:** \`${found.trace_id}\``,
+  ].join('\n');
+  const embed = new EmbedBuilder().setColor(color.pending).setTitle('🔎 พบ Quest ใหม่จาก Checkout ลูกค้า')
+    .setDescription(description).setTimestamp(found.created_at);
+  if (found.account_avatar_url) embed.setThumbnail(found.account_avatar_url);
+  return { embeds: [embed], allowedMentions: { users: [found.discord_user_id], parse: [] } };
+}
+
+async function renderQuestTestFailure(pool, projection) {
+  const alert = (await pool.query(`SELECT a.*,q.name,q.task_type,q.sale_state,b.monitor_order,
+    b.current_monitor_index,b.max_attempts_per_monitor,b.latest_error,b.state AS batch_state,
+    (SELECT count(*)::integer FROM quest_test_runs r WHERE r.batch_id=a.batch_id) AS attempts,
+    (SELECT count(DISTINCT r.target_monitor_id)::integer FROM quest_test_runs r WHERE r.batch_id=a.batch_id) AS monitor_count
+    FROM quest_test_failure_alerts a JOIN quests q ON q.quest_id=a.quest_id
+    JOIN quest_test_batches b ON b.id=a.batch_id WHERE a.id=$1`, [projection.aggregate_id])).rows[0];
+  const failure = alert.last_error?.message ?? alert.latest_error?.message ?? 'ไม่พบรายละเอียดข้อผิดพลาด';
+  const description = [
+    `**Quest:** ${escape(alert.name)} (\`${escape(alert.quest_id)}\`)`,
+    `**ประเภท:** ${escape(alert.task_type)}`, `**ผลทดสอบ:** ไม่ผ่านหลัง ${alert.attempts} attempt / ${alert.monitor_count} Monitor`,
+    `**เหตุผลล่าสุด:** ${escape(failure)}`, `**สถานะขาย:** ${escape(alert.sale_state)}`,
+    `**Batch:** \`${alert.batch_id}\``, `**Trace:** \`${alert.trace_id}\``,
+    'หากเลือก **ส่งเลย** ระบบจะเปิดขายและประกาศโดยบันทึกว่า Admin override; จะไม่ปลอมผลเป็น TEST_PASSED.',
+  ].join('\n');
+  const isOpen = alert.state === 'OPEN';
+  const send = new ButtonBuilder().setCustomId(`qs:v1:test_fail_send:${alert.id}`)
+    .setLabel('ส่งเลย').setStyle(ButtonStyle.Danger).setDisabled(!isOpen);
+  const retry = new ButtonBuilder().setCustomId(`qs:v1:test_fail_retry:${alert.id}`)
+    .setLabel('ลองทดสอบอีกครั้ง').setStyle(ButtonStyle.Primary).setDisabled(!isOpen);
+  const title = alert.state === 'OPEN' ? '⚠️ Monitor ทดสอบ Quest ไม่ผ่าน' : `Monitor Test • ${escape(alert.state)}`;
+  return { embeds: [new EmbedBuilder().setColor(color.failure).setTitle(title)
+    .setDescription(description).setTimestamp(alert.updated_at)],
+  components: [new ActionRowBuilder().addComponents(send, retry)], allowedMentions: noMentions };
+}
+
 async function renderManualReview(pool, projection) {
   const review = (await pool.query(`SELECT r.*,
     (SELECT count(*)::integer FROM review_evidence e WHERE e.review_id=r.id) AS evidence_count,
@@ -247,7 +292,8 @@ const renderers = {
   PAYMENT_LOG: renderPaymentLog, PAYMENT_STATUS_LOG: renderPaymentLog, QUEST_NEW: renderQuestNew,
   QUEST_OPERATION: renderQuestOperation, MANUAL_REVIEW: renderManualReview, RUNNER_SUMMARY: renderRunnerSummary,
   CHECKOUT_AUDIT: renderCheckoutAudit, SYSTEM_INCIDENT: renderIncident, ADMIN_AUDIT: renderAdminAudit,
-  QUEST_HISTORY: renderQuestHistory,
+  QUEST_HISTORY: renderQuestHistory, CUSTOMER_QUEST_DISCOVERY: renderCustomerQuestDiscovery,
+  QUEST_TEST_FAILURE: renderQuestTestFailure,
 };
 
 export async function renderProjection(pool, projection, dependencies = {}) {

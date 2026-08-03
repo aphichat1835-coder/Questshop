@@ -44,3 +44,10 @@ export async function minimumSellablePrice(client) {
   return result.rows[0]?.amount_cents ?? null;
 }
 
+export async function minimumConfiguredPrice(client) {
+  const result = await client.query(`SELECT min(amount_cents)::bigint AS amount_cents
+    FROM price_rules WHERE enabled=true
+      AND (starts_at IS NULL OR starts_at<=clock_timestamp())
+      AND (ends_at IS NULL OR ends_at>clock_timestamp())`);
+  return result.rows[0]?.amount_cents ?? null;
+}

@@ -12,9 +12,9 @@ test('expired sellable Quest records both sale and analysis transitions during m
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const context = createContext({ actorType: 'SYSTEM', actorId: 'maintenance', guildId: 'guild',
     idempotencyKey: 'quest-expiry-reconcile' });
-  await pool.query(`INSERT INTO quests(quest_id,analysis_state,sale_state,name,task_type,task_target,url,expires_at)
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,sale_state,name,task_type,task_target,url,expires_at,public_test_gate_override)
     VALUES('already-expired','SUPPORTED','OPEN','Expired Quest','WATCH_VIDEO',60,
-      'https://discord.com/quests/already-expired',clock_timestamp()-interval '1 minute')`);
+      'https://discord.com/quests/already-expired',clock_timestamp()-interval '1 minute',true)`);
   await reconcileSellableQuests(pool, context, 3);
   const quest = (await pool.query("SELECT analysis_state,sale_state FROM quests WHERE quest_id='already-expired'"))
     .rows[0];

@@ -1,6 +1,8 @@
 # Questshop requirement traceability
 
-The Final Decision-Complete plan is authoritative when wording differs from the Technical Blueprint.
+The Final Decision-Complete plan is authoritative when wording differs from the Technical Blueprint,
+except for the later Owner decision recorded below: a Monitor-discovered Quest is private until
+one Monitor background test passes.  This supersedes the earlier non-gating test wording.
 This matrix separates implemented controls from evidence that can only be produced with production credentials.
 
 | Requirement group | Primary implementation | Automated evidence | Live evidence still required |
@@ -10,7 +12,7 @@ This matrix separates implemented controls from evidence that can only be produc
 | Wallet, immutable ledger, reservation/capture/release/refund | `domain/wallet`, secure retention function, `refunds` | concurrent debit, 3/2 settlement, idempotent captured-item refund, checkpoint tests | Owner pre-launch compensation sign-off |
 | TrueMoney Direct, receiver snapshot, HMAC, ambiguity | `adapters/truemoney`, payment worker/services | URL allowlist, pinned-schema, post-send ambiguity, duplicate-voucher and crash-credit tests | real success/ambiguous/schema fixtures |
 | Promotion and pricing precedence | pricing/promotion resolvers and Admin config services | money/unit and PostgreSQL constraints | Owner price/promotion UAT |
-| Catalog discovery, metadata, sale/test axes | `domain/catalog`, discovery/test workers | contract/state tests, including Retest pause while no TEST Monitor is available | live Quest API metadata drift |
+| Catalog discovery, metadata, sale/test axes | `domain/catalog`, discovery/test workers, `quest_test_batches` | Monitor-gate integration test: 3 attempts per Monitor, first pass stops, failures create private override; customer-account admission test | live Quest API metadata drift and Monitor test UAT |
 | Checkout, quote revalidation, account lock | `domain/checkout`, interaction router | signed-preflight, large-order/account uniqueness and simultaneous-confirm tests | mobile Discord UAT |
 | Fair queue, lazy jobs, dynamic expiry | runner/catalog expiry services | fair queue and lazy materialization tests | runtime p95 calibration |
 | Runner checkpoints, lease/fencing, no claim | runner service, Quest executor registry | crash/fencing, stale Manual-Review denial, contract-failure containment, restart-recovery transition audit and no-claim source scan | live video/desktop Quest UAT |

@@ -9,7 +9,9 @@ import { loadRuntimeConfig } from '../config/runtime-config.js';
 import { appendAdminAudit } from '../domain/admin/audit.js';
 import { releaseReservation } from '../domain/wallet/service.js';
 import { evaluateExpiryAdmission } from '../domain/catalog/expiry.js';
+import { resolvePrice } from '../domain/pricing/resolver.js';
 import { pauseQuestForRetest } from '../domain/catalog/service.js';
+import { advanceMonitorTestBatch, createMonitorTestBatch, hasCurrentTestPass } from '../domain/catalog/test-gate.js';
 import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { openReview } from '../domain/reviews/service.js';
 import { acquireLease, releaseLease, renewLease } from '../db/leases.js';
@@ -108,7 +110,13 @@ async function recoverCrashedQuestTests(database, context) {
     if (testRun.uncertain) await openReview(database, { subjectType: 'QUEST',
       subjectId: testRun.quest_id, reason: 'QUEST_TEST_CRASH_WITH_UNCERTAIN_MUTATION',
       financial: false, ownerOnly: false, context: tracedContext });
-    else await database.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,
+    else if (updated.batch_id) {
+      const quest = (await database.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
+        [updated.quest_id])).rows[0];
+      await advanceMonitorTestBatch(database, { run: updated, quest,
+        error: { code: 'TEST_WORKER_CRASH', message: 'Quest test worker stopped before completion' },
+        context: tracedContext });
+    } else await database.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,
         executor_version,contract_version,trace_id) VALUES(gen_random_uuid(),$1,'TEST_QUEUED',$2,$3,$4,$5)`,
       [testRun.quest_id, testRun.engine_version, testRun.executor_version,
         testRun.contract_version, testRun.trace_id]);
@@ -119,36 +127,17 @@ async function recoverCrashedQuestTests(database, context) {
 }
 
 export async function maintainQuestRetests(database, context) {
-  await database.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,executor_version,
-      contract_version,trace_id)
-      SELECT gen_random_uuid(),q.quest_id,'RETEST_REQUIRED',q.engine_version,q.executor_version,
-        q.contract_version,gen_random_uuid() FROM quests q
-      WHERE q.analysis_state='SUPPORTED' AND q.sale_state<>'EXPIRED'
-        AND NOT EXISTS(SELECT 1 FROM quest_test_runs active WHERE active.quest_id=q.quest_id
-          AND active.state IN ('TEST_QUEUED','TESTING','RETEST_REQUIRED','MANUAL_REVIEW'))
-        AND NOT EXISTS(SELECT 1 FROM quest_test_runs recent WHERE recent.quest_id=q.quest_id
-          AND recent.created_at>clock_timestamp()-interval '24 hours')
-        AND EXISTS(SELECT 1 FROM quest_test_runs passed WHERE passed.quest_id=q.quest_id
-          AND passed.state='TEST_PASSED' AND passed.completed_at<clock_timestamp()-interval '24 hours')`);
-  const activeTestMonitors = Number((await database.query(`SELECT count(*)::integer AS count
-      FROM monitor_accounts WHERE state='ACTIVE' AND 'TEST'=ANY(capabilities)`)).rows[0].count);
-  if (activeTestMonitors === 0) {
-    const affectedQuests = await database.query(`SELECT q.* FROM quests q
-      WHERE q.sale_state='OPEN' AND EXISTS(SELECT 1 FROM quest_test_runs tr
-        WHERE tr.quest_id=q.quest_id AND tr.state='RETEST_REQUIRED') FOR UPDATE`);
-    for (const quest of affectedQuests.rows) {
-      await pauseQuestForRetest(database, quest, context);
-    }
-    return;
+  const due = (await database.query(`SELECT q.* FROM quests q
+    WHERE q.analysis_state='SUPPORTED' AND q.sale_state<>'EXPIRED'
+      AND (SELECT max(passed.completed_at) FROM quest_test_runs passed
+        WHERE passed.quest_id=q.quest_id AND passed.state='TEST_PASSED')
+          < clock_timestamp()-interval '24 hours'
+      AND NOT EXISTS(SELECT 1 FROM quest_test_batches active WHERE active.quest_id=q.quest_id
+        AND active.state IN ('QUEUED','RUNNING')) FOR UPDATE`)).rows;
+  for (const quest of due) {
+    await pauseQuestForRetest(database, quest, context);
+    await createMonitorTestBatch(database, { quest, context, requestedBy: 'RETEST', force: true });
   }
-  const dueRetests = await database.query(`UPDATE quest_test_runs SET state='TEST_QUEUED',
-      state_version=state_version+1,updated_at=clock_timestamp()
-      WHERE state='RETEST_REQUIRED' RETURNING *`);
-  for (const testRun of dueRetests.rows) await recordTransition(database, {
-    aggregateType: 'QUEST_TEST', aggregateId: testRun.id, fromState: 'RETEST_REQUIRED',
-    toState: 'TEST_QUEUED', stateVersion: testRun.state_version,
-    reasonCode: 'RETEST_DUE', context: { ...context, traceId: testRun.trace_id },
-  });
 }
 
 async function recoverCrashedPayments(database, context) {
@@ -243,7 +232,7 @@ async function releaseExpiredOrderItems(pool, context) {
 }
 
 export async function reconcileSellableQuests(pool, context, runnerConcurrency) {
-  const sellable = (await pool.query("SELECT * FROM quests WHERE sale_state IN ('OPEN','PAUSED') LIMIT 100")).rows;
+  const sellable = (await pool.query("SELECT * FROM quests WHERE sale_state IN ('OPEN','PAUSED','CLOSED') LIMIT 100")).rows;
   for (const quest of sellable) {
     const admission = await withTransaction({ pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
       (database) => evaluateExpiryAdmission(database, { quest, runnerConcurrency }));
@@ -271,7 +260,31 @@ export async function reconcileSellableQuests(pool, context, runnerConcurrency) 
           aggregateId: updated.quest_id, aggregateVersion: updated.sale_version,
           surfaceKey: 'QUEST_NEW', context });
       });
+      continue;
     }
+    await withTransaction({ pool, isolation: 'READ COMMITTED' }, async (database) => {
+      const current = (await database.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [quest.quest_id])).rows[0];
+      const testPassed = await hasCurrentTestPass(database, current);
+      if (!testPassed) {
+        if (current.sale_state === 'OPEN') await pauseQuestForRetest(database, current, context);
+        return;
+      }
+      if (!['CLOSED', 'PAUSED'].includes(current.sale_state) || current.analysis_state !== 'SUPPORTED') return;
+      const coreComplete = Boolean(current.name && current.task_type && Number(current.task_target) > 0
+        && current.url && current.starts_at && current.expires_at && current.executor_id);
+      const price = await resolvePrice(database, { questId: current.quest_id, taskType: current.task_type });
+      if (!coreComplete || !price) return;
+      const opened = (await database.query(`UPDATE quests SET sale_state='OPEN',sale_version=sale_version+1,
+        updated_at=clock_timestamp() WHERE quest_id=$1 AND sale_state=$2 AND sale_version=$3 RETURNING *`,
+      [current.quest_id, current.sale_state, current.sale_version])).rows[0];
+      if (!opened) return;
+      await recordTransition(database, { aggregateType: 'QUEST_SALE', aggregateId: opened.quest_id,
+        fromState: current.sale_state, toState: 'OPEN', stateVersion: opened.sale_version,
+        reasonCode: 'MONITOR_TEST_PASSED', context });
+      await enqueueProjection(database, { projectionType: 'QUEST_NEW', aggregateType: 'QUEST',
+        aggregateId: opened.quest_id, aggregateVersion: opened.sale_version,
+        surfaceKey: 'QUEST_NEW', context });
+    });
   }
 }
 

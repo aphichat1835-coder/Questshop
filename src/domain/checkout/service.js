@@ -98,12 +98,13 @@ export async function createSession({
     api.fetchQuests(),
   ]);
   if (!profile?.id) throw new QuestshopError('TOKEN_PROFILE_INVALID', 'ไม่สามารถตรวจบัญชี Discord ได้');
+  const discoveries = new Map();
   for (const quest of quests) {
-    await ingestDiscovery({
+    discoveries.set(quest.id, await ingestDiscovery({
       normalized: quest,
       source: 'CUSTOMER_CHECKOUT',
       runnerConcurrency,
-    }, context, options);
+    }, context, options));
   }
   const candidates = [];
   for (const quest of quests) {
@@ -112,6 +113,7 @@ export async function createSession({
       questId: quest.id,
       progressActual: quest.progress,
       runnerConcurrency,
+      allowCustomerAccount: true,
     }, context, options);
     if (eligibility.eligible) candidates.push({ quest, eligibility });
   }
@@ -141,15 +143,36 @@ export async function createSession({
     ]);
     for (const { quest, eligibility } of candidates) {
       await client.query(`
-        INSERT INTO checkout_quest_options(
-          id, session_id, line_id, quest_id, quest_name, task_type,
-          price_cents, price_rule_id, metadata_revision, deadline_at, progress_actual
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      INSERT INTO checkout_quest_options(
+        id, session_id, line_id, quest_id, quest_name, task_type,
+          price_cents, price_rule_id, metadata_revision, deadline_at, progress_actual,admission_scope
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
       `, [
         uuidv7(), sessionId, lineId(), quest.id, quest.name, quest.eventName,
         eligibility.price.amount_cents, eligibility.price.id,
         eligibility.quest.current_metadata_revision, eligibility.quest.expires_at, quest.progress,
+        eligibility.admissionScope,
       ]);
+    }
+    for (const quest of quests) {
+      const monitorSeen = (await client.query(`SELECT 1 FROM quest_metadata_revisions
+        WHERE quest_id=$1 AND source='MONITOR' LIMIT 1`, [quest.id])).rowCount > 0;
+      if (monitorSeen) continue;
+      const discovery = discoveries.get(quest.id);
+      const customerDiscovery = (await client.query(`INSERT INTO customer_quest_discoveries(
+        id,checkout_session_id,quest_id,metadata_revision,discord_user_id,account_id,
+        account_username,account_avatar_url,trace_id
+      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ON CONFLICT(checkout_session_id,quest_id) DO NOTHING RETURNING *`, [
+        uuidv7(), sessionId, quest.id, discovery?.revision ?? 0, discordUserId,
+        String(profile.id), profile.global_name ?? profile.username ?? String(profile.id),
+        avatarUrl(profile), context.traceId,
+      ])).rows[0];
+      if (customerDiscovery) await enqueueProjection(client, {
+        projectionType: 'CUSTOMER_QUEST_DISCOVERY', aggregateType: 'CUSTOMER_QUEST_DISCOVERY',
+        aggregateId: customerDiscovery.id, aggregateVersion: 1,
+        surfaceKey: 'LOG_QUEST_OPERATIONS', context,
+      });
     }
     await enqueueProjection(client, {
       projectionType: 'CHECKOUT_AUDIT', aggregateType: 'INTERACTION_SESSION', aggregateId: sessionId,
@@ -157,6 +180,23 @@ export async function createSession({
     });
     return { session, profile, optionsCount: candidates.length };
   });
+}
+
+function coreMetadataPresent(quest) {
+  return Boolean(quest?.name && quest.task_type && Number(quest.task_target) > 0
+    && quest.url && quest.starts_at && quest.expires_at && quest.executor_id);
+}
+
+async function validateOptionAdmission(client, option, quest) {
+  if (option.admission_scope === 'PUBLIC') {
+    if (quest?.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
+      throw new QuestshopError('QUEST_NOT_FOR_SALE', `Quest ${option.quest_name} ไม่เปิดขายแล้ว`);
+    }
+    return;
+  }
+  if (option.admission_scope === 'CUSTOMER_ACCOUNT'
+    && quest?.analysis_state === 'SUPPORTED' && coreMetadataPresent(quest)) return;
+  throw new QuestshopError('QUEST_NOT_FOR_SALE', `Quest ${option.quest_name} ไม่รองรับสำหรับบัญชีนี้`);
 }
 
 async function lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId = null,
@@ -249,9 +289,7 @@ export async function buildQuote({ sessionId, actorId, guildId, channelId = null
     if (!items.length) throw new QuestshopError('NO_QUEST_SELECTED', 'กรุณาเลือก Quest อย่างน้อยหนึ่งรายการ');
     for (const item of items) {
       const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR SHARE', [item.quest_id])).rows[0];
-      if (quest?.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
-        throw new QuestshopError('QUEST_NOT_FOR_SALE', `Quest ${item.quest_name} ไม่เปิดขายแล้ว`);
-      }
+      await validateOptionAdmission(client, item, quest);
       const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
       if (!price || price.id !== item.price_rule_id || BigInt(price.amount_cents) !== BigInt(item.price_cents)) {
         throw new QuestshopError('QUOTE_EXPIRED', 'ราคามีการเปลี่ยนแปลง กรุณาเริ่ม Quote ใหม่');
@@ -354,9 +392,7 @@ async function validateSelectedOptions(client, selected, freshById, runnerConcur
       const quest = (await client.query(
         'SELECT * FROM quests WHERE quest_id = $1 FOR SHARE', [option.quest_id],
       )).rows[0];
-      if (quest?.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
-        throw new QuestshopError('QUEST_NOT_FOR_SALE', `Quest ${option.quest_name} ไม่เปิดขายแล้ว`);
-      }
+      await validateOptionAdmission(client, option, quest);
       const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
       if (!price || BigInt(price.amount_cents) !== BigInt(option.price_cents) || price.id !== option.price_rule_id) {
         throw new QuestshopError('QUOTE_EXPIRED', 'ราคามีการเปลี่ยนแปลง กรุณาตรวจ Quote ใหม่');
@@ -425,17 +461,18 @@ async function createOrderItems(client, orderId, session, validated) {
     progress_actual: Number(fresh.progress),
     progress_bucket: Math.floor(Math.min(99.999, Number(fresh.progress)) / 25) * 25,
     deadline_at: option.deadline_at,
+    admission_scope: option.admission_scope,
   }));
   const result = await client.query(`
     INSERT INTO order_items(
       id, order_id, sequence_number, quest_id, quest_name, task_type,
       price_cents, price_rule_id, config_version, metadata_revision,
       engine_version, executor_version, contract_version,
-      runner_state_schema_version, state, progress_actual, progress_bucket, deadline_at
+      runner_state_schema_version, state, progress_actual, progress_bucket, deadline_at, admission_scope
     )
     SELECT rows.id, $2, rows.sequence_number, rows.quest_id, rows.quest_name, rows.task_type,
       rows.price_cents, rows.price_rule_id, $3, rows.metadata_revision,
-      $4, $5, $6, $7, 'SELECTED', rows.progress_actual, rows.progress_bucket, rows.deadline_at
+      $4, $5, $6, $7, 'SELECTED', rows.progress_actual, rows.progress_bucket, rows.deadline_at, rows.admission_scope
     FROM jsonb_to_recordset($1::jsonb) AS rows(
       id uuid,
       sequence_number integer,
@@ -447,7 +484,8 @@ async function createOrderItems(client, orderId, session, validated) {
       metadata_revision bigint,
       progress_actual numeric(7,3),
       progress_bucket smallint,
-      deadline_at timestamptz
+      deadline_at timestamptz,
+      admission_scope text
     )
     ORDER BY rows.sequence_number
     RETURNING *
