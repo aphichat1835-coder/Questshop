@@ -30,6 +30,17 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
   if (PRIVATE.has(surfaceKey) && channel.permissionsFor(interaction.guild.roles.everyone)?.has('ViewChannel')) {
     throw new QuestshopError('PRIVATE_SURFACE_EXPOSED', 'ห้องหลังบ้านต้องปิด View Channel ของ @everyone ก่อน');
   }
+  if (PRIVATE.has(surfaceKey)) {
+    const adminRoleId = config?.values?.adminRoleId;
+    const expected = new Set([interaction.guild.roles.everyone.id, member.id, interaction.client.user.id,
+      interaction.guild.ownerId, ...(adminRoleId ? [adminRoleId] : []), ...member.roles?.cache?.keys?.() ?? []]);
+    const unexpectedRole = [...interaction.guild.roles.cache.values()].find((role) =>
+      role.id !== interaction.guild.roles.everyone.id && !expected.has(role.id)
+      && channel.permissionsFor(role)?.has('ViewChannel'));
+    if (unexpectedRole) {
+      throw new QuestshopError('PRIVATE_SURFACE_EXPOSED', 'ห้องหลังบ้านเปิดให้ Role ที่ไม่ได้อนุญาตเข้าดู');
+    }
+  }
   const existing = (await options.pool.query('SELECT * FROM surfaces WHERE surface_key = $1', [surfaceKey])).rows[0];
   let message = null;
   if (existing?.channel_id === channel.id && existing.message_id) {

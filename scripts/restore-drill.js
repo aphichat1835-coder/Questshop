@@ -74,6 +74,11 @@ try {
   console.log(JSON.stringify({ ok: true, drillId, backupId: backup.id, checks }));
 } catch (error) {
   await source.query(`UPDATE restore_drills SET state='FAILED',error_code=$2,completed_at=clock_timestamp() WHERE id=$1`, [drillId, error.code ?? error.name]).catch(() => null);
+  await source.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
+    VALUES($1,'RESTORE_DRILL_FAILED','DATABASE','OPEN','CRITICAL',$2,$3)
+    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
+      severity=EXCLUDED.severity,evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
+  [uuidv7(), { drillId, backupId: backup.id, errorCode: error.code ?? error.name }, uuidv7()]).catch(() => null);
   throw error;
 } finally {
   await target?.end();

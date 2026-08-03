@@ -4,6 +4,7 @@ import { AuthorizationError, StaleStateError } from '../../shared/errors.js';
 import { enqueueProjection } from '../outbox/service.js';
 import { recordTransition } from '../shared/transition.js';
 import { appendAdminAudit } from '../admin/audit.js';
+import { redact } from '../../shared/redaction.js';
 import {
   captureReservationInTransaction,
   creditRedeemedTopupInTransaction,
@@ -49,6 +50,9 @@ export async function assignReview({ reviewId, assigneeId, expectedVersion }, co
       aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
       fromState: 'OPEN', toState: 'ASSIGNED', stateVersion: updated.state_version, context,
     });
+    await appendAdminAudit(client, { action: 'MANUAL_REVIEW_ASSIGNED', targetType: 'MANUAL_REVIEW',
+      targetId: reviewId, actorId: context.actorId, before: { state: 'OPEN', assignedTo: null },
+      after: { state: updated.state, assignedTo: updated.assigned_to }, reason: 'review assignment', context });
     return updated;
   });
 }
@@ -70,13 +74,21 @@ export async function addEvidence({ reviewId, evidenceType, payload }, context, 
     await client.query(`
       INSERT INTO review_evidence(id, review_id, evidence_type, payload, actor_type, actor_id, trace_id)
       VALUES ($1,$2,$3,$4,$5,$6,$7)
-    `, [uuidv7(), reviewId, evidenceType, payload, context.actorType, context.actorId, context.traceId]);
-    if (review.state !== 'ASSIGNED') return review;
+    `, [uuidv7(), reviewId, evidenceType, redact(payload), context.actorType, context.actorId, context.traceId]);
+    if (review.state !== 'ASSIGNED') {
+      await appendAdminAudit(client, { action: 'MANUAL_REVIEW_EVIDENCE_ADDED', targetType: 'MANUAL_REVIEW',
+        targetId: reviewId, actorId: context.actorId, before: { state: review.state },
+        after: { evidenceType }, reason: 'review evidence added', context });
+      return review;
+    }
     const pending = (await client.query(`UPDATE manual_reviews SET state='EVIDENCE_PENDING',
       state_version=state_version+1 WHERE id=$1 AND state='ASSIGNED' AND state_version=$2 RETURNING *`,
     [reviewId, review.state_version])).rows[0];
     await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
       fromState: 'ASSIGNED', toState: 'EVIDENCE_PENDING', stateVersion: pending.state_version, context });
+    await appendAdminAudit(client, { action: 'MANUAL_REVIEW_EVIDENCE_ADDED', targetType: 'MANUAL_REVIEW',
+      targetId: reviewId, actorId: context.actorId, before: { state: 'ASSIGNED' },
+      after: { state: pending.state, evidenceType }, reason: 'review evidence added', context });
     return pending;
   });
 }
@@ -109,7 +121,7 @@ export async function resolveReview({
     }
     if (decisionEvidence) await client.query(`INSERT INTO review_evidence(id,review_id,evidence_type,
       payload,actor_type,actor_id,trace_id) VALUES($1,$2,'DECISION_INPUT',$3,$4,$5,$6)`,
-    [uuidv7(), reviewId, decisionEvidence, context.actorType, context.actorId, context.traceId]);
+    [uuidv7(), reviewId, redact(decisionEvidence), context.actorType, context.actorId, context.traceId]);
     if (review.state === 'ASSIGNED') {
       const pending = (await client.query(`UPDATE manual_reviews SET state='EVIDENCE_PENDING',
         state_version=state_version+1 WHERE id=$1 AND state='ASSIGNED' AND state_version=$2 RETURNING *`,

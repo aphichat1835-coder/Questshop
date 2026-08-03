@@ -69,13 +69,17 @@ async function finalizeOrderIfTerminal(client, orderId, context) {
     [orderId],
   )).rows[0];
   if (!aggregate || Number(aggregate.active_items) !== 0) return;
-  await client.query(`
-    UPDATE orders SET completed_at = COALESCE(completed_at, transaction_timestamp()) WHERE id = $1
-  `, [orderId]);
+  const order = (await client.query(`
+    UPDATE orders SET completed_at = transaction_timestamp()
+    WHERE id = $1 AND completed_at IS NULL
+    RETURNING discord_user_id
+  `, [orderId])).rows[0];
+  // A terminal settlement can be retried after a process crash.  Publish the
+  // final DM only for the transaction that first closes the aggregate.
+  if (!order) return;
   await client.query('DELETE FROM order_credentials WHERE order_id = $1', [orderId]);
   await client.query('DELETE FROM active_quest_accounts WHERE order_id = $1', [orderId]);
-  const order = (await client.query('SELECT discord_user_id FROM orders WHERE id=$1', [orderId])).rows[0];
-  if (order) await enqueueProjection(client, { projectionType: 'ORDER_DM', aggregateType: 'ORDER',
+  await enqueueProjection(client, { projectionType: 'ORDER_DM', aggregateType: 'ORDER',
     aggregateId: orderId, aggregateVersion: 1, surfaceKey: `DM:${order.discord_user_id}`, context });
 }
 
@@ -437,12 +441,23 @@ export async function creditRedeemedTopupInTransaction(client, { topupId }, cont
       fromState: topup.status, toState: 'CREDITED', stateVersion: updated.state_version,
       context,
     });
+    await client.query(`INSERT INTO operation_metrics(id,operation,outcome,duration_ms,trace_id)
+      VALUES($1,'TOPUP_CREDIT','SUCCESS',GREATEST(0,floor(extract(epoch FROM transaction_timestamp()-$2::timestamptz)*1000))::integer,$3)`,
+    [uuidv7(), topup.created_at, context.traceId]);
     const daily = (await client.query(`
       SELECT COALESCE(sum(amount_cents), 0)::bigint AS total
       FROM topups WHERE discord_user_id = $1 AND status = 'CREDITED'
         AND credited_at >= $2 AND credited_at < $3
     `, [topup.discord_user_id, bounds.starts_at, bounds.ends_at])).rows[0];
     if (BigInt(daily.total) >= 300_000n) {
+      await client.query(`UPDATE topups SET warning_code='DAILY_TOPUP_LIMIT_EXCEEDED',
+        updated_at=transaction_timestamp() WHERE id=$1`, [topupId]);
+      // Automatic daily blocks expire at the Bangkok boundary.  Revoke a
+      // previous expired automatic block first, otherwise the partial unique
+      // index would keep an old, harmless row from being replaced tomorrow.
+      await client.query(`UPDATE blocklist_entries SET revoked_at=clock_timestamp(),revoked_by='SYSTEM'
+        WHERE discord_user_id=$1 AND block_type='TOPUP_BLOCKED' AND revoked_at IS NULL
+          AND expires_at<=clock_timestamp()`, [topup.discord_user_id]);
       const block = (await client.query(`
         INSERT INTO blocklist_entries(
           id, discord_user_id, block_type, reason, expires_at, actor_id, trace_id

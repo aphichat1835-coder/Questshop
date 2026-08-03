@@ -154,3 +154,30 @@ test('financial invariant alert opens and resolves without mutating ledger evide
   assert.equal((await pool.query(`SELECT state FROM incidents WHERE incident_code='FINANCIAL_INVARIANT'
     AND scope='WALLET_LEDGER' ORDER BY opened_at DESC LIMIT 1`)).rows[0].state, 'RESOLVED');
 });
+
+test('scheduler lag opens a scoped incident without changing queued work', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const trace = uuidv7(); const rule = uuidv7(); const order = uuidv7(); const item = uuidv7(); const job = uuidv7();
+  await pool.query(`INSERT INTO price_rules(id,rule_type,amount_cents,config_version,actor_id,trace_id)
+    VALUES($1,'DEFAULT',500,1,'owner',$2)`, [rule, trace]);
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,name,task_type,task_target,url,expires_at)
+    VALUES('scheduler-lag','SUPPORTED','Scheduler Lag','WATCH_VIDEO',60,
+      'https://discord.com/quests/scheduler-lag',clock_timestamp()+interval '1 day')`);
+  await pool.query(`INSERT INTO orders(id,discord_user_id,account_id,trace_id)
+    VALUES($1,'scheduler-user','scheduler-account',$2)`, [order, trace]);
+  await pool.query(`INSERT INTO order_items(id,order_id,sequence_number,quest_id,quest_name,task_type,
+    price_cents,price_rule_id,config_version,metadata_revision,engine_version,executor_version,
+    contract_version,runner_state_schema_version,state,deadline_at)
+    VALUES($1,$2,1,'scheduler-lag','Scheduler Lag','WATCH_VIDEO',500,$3,1,1,'1','1','1',1,
+      'QUEUED',clock_timestamp()+interval '1 day')`, [item, order, rule]);
+  await pool.query(`INSERT INTO runner_jobs(id,order_item_id,discord_user_id,account_id,state,available_at,
+    deadline_at,engine_version,executor_version,contract_version,runner_state_schema_version,trace_id)
+    VALUES($1,$2,'scheduler-user','scheduler-account','QUEUED',clock_timestamp()-interval '6 seconds',
+      clock_timestamp()+interval '1 day','1','1','1',1,$3)`, [job, item, trace]);
+  const health = { ready: true, status: 'HEALTHY', workers: {} };
+  await evaluateAlerts({ pool, health });
+  assert.equal((await pool.query(`SELECT state FROM incidents WHERE incident_code='SCHEDULER_LAG'
+    AND scope='RUNNER'`)).rows[0].state, 'OPEN');
+  assert.equal((await pool.query('SELECT state FROM runner_jobs WHERE id=$1', [job])).rows[0].state, 'QUEUED');
+  assert.equal(health.status, 'DEGRADED');
+});

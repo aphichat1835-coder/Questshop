@@ -127,12 +127,31 @@ async function renderQuestOperation(pool, projection) {
 }
 
 async function renderManualReview(pool, projection) {
-  const review = (await pool.query(`SELECT r.*,(SELECT count(*)::integer FROM review_evidence e WHERE e.review_id=r.id) AS evidence_count
-    FROM manual_reviews r WHERE r.id=$1`, [projection.aggregate_id])).rows[0];
+  const review = (await pool.query(`SELECT r.*,
+    (SELECT count(*)::integer FROM review_evidence e WHERE e.review_id=r.id) AS evidence_count,
+    w.available_cents,w.reserved_cents,
+    COALESCE(payment_attempts.attempt_count,0)+COALESCE(runner_attempts.attempt_count,0) AS attempt_count,
+    COALESCE(payment_attempts.last_error_class,runner_attempts.last_error_class) AS last_error_class
+    FROM manual_reviews r
+    LEFT JOIN topups t ON r.subject_type='TOPUP' AND t.id::text=r.subject_id
+    LEFT JOIN order_items i ON r.subject_type='ORDER_ITEM' AND i.id::text=r.subject_id
+    LEFT JOIN orders o ON o.id=i.order_id
+    LEFT JOIN wallets w ON w.discord_user_id=COALESCE(t.discord_user_id,o.discord_user_id)
+    LEFT JOIN LATERAL (SELECT count(*)::integer AS attempt_count,
+      (array_agg(p.error_class ORDER BY p.started_at DESC) FILTER (WHERE p.error_class IS NOT NULL))[1] AS last_error_class
+      FROM payment_attempts p WHERE p.topup_id::text=r.subject_id AND r.subject_type='TOPUP') payment_attempts ON true
+    LEFT JOIN LATERAL (SELECT count(*)::integer AS attempt_count,
+      (array_agg(a.error_class ORDER BY a.started_at DESC) FILTER (WHERE a.error_class IS NOT NULL))[1] AS last_error_class
+      FROM runner_attempts a JOIN runner_jobs j ON j.id=a.job_id
+      WHERE j.order_item_id::text=r.subject_id AND r.subject_type='ORDER_ITEM') runner_attempts ON true
+    WHERE r.id=$1`, [projection.aggregate_id])).rows[0];
+  const wallet = review.available_cents == null ? 'ไม่พบ Wallet' : `${baht(review.available_cents)} / จอง ${baht(review.reserved_cents)}`;
   const description = [
     `**Review ID:** \`${review.id}\``, `**Subject:** ${escape(review.subject_type)} / \`${escape(review.subject_id)}\``,
     `**เหตุผล:** ${escape(review.opened_reason)}`, `**Financial:** ${review.financial ? 'ใช่' : 'ไม่'}`,
     `**Owner-only:** ${review.owner_only ? 'ใช่' : 'ไม่'}`, `**Assignee:** ${escape(review.assigned_to)}`,
+    `**Wallet (พร้อมใช้ / จอง):** ${wallet}`, `**Attempts:** ${review.attempt_count}`,
+    `**Error class ล่าสุด:** ${escape(review.last_error_class ?? 'ไม่ระบุ')}`,
     `**Evidence:** ${review.evidence_count}`, `**Trace:** \`${review.trace_id}\``, `**เตือนอีกครั้ง:** ${timestamp(review.remind_at, 'R')}`,
   ].join('\n');
   return { embeds: [new EmbedBuilder().setColor(review.financial ? color.failure : color.pending)

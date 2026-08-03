@@ -66,7 +66,16 @@ function mapProviderFailure(parsed, httpStatus) {
   return { outcome: 'AMBIGUOUS', providerCode: code, httpStatus };
 }
 
-export async function redeemVoucher({ code, receiverPhone, signal, onPossiblySent = () => {} }) {
+export async function redeemVoucher({
+  code,
+  receiverPhone,
+  signal,
+  onPossiblySent = () => {},
+  // Dependency injection is intentionally limited to the transport factory.
+  // It makes the pinned provider contract testable without ever allowing a
+  // caller to control the endpoint, host, request path, or payload shape.
+  requestFactory = https.request,
+}) {
   if (!VOUCHER_CODE.test(code)) throw new TypeError('invalid voucher code');
   if (!/^0\d{9}$/.test(receiverPhone)) throw new TypeError('invalid receiver phone');
   const body = Buffer.from(JSON.stringify({ mobile: receiverPhone, voucher_hash: code }));
@@ -74,7 +83,7 @@ export async function redeemVoucher({ code, receiverPhone, signal, onPossiblySen
     let finished = false;
     let settled = false;
     let possiblySentPromise = Promise.resolve();
-    const request = https.request({
+    const request = requestFactory({
       protocol: 'https:',
       hostname: PROVIDER_HOST,
       port: 443,

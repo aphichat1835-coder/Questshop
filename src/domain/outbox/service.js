@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { v7 as uuidv7 } from 'uuid';
 import { withTransaction } from '../../db/transaction.js';
+import { FencingLostError } from '../../shared/errors.js';
 
 function projectionNonce(id) {
   return createHash('sha256').update(String(id)).digest('base64url').slice(0, 25);
@@ -73,9 +74,17 @@ export async function acquireDelivery({ holder, ttlSeconds = 30 }, options = {})
       RETURNING o.*
     `, [holder, ttlSeconds]);
     const event = result.rows[0] ?? null;
-    if (event?.projection_id) await client.query(`UPDATE message_projections SET lease_owner=$2,
-      lease_expires_at=clock_timestamp()+make_interval(secs=>$3),fencing_token=fencing_token+1
-      WHERE id=$1`, [event.projection_id, holder, ttlSeconds]);
+    if (event?.projection_id) {
+      const projection = (await client.query(`UPDATE message_projections SET lease_owner=$2,
+        lease_expires_at=clock_timestamp()+make_interval(secs=>$3),fencing_token=fencing_token+1
+        WHERE id=$1 RETURNING fencing_token`, [event.projection_id, holder, ttlSeconds])).rows[0];
+      if (!projection) throw new FencingLostError(`projection:${event.projection_id}`);
+      const updated = (await client.query(`UPDATE outbox_events SET projection_fencing_token=$4
+        WHERE id=$1 AND lease_owner=$2 AND fencing_token=$3 RETURNING projection_fencing_token`,
+      [event.id, holder, event.fencing_token, projection.fencing_token])).rows[0];
+      if (!updated) throw new FencingLostError(`outbox:${event.id}`);
+      event.projection_fencing_token = updated.projection_fencing_token;
+    }
     return event;
   });
 }
@@ -88,7 +97,32 @@ export async function recordDelivery({
   pingSent = false,
 }, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
-    const event = (await client.query(`
+    const event = (await client.query(`SELECT * FROM outbox_events
+      WHERE id=$1 AND lease_owner=$2 AND fencing_token=$3
+        AND lease_expires_at>clock_timestamp() FOR UPDATE`,
+    [outboxId, holder, fencingToken])).rows[0];
+    if (!event) return null;
+    let projection = null;
+    if (event.projection_id) {
+      projection = (await client.query(`
+        UPDATE message_projections
+        SET message_id = COALESCE($2, message_id),
+            delivered_version = desired_version,
+            ping_sent_at = CASE
+              WHEN $5 AND ping_sent_at IS NULL THEN clock_timestamp()
+              ELSE ping_sent_at
+            END,
+            last_error_code = NULL, lease_owner=NULL, lease_expires_at=NULL,
+            updated_at = clock_timestamp()
+        WHERE id = $1 AND lease_owner=$3 AND fencing_token=$4 AND lease_expires_at>clock_timestamp()
+        RETURNING *
+      `, [event.projection_id, messageId, holder, event.projection_fencing_token, pingSent])).rows[0];
+      // The projection lease is part of the same ownership contract.  If it
+      // was renewed/taken by another worker, leave the event untouched for
+      // that worker instead of acknowledging a stale delivery.
+      if (!projection) throw new FencingLostError(`projection:${event.projection_id}`);
+    }
+    const delivered = (await client.query(`
       UPDATE outbox_events
       SET state = 'DELIVERED', delivered_at = clock_timestamp(),
           lease_owner = NULL, lease_expires_at = NULL
@@ -96,24 +130,14 @@ export async function recordDelivery({
         AND lease_expires_at > clock_timestamp()
       RETURNING *
     `, [outboxId, holder, fencingToken])).rows[0];
-    if (!event) return null;
+    if (!delivered) throw new FencingLostError(`outbox:${outboxId}`);
     await client.query(`INSERT INTO delivery_attempts(id,outbox_id,attempt_number,outcome)
       VALUES($1,$2,$3,'DELIVERED') ON CONFLICT(outbox_id,attempt_number) DO NOTHING`,
     [uuidv7(), event.id, event.attempt_count]);
-    if (event.projection_id) {
-      const projection = (await client.query(`
-        UPDATE message_projections
-        SET message_id = COALESCE($2, message_id),
-            delivered_version = desired_version,
-            ping_sent_at = CASE
-              WHEN $4 AND ping_sent_at IS NULL THEN clock_timestamp()
-              ELSE ping_sent_at
-            END,
-            last_error_code = NULL, lease_owner=NULL, lease_expires_at=NULL,
-            updated_at = clock_timestamp()
-        WHERE id = $1 AND lease_owner=$3
-        RETURNING *
-      `, [event.projection_id, messageId, holder, pingSent])).rows[0];
+    await client.query(`INSERT INTO operation_metrics(id,operation,outcome,duration_ms,trace_id)
+      VALUES($1,'OUTBOX_DELIVERY','SUCCESS',GREATEST(0,floor(extract(epoch FROM clock_timestamp()-$2::timestamptz)*1000))::integer,$3)`,
+    [uuidv7(), event.created_at, event.trace_id]);
+    if (projection) {
       if (projection?.projection_type === 'PAYMENT_LOG') {
         await client.query(`UPDATE topup_sensitive_payloads SET log_delivered_at=clock_timestamp()
           WHERE topup_id=$1`, [projection.aggregate_id]);
@@ -133,6 +157,32 @@ export async function recordDelivery({
     }
     await client.query(`UPDATE dead_letter_items SET state='RESOLVED',resolved_at=clock_timestamp()
       WHERE state='PENDING' AND evidence->>'replayOutboxId'=$1`, [event.id]);
-    return event;
+    return delivered;
+  });
+}
+
+export async function renewDeliveryLease({
+  outboxId,
+  holder,
+  fencingToken,
+  ttlSeconds = 30,
+}, options = {}) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
+    const event = (await client.query(`SELECT * FROM outbox_events
+      WHERE id=$1 AND state='LEASED' AND lease_owner=$2 AND fencing_token=$3
+        AND lease_expires_at>clock_timestamp() FOR UPDATE`,
+    [outboxId, holder, fencingToken])).rows[0];
+    if (!event) return null;
+    if (event.projection_id) {
+      const projection = (await client.query(`UPDATE message_projections
+        SET lease_expires_at=clock_timestamp()+make_interval(secs=>$4),updated_at=clock_timestamp()
+        WHERE id=$1 AND lease_owner=$2 AND fencing_token=$3 AND lease_expires_at>clock_timestamp()
+        RETURNING id`, [event.projection_id, holder, event.projection_fencing_token, ttlSeconds])).rows[0];
+      if (!projection) return null;
+    }
+    return (await client.query(`UPDATE outbox_events
+      SET lease_expires_at=clock_timestamp()+make_interval(secs=>$4)
+      WHERE id=$1 AND lease_owner=$2 AND fencing_token=$3 AND lease_expires_at>clock_timestamp()
+      RETURNING *`, [outboxId, holder, fencingToken, ttlSeconds])).rows[0] ?? null;
   });
 }

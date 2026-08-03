@@ -76,3 +76,28 @@ test('owner manual review credits ambiguous top-up atomically with audit', async
   assert.equal((await pool.query('SELECT status FROM topups WHERE id=$1', [topup])).rows[0].status, 'CREDITED');
   assert.equal(reversal.review.owner_only, true);
 });
+
+test('daily top-up limit credits the full received amount then blocks further top-ups until Bangkok midnight', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0].id;
+  const trace = uuidv7();
+  const topups = [uuidv7(), uuidv7()];
+  for (const [index, topupId] of topups.entries()) {
+    await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+      receiver_version_id,receiver_phone_last4,provider_transaction_id,amount_cents,currency,trace_id,redeemed_at)
+      VALUES($1,'daily-limit-user','REDEEMED',1,$2,$3,'1234',$4,$5,'THB',$6,clock_timestamp())`,
+    [topupId, Buffer.alloc(32, 20 + index), receiver, `daily-provider-${index}`, index === 0 ? 200_000 : 150_000, trace]);
+  }
+  const context = (key) => createContext({ traceId: trace, actorType: 'SYSTEM', actorId: 'payment-worker',
+    guildId: '10000000000000002', idempotencyKey: key });
+  await creditRedeemedTopup({ topupId: topups[0] }, context('daily-credit-1'), { pool });
+  await creditRedeemedTopup({ topupId: topups[1] }, context('daily-credit-2'), { pool });
+  const wallet = (await pool.query("SELECT * FROM wallets WHERE discord_user_id='daily-limit-user'")).rows[0];
+  assert.equal(BigInt(wallet.available_cents), 350_000n);
+  const latest = (await pool.query('SELECT warning_code FROM topups WHERE id=$1', [topups[1]])).rows[0];
+  assert.equal(latest.warning_code, 'DAILY_TOPUP_LIMIT_EXCEEDED');
+  const block = (await pool.query(`SELECT * FROM blocklist_entries WHERE discord_user_id='daily-limit-user'
+    AND block_type='TOPUP_BLOCKED' AND revoked_at IS NULL`)).rows[0];
+  assert.equal(block.reason, 'DAILY_TOPUP_LIMIT');
+  assert.ok(new Date(block.expires_at).getTime() > Date.now());
+});

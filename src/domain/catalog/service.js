@@ -55,6 +55,32 @@ function requiresRetest(previousQuest, normalized) {
     || Number(previousQuest.task_target) !== Number(normalized.secondsNeeded);
 }
 
+// A Monitor can see a partial Quest payload while another active account sees
+// the complete contract.  Merge only absent core fields from the durable
+// revision; never invent values.  A complete, newly observed payload still
+// wins so contract/executor changes trigger the normal retest path.
+function mergeDiscoveryMetadata(previousQuest, normalized) {
+  if (!previousQuest || normalized.coreComplete) return normalized;
+  const merged = {
+    ...normalized,
+    name: normalized.name || previousQuest.name,
+    eventName: normalized.eventName === 'UNKNOWN_SCHEMA' ? previousQuest.task_type : normalized.eventName,
+    secondsNeeded: Number(normalized.secondsNeeded) > 0 ? normalized.secondsNeeded : previousQuest.task_target,
+    startsAt: normalized.startsAt ?? previousQuest.starts_at,
+    expiresAt: normalized.expiresAt ?? previousQuest.expires_at,
+    url: normalized.url ?? previousQuest.url,
+    artworkUrl: normalized.artworkUrl ?? previousQuest.artwork_url,
+    orbs: normalized.orbs ?? previousQuest.orbs,
+    executorId: normalized.eventName === 'UNKNOWN_SCHEMA' ? previousQuest.executor_id : normalized.executorId,
+  };
+  merged.coreComplete = Boolean(merged.id && merged.eventName && Number(merged.secondsNeeded) > 0
+    && merged.startsAt && merged.expiresAt && merged.url);
+  if (merged.coreComplete && previousQuest.analysis_state === 'SUPPORTED') {
+    merged.autoSupported = true;
+  }
+  return merged;
+}
+
 async function upsertQuest(client, normalized) {
   return (await client.query(`
       INSERT INTO quests(
@@ -108,7 +134,7 @@ async function analyzeQuest(client, quest, normalized, context) {
   return quest;
 }
 
-async function pauseForRetest(client, quest, context) {
+export async function pauseQuestForRetest(client, quest, context) {
   if (quest.sale_state !== 'OPEN') return quest;
   const paused = (await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
     updated_at=transaction_timestamp() WHERE quest_id=$1 AND sale_state='OPEN'
@@ -155,12 +181,13 @@ export async function ingestDiscovery({
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const previousQuest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
       [normalized.id])).rows[0] ?? null;
-    const needsRetest = requiresRetest(previousQuest, normalized);
-    let quest = await upsertQuest(client, normalized);
-    const metadata = await recordMetadataRevision(client, quest, normalized, source, redactedRaw, context);
-    quest = await analyzeQuest(client, metadata.quest, normalized, context);
-    const sale = await reconcileSale(client, quest, normalized, context, runnerConcurrency);
-    quest = needsRetest ? await pauseForRetest(client, sale.quest, context) : sale.quest;
+    const merged = mergeDiscoveryMetadata(previousQuest, normalized);
+    const needsRetest = requiresRetest(previousQuest, merged);
+    let quest = await upsertQuest(client, merged);
+    const metadata = await recordMetadataRevision(client, quest, merged, source, redactedRaw, context);
+    quest = await analyzeQuest(client, metadata.quest, merged, context);
+    const sale = await reconcileSale(client, quest, merged, context, runnerConcurrency);
+    quest = needsRetest ? await pauseQuestForRetest(client, sale.quest, context) : sale.quest;
     await queueTestIfSupported(client, quest, needsRetest, context);
     await queueDiscoveryProjections(client, quest, metadata.revision, context);
     return { quest, price: sale.price, expiry: sale.expiry, revision: metadata.revision };

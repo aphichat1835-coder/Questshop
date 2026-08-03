@@ -186,8 +186,11 @@ export async function renewRunnerJob(job, ttlSeconds = 60, options = {}) {
 async function createAttempt(job, context, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => (
     (await client.query(`
-      INSERT INTO runner_attempts(id, job_id, attempt_number, stage, trace_id)
-      VALUES ($1,$2,$3,'STARTING',$4) RETURNING *
+      INSERT INTO runner_attempts(id, job_id, attempt_number, parent_attempt_id, stage, trace_id)
+      VALUES ($1,$2,$3,(
+        SELECT id FROM runner_attempts WHERE job_id=$2
+        ORDER BY attempt_number DESC,started_at DESC LIMIT 1
+      ),'STARTING',$4) RETURNING *
     `, [uuidv7(), job.id, job.attempt_count, context.traceId])).rows[0]
   ));
 }

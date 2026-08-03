@@ -7,6 +7,17 @@ import { QuestshopError } from '../../shared/errors.js';
 const REQUIRED = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages,
   PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.ReadMessageHistory];
 
+function expectedPrivateAccess(guild, bot, env, adminRoleId) {
+  return new Set([guild.roles.everyone.id, bot.id, env.OWNER_ID,
+    ...(adminRoleId ? [adminRoleId] : []), ...bot.roles?.cache?.keys?.() ?? []]);
+}
+
+function unexpectedPrivateViewRoles(channel, guild, expectedAccess) {
+  return [...guild.roles.cache.values()].filter((role) => role.id !== guild.roles.everyone.id
+    && !expectedAccess.has(role.id) && channel.permissionsFor(role)?.has(PermissionFlagsBits.ViewChannel))
+    .map((role) => role.id);
+}
+
 export async function checkPermissionDrift({ client, pool, env }) {
   const surfaces = (await pool.query('SELECT * FROM surfaces')).rows;
   const config = (await pool.query('SELECT payload FROM config_versions ORDER BY version DESC LIMIT 1')).rows[0]?.payload ?? {};
@@ -16,15 +27,16 @@ export async function checkPermissionDrift({ client, pool, env }) {
   for (const surface of surfaces) {
     const channel = await guild.channels.fetch(surface.channel_id).catch(() => null);
     const missing = channel ? REQUIRED.filter((permission) => !channel.permissionsFor(bot)?.has(permission)).map(String) : ['CHANNEL_MISSING'];
-    const expectedPrivateAccess = new Set([guild.roles.everyone.id, bot.id, env.OWNER_ID,
-      ...(config.adminRoleId ? [config.adminRoleId] : [])]);
+    const expectedAccess = expectedPrivateAccess(guild, bot, env, config.adminRoleId);
     const unexpectedViewOverwrites = surface.expected_permissions?.private && channel
       ? [...channel.permissionOverwrites.cache.values()].filter((overwrite) =>
-        overwrite.allow.has(PermissionFlagsBits.ViewChannel) && !expectedPrivateAccess.has(overwrite.id))
+        overwrite.allow.has(PermissionFlagsBits.ViewChannel) && !expectedAccess.has(overwrite.id))
         .map((overwrite) => overwrite.id) : [];
+    const unexpectedViewRoles = surface.expected_permissions?.private && channel
+      ? unexpectedPrivateViewRoles(channel, guild, expectedAccess) : [];
     const exposed = Boolean(surface.expected_permissions?.private && channel
       && (channel.permissionsFor(guild.roles.everyone)?.has(PermissionFlagsBits.ViewChannel)
-        || unexpectedViewOverwrites.length));
+        || unexpectedViewOverwrites.length || unexpectedViewRoles.length));
     const drifted = missing.length > 0 || exposed;
     await withTransaction({ pool, isolation: 'READ COMMITTED' }, async (db) => {
       await db.query(`UPDATE surfaces SET state=$2,last_validated_at=clock_timestamp(),
@@ -36,10 +48,10 @@ export async function checkPermissionDrift({ client, pool, env }) {
         await db.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
           SELECT gen_random_uuid(),'PERMISSION_DRIFT',$1,'OPEN','CRITICAL',$2,$3
           WHERE NOT EXISTS(SELECT 1 FROM incidents WHERE incident_code='PERMISSION_DRIFT' AND scope=$1 AND state<>'RESOLVED')`,
-        [surface.surface_key, { missing, exposed, unexpectedViewOverwrites }, context.traceId]);
+        [surface.surface_key, { missing, exposed, unexpectedViewOverwrites, unexpectedViewRoles }, context.traceId]);
       }
     });
-    results.push({ surface: surface.surface_key, drifted, missing, exposed, unexpectedViewOverwrites });
+    results.push({ surface: surface.surface_key, drifted, missing, exposed, unexpectedViewOverwrites, unexpectedViewRoles });
   }
   return results;
 }
@@ -58,12 +70,15 @@ export async function repairPermissionDrift({ client, pool, env, surfaceKey, adm
   if (adminRoleId) await channel.permissionOverwrites.edit(adminRoleId, allow, { reason });
   if (surface.expected_permissions?.private) {
     await channel.permissionOverwrites.edit(guild.roles.everyone.id, { ViewChannel: false }, { reason });
-    const expected = new Set([guild.roles.everyone.id, bot.id, env.OWNER_ID,
-      ...(adminRoleId ? [adminRoleId] : [])]);
-    for (const overwrite of channel.permissionOverwrites.cache.values()) {
-      if (overwrite.allow.has(PermissionFlagsBits.ViewChannel) && !expected.has(overwrite.id)) {
-        await channel.permissionOverwrites.edit(overwrite.id, { ViewChannel: false }, { reason });
-      }
+    const expected = expectedPrivateAccess(guild, bot, env, adminRoleId);
+    const unexpected = new Set([
+      ...unexpectedPrivateViewRoles(channel, guild, expected),
+      ...[...channel.permissionOverwrites.cache.values()]
+        .filter((overwrite) => overwrite.allow.has(PermissionFlagsBits.ViewChannel) && !expected.has(overwrite.id))
+        .map((overwrite) => overwrite.id),
+    ]);
+    for (const id of unexpected) {
+      await channel.permissionOverwrites.edit(id, { ViewChannel: false }, { reason });
     }
   }
   const validation = (await checkPermissionDrift({ client, pool, env }))

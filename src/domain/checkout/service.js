@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { v7 as uuidv7 } from 'uuid';
 import { encryptSecret, decryptSecret } from '../../adapters/crypto/keyring.js';
 import { withTransaction } from '../../db/transaction.js';
@@ -28,6 +28,45 @@ function selectionHash(items, configVersion) {
   const canonical = items.map((item) => `${item.line_id}:${item.quest_id}:${item.price_cents}:${item.price_rule_id}`)
     .sort().join('|');
   return createHash('sha256').update(`${configVersion}|${canonical}`).digest('hex');
+}
+
+function preflightPayload({ session, credential, items, profile, quests, dbNow }) {
+  const fresh = new Map(quests.map((quest) => [quest.id, quest]));
+  return JSON.stringify({
+    sessionId: session.id,
+    actorId: session.actor_id,
+    guildId: session.guild_id,
+    accountId: credential.account_id,
+    profileId: String(profile.id),
+    checkedAt: new Date(dbNow).toISOString(),
+    selection: items.map((item) => ({ lineId: item.line_id, questId: item.quest_id,
+      priceCents: String(item.price_cents), metadataRevision: String(item.metadata_revision) })),
+    quests: items.map((item) => {
+      const quest = fresh.get(item.quest_id);
+      return { id: item.quest_id, completed: Boolean(quest?.completed),
+        progress: Number(quest?.progress ?? 0), expiresAt: quest?.expiresAt ?? null };
+    }),
+  });
+}
+
+function preflightKey(env) {
+  const keyring = env.DATA_ENCRYPTION_KEYS_JSON;
+  const encoded = keyring?.keys?.[keyring?.current];
+  if (typeof encoded !== 'string') throw new QuestshopError('PREFLIGHT_KEY_UNAVAILABLE', 'Preflight key ไม่พร้อมใช้งาน');
+  return Buffer.from(encoded, 'base64');
+}
+
+function signPreflight(snapshot, profile, quests, env) {
+  return createHmac('sha256', preflightKey(env))
+    .update(preflightPayload({ ...snapshot, profile, quests })).digest('base64url');
+}
+
+function verifyPreflightSignature(preflight, env) {
+  if (typeof preflight.signature !== 'string') return false;
+  const expected = signPreflight(preflight, preflight.profile, preflight.quests, env);
+  const actual = Buffer.from(preflight.signature);
+  const value = Buffer.from(expected);
+  return actual.length === value.length && timingSafeEqual(actual, value);
 }
 
 function avatarUrl(profile) {
@@ -252,10 +291,11 @@ async function loadPreflight({ sessionId, actorId, guildId, channelId, messageId
   if (String(profile.id) !== snapshot.credential.account_id) {
     throw new QuestshopError('TOKEN_ACCOUNT_CHANGED', 'Token ไม่ตรงกับบัญชีที่ตรวจครั้งแรก');
   }
-  return { ...snapshot, token, profile, quests };
+  const preflight = { ...snapshot, token, profile, quests };
+  return { ...preflight, signature: signPreflight(preflight, profile, quests, env) };
 }
 
-async function validateConfirmationSession(client, sessionInput, preflight) {
+async function validateConfirmationSession(client, sessionInput, preflight, env) {
   const { sessionId, actorId, guildId, channelId, messageId } = sessionInput;
   const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
     const currentConfigVersion = await activeConfigVersion(client);
@@ -266,6 +306,9 @@ async function validateConfirmationSession(client, sessionInput, preflight) {
       SELECT $1::timestamptz >= clock_timestamp() - interval '${PREFLIGHT_TTL_SECONDS} seconds' AS ok
     `, [preflight.dbNow])).rows[0].ok;
     if (!freshEnough) throw new QuestshopError('PREFLIGHT_EXPIRED', 'การตรวจบัญชีหมดอายุ กรุณายืนยันใหม่');
+    if (!verifyPreflightSignature(preflight, env)) {
+      throw new QuestshopError('PREFLIGHT_SIGNATURE_INVALID', 'ผลการตรวจบัญชีไม่ถูกต้อง กรุณาเริ่มใหม่');
+    }
     const blocked = (await client.query(`
       SELECT 1 FROM blocklist_entries
       WHERE discord_user_id = $1 AND block_type = 'ORDER_BLOCKED' AND revoked_at IS NULL
@@ -354,29 +397,51 @@ async function storeOrderCredential(client, orderId, preflight, env, guildId) {
 }
 
 async function createOrderItems(client, orderId, session, validated) {
-  const itemRows = [];
-  for (let index = 0; index < validated.length; index += 1) {
-      const { option, quest } = validated[index];
-      const item = (await client.query(`
-        INSERT INTO order_items(
-          id, order_id, sequence_number, quest_id, quest_name, task_type,
-          price_cents, price_rule_id, config_version, metadata_revision,
-          engine_version, executor_version, contract_version,
-          runner_state_schema_version, state, progress_actual, progress_bucket, deadline_at
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'SELECTED',$15,$16,$17)
-        RETURNING *
-      `, [
-        uuidv7(), orderId, index + 1, option.quest_id, option.quest_name, option.task_type,
-        option.price_cents, option.price_rule_id, session.config_version,
-        quest.current_metadata_revision, ENGINE_VERSION, EXECUTOR_VERSION,
-        QUEST_CONTRACT_VERSION, RUNNER_STATE_SCHEMA_VERSION,
-        validated[index].fresh.progress,
-        Math.floor(Math.min(99.999, validated[index].fresh.progress) / 25) * 25,
-        option.deadline_at,
-      ])).rows[0];
-    itemRows.push(item);
-  }
-  return itemRows;
+  // An order has no item limit.  Insert all its durable items in one statement
+  // so a large checkout does not keep a SERIALIZABLE transaction open for one
+  // round-trip per quest.  Only the first item is materialized as a runnable
+  // job below; the remainder stay RESERVED until their turn.
+  const values = validated.map(({ option, quest, fresh }, index) => ({
+    id: uuidv7(),
+    sequence_number: index + 1,
+    quest_id: option.quest_id,
+    quest_name: option.quest_name,
+    task_type: option.task_type,
+    price_cents: String(option.price_cents),
+    price_rule_id: option.price_rule_id,
+    metadata_revision: String(quest.current_metadata_revision),
+    progress_actual: Number(fresh.progress),
+    progress_bucket: Math.floor(Math.min(99.999, Number(fresh.progress)) / 25) * 25,
+    deadline_at: option.deadline_at,
+  }));
+  const result = await client.query(`
+    INSERT INTO order_items(
+      id, order_id, sequence_number, quest_id, quest_name, task_type,
+      price_cents, price_rule_id, config_version, metadata_revision,
+      engine_version, executor_version, contract_version,
+      runner_state_schema_version, state, progress_actual, progress_bucket, deadline_at
+    )
+    SELECT rows.id, $2, rows.sequence_number, rows.quest_id, rows.quest_name, rows.task_type,
+      rows.price_cents, rows.price_rule_id, $3, rows.metadata_revision,
+      $4, $5, $6, $7, 'SELECTED', rows.progress_actual, rows.progress_bucket, rows.deadline_at
+    FROM jsonb_to_recordset($1::jsonb) AS rows(
+      id uuid,
+      sequence_number integer,
+      quest_id text,
+      quest_name text,
+      task_type text,
+      price_cents bigint,
+      price_rule_id uuid,
+      metadata_revision bigint,
+      progress_actual numeric(7,3),
+      progress_bucket smallint,
+      deadline_at timestamptz
+    )
+    ORDER BY rows.sequence_number
+    RETURNING *
+  `, [JSON.stringify(values), orderId, session.config_version, ENGINE_VERSION,
+    EXECUTOR_VERSION, QUEST_CONTRACT_VERSION, RUNNER_STATE_SCHEMA_VERSION]);
+  return result.rows;
 }
 
 async function queueFirstOrderItem(client, itemRows, actorId, preflight, context) {
@@ -435,7 +500,7 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
   const preflight = await loadPreflight({ ...input, env }, options);
   const freshById = new Map(preflight.quests.map((quest) => [quest.id, quest]));
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const { session, selected } = await validateConfirmationSession(client, input, preflight);
+    const { session, selected } = await validateConfirmationSession(client, input, preflight, env);
     const validated = await validateSelectedOptions(client, selected, freshById, runnerConcurrency);
     const orderId = await createOrder(client, actorId, preflight, context, env);
     await storeOrderCredential(client, orderId, preflight, env, guildId);

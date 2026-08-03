@@ -16,16 +16,17 @@ import { createEncryptedBackup } from '../adapters/s3/backup.js';
 import { runMaintenance } from '../workers/maintenance-worker.js';
 import { validateKeyringCoverage } from './keyring-coverage.js';
 import { validateRuntimeRole } from '../db/role-contract.js';
+import { processOutbox } from '../workers/outbox-worker.js';
 
-export async function startup() {
-  const health = createHealthState();
+export async function startup({ health = createHealthState(), server: existingServer = null } = {}) {
   const requestedPort = /^\d+$/.test(process.env.PORT ?? '') ? Number(process.env.PORT) : 3000;
   const bootstrapPort = requestedPort >= 1 && requestedPort <= 65535 ? requestedPort : 3000;
   const logger = createLogger({ gitSha: process.env.GIT_SHA ?? 'bootstrap' });
-  const server = await startHealthServer({ port: bootstrapPort,
+  const server = existingServer ?? await startHealthServer({ port: bootstrapPort,
     statusToken: process.env.STATUS_TOKEN ?? 'unconfigured', state: health });
   const abortController = new AbortController();
   let client;
+  let pool;
   try {
     const env = loadEnvironment();
     health.checks.config = 'OK';
@@ -51,7 +52,7 @@ export async function startup() {
     }
     await closeDirectPool();
     health.checks.schema = 'OK';
-    const pool = getRuntimePool(env);
+    pool = getRuntimePool(env);
     await pool.query('SELECT 1');
     await validateKeyringCoverage(pool, env);
     health.checks.keyrings = 'OK';
@@ -79,7 +80,14 @@ export async function startup() {
     await runMaintenance({ env, holder: 'startup-recovery', client, pool,
       runnerConcurrency: Number(config.values?.runnerConcurrency ?? env.RUNNER_CONCURRENCY) });
     health.checks.discord = 'OK';
-    const workers = startWorkers({ client, pool, env, signal: abortController.signal, health, logger });
+    const workers = startWorkers({ client, pool, env, signal: abortController.signal, health, logger,
+      startDeferred: false });
+    const notificationsEnabled = (await pool.query("SELECT enabled FROM feature_gates WHERE gate='NOTIFICATIONS_ENABLED'"))
+      .rows[0]?.enabled === true;
+    if (notificationsEnabled) {
+      await processOutbox({ holder: uuidv7(), client, pool, env });
+    }
+    workers.startDeferred();
     const heartbeat = (async () => {
       while (!abortController.signal.aborted) {
         await delay(15_000, undefined, { signal: abortController.signal, ref: false });
@@ -103,6 +111,13 @@ export async function startup() {
   } catch (error) {
     health.lastError = error; health.status = 'NOT_READY';
     logger.error({ error }, 'Questshop startup failed');
+    if (pool && error?.code === 'SECRET_DECRYPT_FAILED') {
+      await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
+        VALUES($1,'SECRET_DECRYPT_FAILED','CRYPTO','OPEN','CRITICAL',$2,$3)
+        ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
+          severity=EXCLUDED.severity,evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
+      [uuidv7(), { phase: 'startup' }, uuidv7()]).catch(() => null);
+    }
     abortController.abort(error);
     client?.destroy();
     await closePools().catch(() => null);

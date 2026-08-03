@@ -9,8 +9,12 @@ import { loadRuntimeConfig } from '../config/runtime-config.js';
 import { appendAdminAudit } from '../domain/admin/audit.js';
 import { releaseReservation } from '../domain/wallet/service.js';
 import { evaluateExpiryAdmission } from '../domain/catalog/expiry.js';
+import { pauseQuestForRetest } from '../domain/catalog/service.js';
 import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { openReview } from '../domain/reviews/service.js';
+import { acquireLease, releaseLease, renewLease } from '../db/leases.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { v7 as uuidv7 } from 'uuid';
 
 async function recoverExpiredLeases(database, context) {
   const leased = await database.query(`
@@ -96,7 +100,7 @@ async function recoverCrashedQuestTests(database, context) {
   }
 }
 
-async function maintainQuestRetests(database, context) {
+export async function maintainQuestRetests(database, context) {
   await database.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,executor_version,
       contract_version,trace_id)
       SELECT gen_random_uuid(),q.quest_id,'RETEST_REQUIRED',q.engine_version,q.executor_version,
@@ -108,20 +112,25 @@ async function maintainQuestRetests(database, context) {
           AND recent.created_at>clock_timestamp()-interval '24 hours')
         AND EXISTS(SELECT 1 FROM quest_test_runs passed WHERE passed.quest_id=q.quest_id
           AND passed.state='TEST_PASSED' AND passed.completed_at<clock_timestamp()-interval '24 hours')`);
+  const activeTestMonitors = Number((await database.query(`SELECT count(*)::integer AS count
+      FROM monitor_accounts WHERE state='ACTIVE' AND 'TEST'=ANY(capabilities)`)).rows[0].count);
+  if (activeTestMonitors === 0) {
+    const affectedQuests = await database.query(`SELECT q.* FROM quests q
+      WHERE q.sale_state='OPEN' AND EXISTS(SELECT 1 FROM quest_test_runs tr
+        WHERE tr.quest_id=q.quest_id AND tr.state='RETEST_REQUIRED') FOR UPDATE`);
+    for (const quest of affectedQuests.rows) {
+      await pauseQuestForRetest(database, quest, context);
+    }
+    return;
+  }
   const dueRetests = await database.query(`UPDATE quest_test_runs SET state='TEST_QUEUED',
       state_version=state_version+1,updated_at=clock_timestamp()
       WHERE state='RETEST_REQUIRED' RETURNING *`);
   for (const testRun of dueRetests.rows) await recordTransition(database, {
-      aggregateType: 'QUEST_TEST', aggregateId: testRun.id, fromState: 'RETEST_REQUIRED',
-      toState: 'TEST_QUEUED', stateVersion: testRun.state_version,
-      reasonCode: 'RETEST_DUE', context: { ...context, traceId: testRun.trace_id },
-    });
-  const activeTestMonitors = Number((await database.query(`SELECT count(*)::integer AS count
-      FROM monitor_accounts WHERE state='ACTIVE' AND 'TEST'=ANY(capabilities)`)).rows[0].count);
-  if (activeTestMonitors === 0) await database.query(`UPDATE quests q SET sale_state='PAUSED',
-      sale_version=sale_version+1,updated_at=clock_timestamp()
-      WHERE q.sale_state='OPEN' AND EXISTS(SELECT 1 FROM quest_test_runs tr
-        WHERE tr.quest_id=q.quest_id AND tr.state='RETEST_REQUIRED')`);
+    aggregateType: 'QUEST_TEST', aggregateId: testRun.id, fromState: 'RETEST_REQUIRED',
+    toState: 'TEST_QUEUED', stateVersion: testRun.state_version,
+    reasonCode: 'RETEST_DUE', context: { ...context, traceId: testRun.trace_id },
+  });
 }
 
 async function recoverCrashedPayments(database, context) {
@@ -237,16 +246,64 @@ async function materializeAvailableOrders(pool, context) {
   for (const order of orders) await materializeNextOrderItem({ orderId: order.order_id }, context, { pool });
 }
 
+function startMaintenanceHeartbeat(lease, pool) {
+  const abort = new AbortController();
+  let lost = null;
+  const done = (async () => {
+    while (!abort.signal.aborted) {
+      await delay(30_000, undefined, { signal: abort.signal, ref: false });
+      if (abort.signal.aborted) break;
+      try {
+        await renewLease({ resourceType: 'MAINTENANCE', resourceId: lease.resource_id,
+          holder: lease.lease_owner, fencingToken: lease.fencing_token, ttlSeconds: 120 }, { pool });
+      } catch (error) {
+        lost = error;
+        abort.abort(error);
+      }
+    }
+  })().catch((error) => {
+    if (error?.name !== 'AbortError') {
+      lost = error;
+      abort.abort(error);
+    }
+  });
+  return {
+    assertOwned() { if (lost) throw lost; },
+    async stop() { abort.abort('maintenance complete'); await done; },
+  };
+}
+
+async function runMaintainedStep(heartbeat, action) {
+  heartbeat.assertOwned();
+  const result = await action();
+  heartbeat.assertOwned();
+  return result;
+}
+
 export async function runMaintenance({ env, holder, client, pool, runnerConcurrency = env.RUNNER_CONCURRENCY }) {
+  // Startup recovery historically used a human-readable holder.  The durable
+  // lease owner is UUID typed, so keep that diagnostic actor separately.
+  const leaseHolder = typeof holder === 'string' && /^[0-9a-f]{8}-/i.test(holder) ? holder : uuidv7();
+  const lease = await acquireLease({ resourceType: 'MAINTENANCE', resourceId: env.DISCORD_GUILD_ID,
+    holder: leaseHolder, ttlSeconds: 120 }, { pool });
+  if (!lease) return false;
+  const heartbeat = startMaintenanceHeartbeat(lease, pool);
   const context = createContext({ actorType: 'SYSTEM', actorId: holder, guildId: env.DISCORD_GUILD_ID,
     idempotencyKey: `maintenance:${new Date().toISOString().slice(0, 16)}` });
-  await expireSessions({}, context, { pool });
-  await runTransactionalMaintenance(pool, context);
-  await releaseExpiredOrderItems(pool, context);
-  await reconcileSellableQuests(pool, context, runnerConcurrency);
-  await materializeAvailableOrders(pool, context);
-  await checkPermissionDrift({ client, pool, env });
-  client.questshop.config = await loadRuntimeConfig(pool);
-  await reconcileSurfaceAnchors({ client, pool, env, config: client.questshop.config }, context);
-  return true;
+  try {
+    await runMaintainedStep(heartbeat, () => expireSessions({}, context, { pool }));
+    await runMaintainedStep(heartbeat, () => runTransactionalMaintenance(pool, context));
+    await runMaintainedStep(heartbeat, () => releaseExpiredOrderItems(pool, context));
+    await runMaintainedStep(heartbeat, () => reconcileSellableQuests(pool, context, runnerConcurrency));
+    await runMaintainedStep(heartbeat, () => materializeAvailableOrders(pool, context));
+    await runMaintainedStep(heartbeat, () => checkPermissionDrift({ client, pool, env }));
+    client.questshop.config = await runMaintainedStep(heartbeat, () => loadRuntimeConfig(pool));
+    await runMaintainedStep(heartbeat, () => reconcileSurfaceAnchors({ client, pool, env,
+      config: client.questshop.config }, context));
+    return true;
+  } finally {
+    await heartbeat.stop();
+    await releaseLease({ resourceType: 'MAINTENANCE', resourceId: env.DISCORD_GUILD_ID,
+      holder: lease.lease_owner, fencingToken: lease.fencing_token }, { pool });
+  }
 }

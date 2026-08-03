@@ -2,6 +2,7 @@ import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ModalBuilder,
   StringSelectMenuBuilder, TextInputBuilder, TextInputStyle,
 } from 'discord.js';
+import { v7 as uuidv7 } from 'uuid';
 import { createContext } from '../../shared/correlation.js';
 import { safeError } from '../../shared/redaction.js';
 import { QuestshopError } from '../../shared/errors.js';
@@ -16,14 +17,19 @@ import { assertRateLimitAvailable, consumeRateLimit } from '../../domain/admin/r
 import { minimumSellablePrice } from '../../domain/pricing/resolver.js';
 import { withTransaction } from '../../db/transaction.js';
 import { FEATURE_GATES } from '../../config/feature-gates.js';
-import { createAdminSession, loadAdminSession } from '../../domain/admin/session-service.js';
+import {
+  bindSessionMessage,
+  createAdminSession,
+  loadAdminSession,
+  terminateAdminSession,
+} from '../../domain/admin/session-service.js';
 import {
   createPromotion, setPriceRule, setPriceRuleEnabled, setPromotionState, updateFeatureGate, updateRuntimeConfig,
 } from '../../domain/admin/config-service.js';
 import { adjustWalletAsAdmin } from '../../domain/admin/money-service.js';
 import { refundCapturedOrderItem } from '../../domain/wallet/service.js';
 import { blockUser, unblockUser } from '../../domain/blocklist/service.js';
-import { resolveSubjectReview } from '../../domain/reviews/service.js';
+import { addEvidence, assignReview, resolveSubjectReview } from '../../domain/reviews/service.js';
 import { parseBahtToCents } from '../../shared/money.js';
 import { repairPermissionDrift } from '../permissions/drift.js';
 import { activateReceiver } from '../../domain/admin/receiver-service.js';
@@ -52,6 +58,11 @@ function contextFor(interaction, operation) {
     actorId: interaction.user.id, guildId: interaction.guildId,
     idempotencyKey: `${operation}:${interaction.id}`,
     messageId: interaction.message?.id ?? null });
+}
+async function completeInteractionSession(session, interaction, runtime) {
+  return terminateAdminSession({ sessionId: session.id, actorId: interaction.user.id,
+    guildId: interaction.guildId, expectedVersion: session.state_version },
+  contextFor(interaction, 'interaction_session_complete'), { pool: runtime.pool });
 }
 function isBackoffice(interaction, runtime) {
   if (interaction.user.id === runtime.env.OWNER_ID) return true;
@@ -143,7 +154,9 @@ function brandingSummary(runtime) {
 
 function paymentReviewLine(row) {
   const ownerOnly = row.owner_only ? ' • Owner-only' : '';
-  return `• \`${row.id}\` • **${row.subject_type}** • ${row.state}${ownerOnly}`;
+  const assignee = row.assigned_to ? ` • <@${row.assigned_to}>` : '';
+  const evidence = Number(row.evidence_count ?? 0) ? ` • หลักฐาน ${row.evidence_count}` : '';
+  return `• \`${row.id}\` • **${row.subject_type}** • ${row.state}${assignee}${evidence}${ownerOnly}`;
 }
 
 function paymentSummary(breaker, reviews) {
@@ -206,11 +219,16 @@ async function renderBlocklistPanel(interaction, runtime) {
 }
 
 async function renderPaymentsPanel(interaction, runtime) {
-  const reviews = (await runtime.pool.query(`SELECT * FROM manual_reviews WHERE state<>'RESOLVED'
-    ORDER BY financial DESC,created_at LIMIT 10`)).rows;
+  const reviews = (await runtime.pool.query(`SELECT r.*,count(e.id)::integer AS evidence_count
+    FROM manual_reviews r LEFT JOIN review_evidence e ON e.review_id=r.id WHERE r.state<>'RESOLVED'
+    GROUP BY r.id ORDER BY r.financial DESC,r.created_at LIMIT 10`)).rows;
   const breaker = (await runtime.pool.query("SELECT * FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
   return interaction.editReply({ embeds: [panelEmbed(0xf0b232, 'Payments และ Manual Review', paymentSummary(breaker, reviews))],
   components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('review_assign')).setLabel('รับผิดชอบ Review')
+      .setStyle(ButtonStyle.Primary).setDisabled(!reviews.length),
+    new ButtonBuilder().setCustomId(customId('review_evidence')).setLabel('เพิ่มหลักฐาน')
+      .setStyle(ButtonStyle.Secondary).setDisabled(!reviews.length),
     new ButtonBuilder().setCustomId(customId('review_resolve')).setLabel('ตัดสิน Manual Review')
       .setStyle(ButtonStyle.Danger).setDisabled(!reviews.length),
     new ButtonBuilder().setCustomId(customId('breaker_prepare')).setLabel('Recovery probe / Close circuit')
@@ -338,10 +356,23 @@ async function renderOverviewPanel(interaction, runtime) {
   ]);
   const row = wallets.rows[0];
   const selected = interaction.values?.[0] ?? 'overview';
+  const overview = runtime.health?.overview ?? {};
+  const workers = Object.values(runtime.health?.workers ?? {});
+  const healthyWorkers = workers.filter((worker) => worker.state === 'RUNNING').length;
+  const uptimeMs = Math.max(0, Date.now() - Date.parse(runtime.health?.startedAt ?? Date.now()));
+  const uptimeMinutes = Math.floor(uptimeMs / 60_000);
+  const backupAge = overview.backupAgeMs == null ? 'ยังไม่มี' : `${Math.floor(overview.backupAgeMs / 3_600_000)} ชม.`;
+  const rssMb = overview.memoryRssBytes == null ? 'ยังไม่มี' : `${Math.round(overview.memoryRssBytes / 1024 / 1024)} MB`;
+  const ping = Number.isFinite(interaction.client.ws?.ping) && interaction.client.ws.ping >= 0
+    ? `${interaction.client.ws.ping} ms` : 'กำลังเชื่อมต่อ';
   const description = [
     `Wallet users: **${row.users}**`, `Available: **${money(row.available)}**`, `Reserved: **${money(row.reserved)}**`,
     `Queue: **${queue.rows[0].count}**`, `Reviews: **${reviews.rows[0].count}**`, `Incidents: **${incidents.rows[0].count}**`,
     `Backup ล่าสุด: **${backup.rows[0]?.completed_at?.toISOString?.() ?? 'ยังไม่มี'}**`,
+    `Backup age: **${backupAge}** • Queue limits: **${overview.queueSoftLimit ?? 400}/${overview.queueHardLimit ?? 500}**`,
+    `Workers: **${healthyWorkers}/${workers.length} running** • Ping: **${ping}** • Uptime: **${uptimeMinutes} นาที**`,
+    `Capacity: **${rssMb}**${overview.memoryPercent == null ? '' : ` (${overview.memoryPercent.toFixed(1)}%)`} • Event-loop p99: **${overview.eventLoopLagP99Ms == null ? 'ยังไม่มี' : `${overview.eventLoopLagP99Ms.toFixed(1)} ms`}**`,
+    `SLO p95: ACK **${overview.slo?.interactionAckP95Ms ?? 0} ms** • Panel **${overview.slo?.panelP95Ms ?? 0} ms** • Top-up **${overview.slo?.topupP95Ms ?? 0} ms** • Outbox **${overview.slo?.outboxP95Ms ?? 0} ms**`,
   ].join('\n');
   return interaction.editReply({ embeds: [panelEmbed(0x5865f2, `Admin • ${selected}`, description)] });
 }
@@ -422,8 +453,9 @@ if (route.route === 'topup' && interaction.isButton()) {
     new StringSelectMenuBuilder().setCustomId(customId('payment_method', entry.id)).setPlaceholder('เลือกช่องทาง').addOptions({ label: 'TrueMoney Gift', value: 'truemoney', emoji: '💰' }),
   )] });
   const reply = await interaction.fetchReply();
-  await runtime.pool.query(`UPDATE interaction_sessions SET message_id=$2,
-    updated_at=clock_timestamp() WHERE id=$1 AND state='ACTIVE'`, [entry.id, reply.id]);
+  await bindSessionMessage({ sessionId: entry.id, actorId: interaction.user.id,
+    guildId: interaction.guildId, messageId: reply.id, expectedVersion: entry.state_version },
+  contextFor(interaction, 'topup_entry_message'), { pool: runtime.pool });
   return reply;
 }
 }
@@ -441,7 +473,7 @@ if (route.route === 'payment_method' && interaction.isStringSelectMenu()) {
 async function handleVoucherSubmit({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'voucher_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOPUP_ENTRY' }, contextFor(interaction, 'topup_entry_load'), { pool: runtime.pool });
   await assertRateLimitAvailable({ discordUserId: interaction.user.id, operation: 'VOUCHER_INVALID' },
     contextFor(interaction, 'voucher_invalid_submit_check'), { pool: runtime.pool });
@@ -457,7 +489,7 @@ if (route.route === 'voucher_submit' && interaction.isModalSubmit()) {
     }
     throw error;
   }
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [route.sessionId]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`รับรายการเติมเงินแล้ว\nTop-up ID: \`${result.topup.id}\`\nสถานะ: **${result.topup.status}**`);
 }
 }
@@ -465,19 +497,20 @@ if (route.route === 'voucher_submit' && interaction.isModalSubmit()) {
 async function handleTokenSubmit({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'token_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+  const entry = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOKEN_ENTRY' }, contextFor(interaction, 'token_entry_load'), { pool: runtime.pool });
   await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'TOKEN_VALIDATE' }, contextFor(interaction, 'token_rate'));
   const created = await createSession({ discordUserId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null,
     token: interaction.fields.getTextInputValue('token'), env: runtime.env,
     runnerConcurrency: runnerConcurrency(runtime) }, contextFor(interaction, 'checkout'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [route.sessionId]);
+  await completeInteractionSession(entry, interaction, runtime);
   const page = await getSelectionPage({ sessionId: created.session.id, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId }, contextFor(interaction, 'checkout_page'), { pool: runtime.pool });
   const reply = await interaction.editReply(renderSelection(page));
-  await runtime.pool.query(`UPDATE interaction_sessions SET message_id=$2,
-    updated_at=clock_timestamp() WHERE id=$1 AND message_id IS NULL`, [created.session.id, reply.id]);
+  await bindSessionMessage({ sessionId: created.session.id, actorId: interaction.user.id,
+    guildId: interaction.guildId, messageId: reply.id, expectedVersion: created.session.state_version },
+  contextFor(interaction, 'checkout_message'), { pool: runtime.pool });
   return reply;
 }
 }
@@ -620,7 +653,7 @@ if (route.route === 'wallet_adjust_confirm' && interaction.isButton()) {
     amountCents: BigInt(session.payload.amountCents), reason: session.payload.reason,
     expectedVersion: session.payload.expectedVersion },
   contextFor(interaction, 'wallet_adjust_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply({ content: `ปรับยอดสำเร็จ Available = **${money(wallet.available_cents)}**`, components: [] });
 }
 }
@@ -674,7 +707,7 @@ if (route.route === 'refund_confirm' && interaction.isButton()) {
   const refund = await refundCapturedOrderItem({ orderItemId: session.payload.orderItemId,
     reason: session.payload.reason, expectedReservationVersion: session.payload.expectedReservationVersion },
   contextFor(interaction, 'refund_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply({ content: `คืนเงินสำเร็จ **${money(refund.amount_cents)}**\nRefund ID: \`${refund.id}\`\nAvailable ปัจจุบัน: **${money(refund.available_cents)}**`, components: [] });
 }
 }
@@ -732,7 +765,7 @@ if (['block_add_submit', 'block_remove_submit'].includes(route.route) && interac
     operation: adding ? 'ADMIN_BLOCK' : 'ADMIN_UNBLOCK' }, contextFor(interaction, 'block_load'), { pool: runtime.pool });
   const input = blockInput(interaction);
   await executeBlockChange({ adding, input, interaction, runtime });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`${adding ? 'Block' : 'Unblock'} \`${input.discordUserId}\` / **${input.blockType}** เรียบร้อย`);
 }
 }
@@ -749,6 +782,63 @@ if (route.route === 'review_resolve' && interaction.isButton()) {
     { id: 'provider_id', label: 'Provider transaction (เฉพาะ CREDIT)', required: false, max: 200 },
     { id: 'reason', label: 'เหตุผลและหลักฐาน', long: true, max: 500 },
   ]));
+}
+}
+
+async function handleReviewAssign({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'review_assign' && interaction.isButton()) {
+  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_REVIEW_ASSIGN',
+    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'review_assign_session'), { pool: runtime.pool });
+  return interaction.showModal(fieldsModal('review_assign_submit', session.id, 'รับผิดชอบ Manual Review', [
+    { id: 'review_id', label: 'Review ID', max: 36 },
+  ]));
+}
+}
+
+async function handleReviewAssignSubmit({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'review_assign_submit' && interaction.isModalSubmit()) {
+  await interaction.deferReply({ ephemeral: true });
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REVIEW_ASSIGN' },
+  contextFor(interaction, 'review_assign_load'), { pool: runtime.pool });
+  const reviewId = interaction.fields.getTextInputValue('review_id').trim();
+  const review = (await runtime.pool.query(`SELECT * FROM manual_reviews WHERE id=$1 AND state='OPEN'`, [reviewId])).rows[0];
+  if (!review) throw new QuestshopError('REVIEW_NOT_OPEN', 'Review นี้ไม่ได้อยู่ในสถานะ OPEN');
+  const assigned = await assignReview({ reviewId, assigneeId: interaction.user.id,
+    expectedVersion: review.state_version }, contextFor(interaction, 'review_assign_execute'), { pool: runtime.pool });
+  await completeInteractionSession(session, interaction, runtime);
+  return interaction.editReply(`รับผิดชอบ Review \`${assigned.id}\` แล้ว`);
+}
+}
+
+async function handleReviewEvidence({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'review_evidence' && interaction.isButton()) {
+  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_REVIEW_EVIDENCE',
+    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'review_evidence_session'), { pool: runtime.pool });
+  return interaction.showModal(fieldsModal('review_evidence_submit', session.id, 'เพิ่มหลักฐาน Manual Review', [
+    { id: 'review_id', label: 'Review ID', max: 36 },
+    { id: 'type', label: 'ประเภทหลักฐาน', placeholder: 'PROVIDER_CHECK / RUNNER_LOG / ADMIN_NOTE', max: 64 },
+    { id: 'note', label: 'รายละเอียดหลักฐาน', long: true, max: 1000 },
+  ]));
+}
+}
+
+async function handleReviewEvidenceSubmit({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'review_evidence_submit' && interaction.isModalSubmit()) {
+  await interaction.deferReply({ ephemeral: true });
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REVIEW_EVIDENCE' },
+  contextFor(interaction, 'review_evidence_load'), { pool: runtime.pool });
+  const reviewId = interaction.fields.getTextInputValue('review_id').trim();
+  const evidenceType = interaction.fields.getTextInputValue('type').trim().toUpperCase();
+  if (!/^[A-Z][A-Z0-9_]{1,63}$/.test(evidenceType)) throw new TypeError('ประเภทหลักฐานไม่ถูกต้อง');
+  const review = await addEvidence({ reviewId, evidenceType,
+    payload: { note: interaction.fields.getTextInputValue('note').trim() } },
+  contextFor(interaction, 'review_evidence_execute'), { pool: runtime.pool });
+  await completeInteractionSession(session, interaction, runtime);
+  return interaction.editReply(`เพิ่มหลักฐานให้ Review \`${review.id}\` แล้ว • สถานะ **${review.state}**`);
 }
 }
 
@@ -798,7 +888,7 @@ if (route.route === 'review_resolve_confirm' && interaction.isButton()) {
     amountCents: session.payload.amountCents == null ? null : BigInt(session.payload.amountCents),
     providerTransactionId: session.payload.providerTransactionId },
   contextFor(interaction, 'review_resolve_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply({ content: `Review สำเร็จ: **${result.review.state}** • ${session.payload.decision}`, components: [] });
 }
 }
@@ -852,7 +942,7 @@ if (route.route === 'perm_repair_confirm' && interaction.isButton()) {
   await repairPermissionDrift({ client: interaction.client, pool: runtime.pool, env: runtime.env,
     surfaceKey: session.payload.surfaceKey, adminRoleId: runtime.config.values?.adminRoleId,
     reason: session.payload.reason }, contextFor(interaction, 'permission_repair_execute'));
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`ซ่อมและตรวจ Permission ของ **${session.payload.surfaceKey}** ผ่านแล้ว`);
 }
 }
@@ -881,7 +971,7 @@ if (route.route === 'catalog_sale_submit' && interaction.isModalSubmit()) {
     runnerConcurrency: runnerConcurrency(runtime),
     reason: interaction.fields.getTextInputValue('reason').trim() },
   contextFor(interaction, 'catalog_sale_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`Quest \`${quest.quest_id}\` เปลี่ยนเป็น **${quest.sale_state}** แล้ว`);
 }
 }
@@ -909,7 +999,7 @@ if (route.route === 'adminorder_review_submit' && interaction.isModalSubmit()) {
   const review = await openOrderItemReview({ orderItemId: interaction.fields.getTextInputValue('item_id').trim(),
     reason: interaction.fields.getTextInputValue('reason').trim(), ownerOnly },
   contextFor(interaction, 'order_review_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`เปิด Manual Review \`${review.id}\` แล้ว${review.owner_only ? ' (Owner-only)' : ''}`);
 }
 }
@@ -970,7 +1060,7 @@ if (route.route === 'price_create_submit' && interaction.isModalSubmit()) {
   contextFor(interaction, 'price_load'), { pool: runtime.pool });
   const rule = await setPriceRule(priceRuleInput(interaction),
   contextFor(interaction, 'price_create_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`สร้าง Price rule **${rule.rule_type}** ราคา **${money(rule.amount_cents)}** แล้ว`);
 }
 }
@@ -1003,7 +1093,7 @@ if (route.route === 'price_manage_submit' && interaction.isModalSubmit()) {
     enabled: action === 'ENABLE', expectedVersion: current.state_version,
     reason: interaction.fields.getTextInputValue('reason').trim() },
   contextFor(interaction, 'price_manage_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`Price rule \`${rule.id}\` เป็น **${rule.enabled ? 'ENABLE' : 'DISABLE'}** แล้ว`);
 }
 }
@@ -1047,7 +1137,7 @@ if (route.route === 'promo_create_submit' && interaction.isModalSubmit()) {
     maxBonusPerDayCents: bonusText ? parseBahtToCents(bonusText) : null,
     activate: true, reason: interaction.fields.getTextInputValue('reason').trim() },
   contextFor(interaction, 'promo_create_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`สร้างและเปิด Promotion **${promotion.name}** v${promotion.version} แล้ว`);
 }
 }
@@ -1078,7 +1168,7 @@ if (route.route === 'promo_manage_submit' && interaction.isModalSubmit()) {
     state: interaction.fields.getTextInputValue('state').trim().toUpperCase(),
     expectedVersion: current.state_version,
     reason: interaction.fields.getTextInputValue('reason').trim() }, contextFor(interaction, 'promo_manage_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`Promotion **${promotion.name}** เป็น **${promotion.state}** แล้ว`);
 }
 }
@@ -1126,7 +1216,7 @@ if (route.route === 'receiver_activate_confirm' && interaction.isButton()) {
   contextFor(interaction, 'receiver_confirm_load'), { pool: runtime.pool });
   const receiver = await activateReceiver({ phone: session.payload.phone, env: runtime.env,
     reason: session.payload.reason }, contextFor(interaction, 'receiver_activate_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`เปิด Receiver v${receiver.version} (***-***-${receiver.phone_last4}) แล้ว`);
 }
 }
@@ -1156,7 +1246,7 @@ if (route.route === 'monitor_add_submit' && interaction.isModalSubmit()) {
     capabilities: interaction.fields.getTextInputValue('capabilities').split(',').map((value) => value.trim().toUpperCase()),
     env: runtime.env, reason: interaction.fields.getTextInputValue('reason').trim() },
   contextFor(interaction, 'monitor_add_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`เพิ่ม Monitor **${monitor.username}** (\`${monitor.account_id}\`) แล้ว โดย Token ถูกเข้ารหัสและไม่สามารถเปิดดูจาก Admin ได้`);
 }
 }
@@ -1192,7 +1282,7 @@ if (route.route === 'monitor_manage_submit' && interaction.isModalSubmit()) {
     contextFor(interaction, 'monitor_rotate_execute'), { pool: runtime.pool });
   if (!token || state !== 'ACTIVE') monitor = await setMonitorState({ monitorId, state, reason },
     contextFor(interaction, 'monitor_state_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`Monitor \`${monitor.id}\` เป็น **${monitor.state}** แล้ว${token ? ' และ Token ถูก Rotate แบบเข้ารหัส' : ''}`);
 }
 }
@@ -1226,7 +1316,7 @@ if (['dlq_replay_submit', 'dlq_discard_submit'].includes(route.route) && interac
   const result = replay
     ? await replayDeadLetter(input, contextFor(interaction, 'dlq_replay_execute'), { pool: runtime.pool })
     : await discardDeadLetter({ ...input, isOwner: true }, contextFor(interaction, 'dlq_discard_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`${operation} สำเร็จ: \`${replay ? result.replayOutboxId : result.id}\``);
 }
 }
@@ -1259,7 +1349,7 @@ if (route.route === 'config_concurrency_submit' && interaction.isModalSubmit()) 
   contextFor(interaction, 'config_concurrency_execute'), { pool: runtime.pool });
   runtime.config = await loadRuntimeConfig(runtime.pool);
   interaction.client.questshop.config = runtime.config;
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`ตั้ง Runner concurrency เป็น **${concurrency}** แล้ว (Config v${changed.version})`);
 }
 }
@@ -1329,7 +1419,7 @@ if (['config_roles_submit', 'config_branding_submit'].includes(route.route) && i
   contextFor(interaction, 'config_execute'), { pool: runtime.pool });
   runtime.config = await loadRuntimeConfig(runtime.pool);
   interaction.client.questshop.config = runtime.config;
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`อัปเดต Config เป็น v${changed.version} แล้ว การเปลี่ยน Branding จะใช้ในการ Refresh/Setup Surface รอบถัดไป`);
 }
 }
@@ -1362,7 +1452,7 @@ if (route.route === 'breaker_submit' && interaction.isModalSubmit()) {
     expectedVersion: session.payload.expectedVersion,
     reason: interaction.fields.getTextInputValue('reason').trim() },
   contextFor(interaction, 'breaker_execute'), { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`Circuit **${breaker.breaker_key}** เป็น **${breaker.state}** แล้ว${breaker.state === 'HALF_OPEN' ? ' โดย Payment worker จะทำ Probe หนึ่งรายการ' : ''}`);
 }
 }
@@ -1403,7 +1493,7 @@ if (['gate_enable_submit','gate_disable_submit'].includes(route.route) && intera
   const changed = await updateFeatureGate({ gate: session.payload.gate,
     enabled: route.route === 'gate_enable_submit', reason: interaction.fields.getTextInputValue('reason'),
     expectedVersion: session.payload.expectedVersion }, context, { pool: runtime.pool });
-  await runtime.pool.query("UPDATE interaction_sessions SET state='TERMINAL',state_version=state_version+1 WHERE id=$1", [session.id]);
+  await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`อัปเดต **${changed.gate}** เป็น ${changed.enabled ? 'เปิด' : 'ปิด'} (v${changed.version}) แล้ว`);
 }
 }
@@ -1431,6 +1521,10 @@ const ROUTE_HANDLERS = Object.freeze({
   "block_remove": handleBlockAction,
   "block_add_submit": handleBlockSubmit,
   "block_remove_submit": handleBlockSubmit,
+  "review_assign": handleReviewAssign,
+  "review_assign_submit": handleReviewAssignSubmit,
+  "review_evidence": handleReviewEvidence,
+  "review_evidence_submit": handleReviewEvidenceSubmit,
   "review_resolve": handleReviewResolve,
   "review_resolve_submit": handleReviewResolveSubmit,
   "review_resolve_confirm": handleReviewResolveConfirm,
@@ -1481,8 +1575,41 @@ async function dispatchRoute(context) {
   return handler(context);
 }
 
+function startInteractionMetrics(interaction, runtime) {
+  const started = performance.now();
+  const traceId = uuidv7();
+  let acknowledged = false;
+  const write = (operation, outcome, durationMs, errorClass = null) => runtime.pool.query(`
+    INSERT INTO operation_metrics(id,operation,outcome,duration_ms,error_class,trace_id)
+    VALUES($1,$2,$3,$4,$5,$6)
+  `, [uuidv7(), operation, outcome, Math.max(0, Math.round(durationMs)), errorClass, traceId]).catch(() => {});
+  const markAcknowledged = () => {
+    if (acknowledged) return;
+    acknowledged = true;
+    write('INTERACTION_ACK', 'SUCCESS', performance.now() - started);
+  };
+  for (const method of ['reply', 'deferReply', 'showModal', 'update', 'deferUpdate']) {
+    if (typeof interaction[method] !== 'function') continue;
+    const original = interaction[method].bind(interaction);
+    interaction[method] = async (...args) => {
+      const result = await original(...args);
+      markAcknowledged();
+      return result;
+    };
+  }
+  return {
+    complete(error = null) {
+      const operation = isBackoffice(interaction, runtime) ? 'PANEL_REQUEST' : 'CUSTOMER_INTERACTION';
+      write(operation, error ? 'ERROR' : 'SUCCESS', performance.now() - started,
+        error?.category ?? error?.code ?? error?.name ?? null);
+    },
+  };
+}
+
 export async function routeInteraction(interaction) {
   const runtime = interaction.client.questshop;
+  const metrics = startInteractionMetrics(interaction, runtime);
+  let failure = null;
   try {
     if (!interaction.inGuild() || interaction.guildId !== runtime.env.DISCORD_GUILD_ID) return;
     if (await handleSurfaceCommand(interaction, runtime)) return;
@@ -1491,7 +1618,10 @@ export async function routeInteraction(interaction) {
     const gates = await authorizeRoute(interaction, route, runtime);
     return dispatchRoute({ interaction, route, runtime, gates });
   } catch (error) {
+    failure = error;
     runtime.logger.error({ error: safeError(error), interactionId: interaction.id }, 'interaction failed');
     return ephemeralError(interaction, error).catch(() => null);
+  } finally {
+    metrics.complete(failure);
   }
 }

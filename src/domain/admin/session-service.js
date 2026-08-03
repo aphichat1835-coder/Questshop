@@ -1,6 +1,7 @@
 import { v7 as uuidv7 } from 'uuid';
 import { withTransaction } from '../../db/transaction.js';
 import { AuthorizationError, QuestshopError } from '../../shared/errors.js';
+import { recordTransition } from '../shared/transition.js';
 
 export async function createAdminSession({ actorId, guildId, channelId, messageId,
   operation, payload, configVersion, ttlMinutes = 5 }, context, options = {}) {
@@ -25,5 +26,37 @@ export async function loadAdminSession({ sessionId, actorId, guildId, channelId 
       throw new AuthorizationError('เซสชันถูกเรียกจากข้อความอื่น');
     }
     return row;
+  });
+}
+
+export async function bindSessionMessage({ sessionId, actorId, guildId, messageId,
+  expectedVersion }, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {
+    const updated = (await client.query(`UPDATE interaction_sessions
+      SET message_id=$4,state_version=state_version+1,updated_at=clock_timestamp()
+      WHERE id=$1 AND actor_id=$2 AND guild_id=$3 AND state='ACTIVE'
+        AND state_version=$5 AND (message_id IS NULL OR message_id=$4)
+      RETURNING *`, [sessionId, actorId, guildId, messageId, expectedVersion])).rows[0];
+    if (!updated) throw new QuestshopError('STALE_SESSION', 'เซสชันถูกแก้ไขหรือหมดอายุแล้ว');
+    return updated;
+  });
+}
+
+export async function terminateAdminSession({ sessionId, actorId, guildId, expectedVersion }, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {
+    const current = (await client.query(`SELECT * FROM interaction_sessions
+      WHERE id=$1 FOR UPDATE`, [sessionId])).rows[0];
+    if (!current || current.actor_id !== actorId || current.guild_id !== guildId || current.state !== 'ACTIVE'
+      || Number(current.state_version) !== Number(expectedVersion)) {
+      throw new QuestshopError('STALE_SESSION', 'เซสชันถูกใช้หรือหมดอายุแล้ว');
+    }
+    const updated = (await client.query(`UPDATE interaction_sessions
+      SET state='TERMINAL',state_version=state_version+1,updated_at=clock_timestamp()
+      WHERE id=$1 AND state='ACTIVE' AND state_version=$2 RETURNING *`,
+    [sessionId, expectedVersion])).rows[0];
+    if (!updated) throw new QuestshopError('STALE_SESSION', 'เซสชันถูกแก้ไขระหว่างดำเนินการ');
+    await recordTransition(client, { aggregateType: 'INTERACTION_SESSION', aggregateId: sessionId,
+      fromState: current.state, toState: updated.state, stateVersion: updated.state_version, context });
+    return updated;
   });
 }

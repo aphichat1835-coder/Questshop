@@ -74,6 +74,79 @@ test('financial DLQ cannot be discarded', async (t) => {
     context, { pool }), (error) => error.code === 'DLQ_DISCARD_FORBIDDEN');
 });
 
+test('final order DM is attempted once and a DM failure never retries or dead-letters it', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const orderId = uuidv7();
+  const projectionId = uuidv7();
+  const firstEvent = uuidv7();
+  const trace = uuidv7();
+  await pool.query(`INSERT INTO orders(id,discord_user_id,account_id,trace_id,completed_at)
+    VALUES($1,'dm-customer','dm-account',$2,clock_timestamp())`, [orderId, trace]);
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'ORDER_DM',$2,'DM:dm-customer',$3)`, [projectionId, orderId, `dm-${orderId.slice(0, 16)}`]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','ORDER',$2,1,$3,'PENDING',$4)`,
+  [firstEvent, orderId, projectionId, trace]);
+  let fetches = 0;
+  const client = { users: { fetch: async () => {
+    fetches += 1;
+    throw Object.assign(new Error('DM disabled'), { status: 403, code: 50007 });
+  } } };
+  assert.equal(await processOutbox({ holder: uuidv7(), client, pool, env: {} }), true);
+  assert.equal(fetches, 1);
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [firstEvent])).rows[0].state,
+    'DELIVERED');
+  assert.ok((await pool.query('SELECT dm_summary_attempted_at FROM orders WHERE id=$1', [orderId]))
+    .rows[0].dm_summary_attempted_at);
+  assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM dead_letter_items
+    WHERE source_id=$1`, [firstEvent])).rows[0].count), 0);
+
+  const secondEvent = uuidv7();
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','ORDER',$2,2,$3,'PENDING',$4)`,
+  [secondEvent, orderId, projectionId, trace]);
+  assert.equal(await processOutbox({ holder: uuidv7(), client, pool, env: {} }), true);
+  assert.equal(fetches, 1);
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [secondEvent])).rows[0].state,
+    'DELIVERED');
+});
+
+test('Discord 404 reconciles only the affected surface and 429 honors Retry-After', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const trace = uuidv7();
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state)
+    VALUES('LOG_SYSTEM','guild','missing-channel','anchor','ACTIVE') ON CONFLICT(surface_key) DO UPDATE SET
+      channel_id=EXCLUDED.channel_id,message_id=EXCLUDED.message_id,state='ACTIVE'`);
+  const missingProjection = uuidv7();
+  const missingEvent = uuidv7();
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'SYSTEM_INCIDENT',$2,'LOG_SYSTEM',$3)`, [missingProjection, `missing-${missingEvent}`, `nonce-${missingEvent.slice(0, 16)}`]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','INCIDENT',$2,1,$3,'PENDING',$4)`,
+  [missingEvent, `missing-${missingEvent}`, missingProjection, trace]);
+  const missingClient = { channels: { fetch: async () => null } };
+  assert.equal(await processOutbox({ holder: uuidv7(), client: missingClient, pool, env: {} }), true);
+  assert.equal((await pool.query("SELECT state FROM surfaces WHERE surface_key='LOG_SYSTEM'")).rows[0].state, 'RECONCILING');
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [missingEvent])).rows[0].state, 'RETRY_WAIT');
+
+  await pool.query("UPDATE surfaces SET state='ACTIVE' WHERE surface_key='LOG_SYSTEM'");
+  const throttledProjection = uuidv7();
+  const throttledEvent = uuidv7();
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'SYSTEM_INCIDENT',$2,'LOG_SYSTEM',$3)`, [throttledProjection, `throttle-${throttledEvent}`, `nonce-${throttledEvent.slice(0, 16)}`]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','INCIDENT',$2,1,$3,'PENDING',$4)`,
+  [throttledEvent, `throttle-${throttledEvent}`, throttledProjection, trace]);
+  const throttledClient = { channels: { fetch: async () => {
+    throw Object.assign(new Error('rate limited'), { status: 429, retryAfter: 60 });
+  } } };
+  assert.equal(await processOutbox({ holder: uuidv7(), client: throttledClient, pool, env: {} }), true);
+  const throttled = (await pool.query(`SELECT state,EXTRACT(EPOCH FROM available_at-clock_timestamp()) AS delay
+    FROM outbox_events WHERE id=$1`, [throttledEvent])).rows[0];
+  assert.equal(throttled.state, 'RETRY_WAIT');
+  assert.ok(Number(throttled.delay) >= 59);
+});
+
 test('delivery coalesces obsolete outbox events for the same Discord message', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const context = createContext({ actorType: 'SYSTEM', actorId: 'worker', guildId: 'guild',
@@ -93,6 +166,42 @@ test('delivery coalesces obsolete outbox events for the same Discord message', a
   const events = (await pool.query(`SELECT state FROM outbox_events WHERE projection_id=$1 ORDER BY aggregate_version`,
     [first.id])).rows;
   assert.deepEqual(events.map((event) => event.state), ['DELIVERED', 'DELIVERED']);
+});
+
+test('an old outbox delivery holder cannot acknowledge after a newer projection fence is acquired', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const projection = uuidv7();
+  const event = uuidv7();
+  const trace = uuidv7();
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'SYSTEM_INCIDENT',$2,'LOG_SYSTEM',$3)`, [projection, `fence-${event}`, `nonce-${event.slice(0, 16)}`]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','INCIDENT',$2,1,$3,'PENDING',$4)`,
+  [event, `fence-${event}`, projection, trace]);
+  const firstHolder = uuidv7();
+  const first = await acquireDelivery({ holder: firstHolder }, { pool });
+  assert.equal(first.id, event);
+
+  // Simulate a process pause past both leases. A different worker must get a
+  // new event and projection fence, after which the old worker cannot commit.
+  await pool.query(`UPDATE outbox_events SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, [event]);
+  await pool.query(`UPDATE message_projections SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, [projection]);
+  const secondHolder = uuidv7();
+  const second = await acquireDelivery({ holder: secondHolder }, { pool });
+  assert.equal(second.id, event);
+  assert.ok(BigInt(second.fencing_token) > BigInt(first.fencing_token));
+  assert.ok(BigInt(second.projection_fencing_token) > BigInt(first.projection_fencing_token));
+
+  const stale = await recordDelivery({ outboxId: event, holder: firstHolder,
+    fencingToken: first.fencing_token, messageId: 'stale-message' }, { pool });
+  assert.equal(stale, null);
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [event])).rows[0].state, 'LEASED');
+  await recordDelivery({ outboxId: event, holder: secondHolder,
+    fencingToken: second.fencing_token, messageId: 'current-message' }, { pool });
+  const delivered = (await pool.query('SELECT state FROM outbox_events WHERE id=$1', [event])).rows[0];
+  assert.equal(delivered.state, 'DELIVERED');
+  assert.equal((await pool.query('SELECT message_id FROM message_projections WHERE id=$1', [projection])).rows[0].message_id,
+    'current-message');
 });
 
 test('quest-new role ping is durable and is not repeated when the message is recreated', async (t) => {

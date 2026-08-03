@@ -1,6 +1,9 @@
 import { acquireDelivery, recordDelivery } from '../domain/outbox/service.js';
 import { withTransaction } from '../db/transaction.js';
 import { renderProjection } from '../discord/renderers/projections.js';
+import { renewDeliveryLease } from '../domain/outbox/service.js';
+import { FencingLostError } from '../shared/errors.js';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const BACKOFF = [1, 5, 15, 60, 300, 900];
 
@@ -9,8 +12,8 @@ function errorDetails(error) {
   const code = Number(error.code);
   return {
     forbidden: status === 403 || code === 50013,
-    missing: status === 404 || [10003, 10008].includes(code),
-    missingChannel: code === 10003,
+    missing: status === 404 || error.code === 'DISCORD_404' || [10003, 10008].includes(code),
+    missingChannel: error.code === 'DISCORD_404' || code === 10003,
   };
 }
 
@@ -33,8 +36,8 @@ async function updateFailedProjection(client, event, projection, error, missing)
   await client.query(`UPDATE message_projections SET last_error_code=$2,
     message_id=CASE WHEN $4 THEN NULL ELSE message_id END,
     lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-    WHERE id=$1 AND lease_owner=$3`, [event.projection_id, error.code ?? error.name,
-    event.lease_owner, missing]);
+    WHERE id=$1 AND lease_owner=$3 AND fencing_token=$5 AND lease_expires_at>clock_timestamp()`, [event.projection_id, error.code ?? error.name,
+    event.lease_owner, missing, event.projection_fencing_token]);
 }
 
 async function recordSurfaceFailure(client, event, projection, error, details) {
@@ -63,24 +66,75 @@ async function createDeadLetter(client, event, projection, error) {
 
 async function failDelivery(event, error, pool) {
   return withTransaction({ pool, isolation: 'READ COMMITTED' }, async (client) => {
+    const details = errorDetails(error);
     const projection = event.projection_id
       ? (await client.query('SELECT * FROM message_projections WHERE id=$1 FOR UPDATE', [event.projection_id])).rows[0]
       : null;
-    const details = errorDetails(error);
-    const dead = details.forbidden || event.attempt_count > BACKOFF.length;
-    await client.query(`UPDATE outbox_events SET state = $4, available_at = clock_timestamp()
-      + make_interval(secs => $5), lease_owner = NULL, lease_expires_at = NULL
-      WHERE id = $1 AND lease_owner = $2 AND fencing_token = $3`,
-    [event.id, event.lease_owner, event.fencing_token, dead ? 'DEAD_LETTER' : 'RETRY_WAIT',
-      retryDelaySeconds(event, error)]);
+    // Order completion DM is best effort by policy.  It is deliberately not
+    // retried (or DLQed) because a later retry can duplicate a customer-facing
+    // summary and must never influence runner/financial settlement.
+    const terminalDmFailure = projection?.projection_type === 'ORDER_DM'
+      && projection.surface_key.startsWith('DM:');
+    const dead = !terminalDmFailure && (details.forbidden || event.attempt_count > BACKOFF.length);
+    const nextState = terminalDmFailure ? 'DELIVERED' : (dead ? 'DEAD_LETTER' : 'RETRY_WAIT');
+    const updated = (await client.query(`UPDATE outbox_events SET state = $4, available_at = clock_timestamp()
+      + make_interval(secs => $5), delivered_at=CASE WHEN $6 THEN clock_timestamp() ELSE delivered_at END,
+      lease_owner = NULL, lease_expires_at = NULL
+      WHERE id = $1 AND lease_owner = $2 AND fencing_token = $3
+        AND lease_expires_at>clock_timestamp()
+      RETURNING *`,
+    [event.id, event.lease_owner, event.fencing_token, nextState,
+      retryDelaySeconds(event, error), terminalDmFailure])).rows[0];
+    // The lease belongs to a newer worker or has expired.  That worker will
+    // reconcile the event; a stale worker must not create retry/DLQ evidence.
+    if (!updated) return false;
     await client.query(`INSERT INTO delivery_attempts(id,outbox_id,attempt_number,outcome,discord_status,error_code,evidence)
       VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6) ON CONFLICT(outbox_id,attempt_number) DO NOTHING`,
-    [event.id, event.attempt_count, dead ? 'FAILED' : 'RETRY', Number(error.status) || null,
+    [event.id, event.attempt_count, dead || terminalDmFailure ? 'FAILED' : 'RETRY', Number(error.status) || null,
       error.code ?? String(error.status ?? error.name), { message: String(error.message).slice(0, 1000) }]);
     await updateFailedProjection(client, event, projection, error, details.missing);
     await recordSurfaceFailure(client, event, projection, error, details);
     if (dead) await createDeadLetter(client, event, projection, error);
+    return true;
   });
+}
+
+async function claimOrderDmAttempt(pool, event, projection) {
+  if (projection?.projection_type !== 'ORDER_DM' || !projection.surface_key.startsWith('DM:')) return true;
+  return withTransaction({ pool, isolation: 'READ COMMITTED' }, async (client) => {
+    const claimed = (await client.query(`UPDATE orders SET dm_summary_attempted_at=clock_timestamp()
+      WHERE id=$1 AND dm_summary_attempted_at IS NULL AND EXISTS(
+        SELECT 1 FROM outbox_events WHERE id=$2 AND state='LEASED' AND lease_owner=$3
+          AND fencing_token=$4 AND lease_expires_at>clock_timestamp()
+      ) RETURNING id`, [projection.aggregate_id, event.id, event.lease_owner, event.fencing_token])).rows[0];
+    return Boolean(claimed);
+  });
+}
+
+function startDeliveryHeartbeat(event, pool) {
+  const abort = new AbortController();
+  let lost = null;
+  const done = (async () => {
+    while (!abort.signal.aborted) {
+      await delay(10_000, undefined, { signal: abort.signal, ref: false });
+      if (abort.signal.aborted) break;
+      const renewed = await renewDeliveryLease({ outboxId: event.id, holder: event.lease_owner,
+        fencingToken: event.fencing_token, ttlSeconds: 30 }, { pool });
+      if (!renewed) {
+        lost = new FencingLostError(`outbox:${event.id}`);
+        abort.abort(lost);
+      }
+    }
+  })().catch((error) => {
+    if (error?.name !== 'AbortError') {
+      lost = error;
+      abort.abort(error);
+    }
+  });
+  return {
+    assertOwned() { if (lost) throw lost; },
+    async stop() { abort.abort('outbox delivery finished'); await done; },
+  };
 }
 
 async function loadActiveSurface(pool, projection) {
@@ -109,15 +163,33 @@ async function applyQuestAnnouncementPing(pool, projection, body) {
   return true;
 }
 
+async function findMessageByNonce(channel, nonce) {
+  const messages = await channel.messages.fetch({ limit: 25 }).catch(() => null);
+  if (!messages?.values) return null;
+  return [...messages.values()].find((message) => String(message.nonce ?? '') === String(nonce)) ?? null;
+}
+
 async function publishProjection(channel, projection, body) {
   const message = projection.message_id ? await channel.messages.fetch(projection.message_id).catch(() => null) : null;
   if (message) return message.edit(body);
-  return channel.send({ ...body, nonce: projection.nonce, enforceNonce: true });
+  // `send` can fail after Discord accepted the create.  Reconcile by the
+  // stable nonce before creating, and once more after an unknown result, so a
+  // retry does not fill a durable projection with duplicate messages.
+  const existing = await findMessageByNonce(channel, projection.nonce);
+  if (existing) return existing;
+  try {
+    return await channel.send({ ...body, nonce: projection.nonce, enforceNonce: true });
+  } catch (error) {
+    const reconciled = await findMessageByNonce(channel, projection.nonce);
+    if (reconciled) return reconciled;
+    throw error;
+  }
 }
 
 export async function processOutbox({ holder, client, pool, env }) {
   const event = await acquireDelivery({ holder }, { pool });
   if (!event) return false;
+  const heartbeat = startDeliveryHeartbeat(event, pool);
   try {
     const projection = event.projection_id
       ? (await pool.query('SELECT * FROM message_projections WHERE id = $1', [event.projection_id])).rows[0]
@@ -126,15 +198,22 @@ export async function processOutbox({ holder, client, pool, env }) {
       await recordDelivery({ outboxId: event.id, holder, fencingToken: event.fencing_token }, { pool });
       return true;
     }
+    if (!(await claimOrderDmAttempt(pool, event, projection))) {
+      await recordDelivery({ outboxId: event.id, holder, fencingToken: event.fencing_token }, { pool });
+      return true;
+    }
     const surface = await loadActiveSurface(pool, projection);
     const channel = await resolveChannel(client, projection, surface);
     const body = await renderProjection(pool, projection, { env, client });
     const pingSent = await applyQuestAnnouncementPing(pool, projection, body);
     const message = await publishProjection(channel, projection, body);
+    heartbeat.assertOwned();
     await recordDelivery({ outboxId: event.id, holder, fencingToken: event.fencing_token,
       messageId: message.id, pingSent }, { pool });
   } catch (error) {
-    await failDelivery(event, error, pool);
+    if (!(error instanceof FencingLostError)) await failDelivery(event, error, pool);
+  } finally {
+    await heartbeat.stop();
   }
   return true;
 }
