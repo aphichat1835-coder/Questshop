@@ -1,7 +1,6 @@
 import { expireSessions } from '../domain/checkout/service.js';
 import { createContext } from '../shared/correlation.js';
 import { withTransaction } from '../db/transaction.js';
-import { checkPermissionDrift } from '../discord/permissions/drift.js';
 import { recordTransition } from '../domain/shared/transition.js';
 import { materializeNextOrderItem } from '../domain/runner/service.js';
 import { enqueueProjection } from '../domain/outbox/service.js';
@@ -11,7 +10,7 @@ import { releaseReservation } from '../domain/wallet/service.js';
 import { evaluateExpiryAdmission } from '../domain/catalog/expiry.js';
 import { resolvePrice } from '../domain/pricing/resolver.js';
 import { pauseQuestForRetest } from '../domain/catalog/service.js';
-import { advanceMonitorTestBatch, createMonitorTestBatch, hasCurrentTestPass } from '../domain/catalog/test-gate.js';
+import { advanceMonitorTestBatch, hasCurrentTestPass } from '../domain/catalog/test-gate.js';
 import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { openReview } from '../domain/reviews/service.js';
 import { acquireLease, releaseLease, renewLease } from '../db/leases.js';
@@ -126,20 +125,6 @@ async function recoverCrashedQuestTests(database, context) {
   }
 }
 
-export async function maintainQuestRetests(database, context) {
-  const due = (await database.query(`SELECT q.* FROM quests q
-    WHERE q.analysis_state='SUPPORTED' AND q.sale_state<>'EXPIRED'
-      AND (SELECT max(passed.completed_at) FROM quest_test_runs passed
-        WHERE passed.quest_id=q.quest_id AND passed.state='TEST_PASSED')
-          < clock_timestamp()-interval '24 hours'
-      AND NOT EXISTS(SELECT 1 FROM quest_test_batches active WHERE active.quest_id=q.quest_id
-        AND active.state IN ('QUEUED','RUNNING')) FOR UPDATE`)).rows;
-  for (const quest of due) {
-    await pauseQuestForRetest(database, quest, context);
-    await createMonitorTestBatch(database, { quest, context, requestedBy: 'RETEST', force: true });
-  }
-}
-
 async function recoverCrashedPayments(database, context) {
   const crashedPayments = await database.query(`SELECT * FROM topups WHERE status='PROCESSING'
       AND lease_expires_at<=clock_timestamp() FOR UPDATE`);
@@ -203,7 +188,6 @@ async function runTransactionalMaintenance(pool, context) {
     await recoverCrashedRunnerJobs(database, context);
     await requeueRetryJobs(database, context);
     await recoverCrashedQuestTests(database, context);
-    await maintainQuestRetests(database, context);
     await recoverCrashedPayments(database, context);
     await maintainMonitorsAndBlocks(database, context);
     await queueMaintenanceNotifications(database, context);
@@ -346,7 +330,6 @@ export async function runMaintenance({ env, holder, client, pool, runnerConcurre
     await runMaintainedStep(heartbeat, () => releaseExpiredOrderItems(pool, context));
     await runMaintainedStep(heartbeat, () => reconcileSellableQuests(pool, context, runnerConcurrency));
     await runMaintainedStep(heartbeat, () => materializeAvailableOrders(pool, context));
-    await runMaintainedStep(heartbeat, () => checkPermissionDrift({ client, pool, env }));
     client.questshop.config = await runMaintainedStep(heartbeat, () => loadRuntimeConfig(pool));
     await runMaintainedStep(heartbeat, () => reconcileSurfaceAnchors({ client, pool, env,
       config: client.questshop.config }, context));

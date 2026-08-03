@@ -58,9 +58,9 @@ test('outbox exhausts bounded retries into schema-valid DLQ evidence', async (t)
   assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [forbiddenEvent])).rows[0].state,
     'DEAD_LETTER');
   assert.equal((await pool.query("SELECT state FROM surfaces WHERE surface_key='QUEST_NEW'")).rows[0].state,
-    'DRIFTED');
+    'ACTIVE');
   assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM incidents
-    WHERE incident_code='PERMISSION_DRIFT' AND scope='QUEST_NEW' AND state='OPEN'`)).rows[0].count), 1);
+    WHERE incident_code='DISCORD_SURFACE_FORBIDDEN' AND scope='QUEST_NEW' AND state='OPEN'`)).rows[0].count), 1);
 });
 
 test('financial DLQ cannot be discarded', async (t) => {

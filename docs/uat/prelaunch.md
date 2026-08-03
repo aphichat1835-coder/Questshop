@@ -5,7 +5,7 @@ against one exact Git SHA.  Do not record any secret or full voucher URL there.
 
 - Use one production bot/guild/database with all customer gates closed and mark all work `PRELAUNCH`.
 - Run concurrent reserve/capture/release, duplicate voucher, payment crash boundaries, runner lease loss,
-  restart recovery, permission drift, Discord 403/404/429/5xx, and DLQ replay on the same Git SHA.
+  restart recovery, Discord 403/404/429/5xx, and DLQ replay on the same Git SHA.
 - Redeem a real low-value TrueMoney voucher; verify success, ambiguous handling and Owner-only resolution.
 - Run `npm run backup` and `npm run restore:drill`; validate wallet checkpoints, reservations, payments, queue,
   outbox and encrypted credentials.

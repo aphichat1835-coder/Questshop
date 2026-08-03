@@ -27,20 +27,34 @@ async function flushOutbox(runtime, deadline) {
   }
 }
 
-export async function shutdown(runtime, reason = 'shutdown') {
+export async function shutdown(runtime, reason = 'shutdown', { leaseLost = false, error = null } = {}) {
+  if (runtime.shutdownPromise) return runtime.shutdownPromise;
+  runtime.shutdownPromise = shutdownOnce(runtime, reason, { leaseLost, error });
+  return runtime.shutdownPromise;
+}
+
+async function shutdownOnce(runtime, reason, { leaseLost, error }) {
   const deadline = Date.now() + 25_000;
-  runtime.health.ready = false; runtime.health.status = 'NOT_READY';
+  runtime.acceptingInteractions = false;
+  runtime.health.ready = false;
+  runtime.health.status = leaseLost ? 'INCIDENT' : 'NOT_READY';
+  if (error) runtime.health.lastError = error;
   runtime.abortController.abort(reason);
+  // A process that lost the Runtime lease must stop Discord ingress before any
+  // drain work.  It no longer has authority to publish customer-facing state.
+  if (leaseLost) runtime.client.destroy();
   let failure = null;
   try {
     await bounded(runtime.workers.stop(), Math.min(deadline, Date.now() + 10_000), 'worker checkpoint');
-    await bounded(flushOutbox(runtime, deadline), deadline, 'outbox flush');
+    if (!leaseLost) await bounded(flushOutbox(runtime, deadline), deadline, 'outbox flush');
     await bounded(runtime.heartbeat.catch(() => null), deadline, 'runtime heartbeat');
-    await bounded(releaseLease({ resourceType: 'RUNTIME', resourceId: runtime.env.DISCORD_GUILD_ID,
-      holder: runtime.runtimeHolder, fencingToken: runtime.runtimeLease.fencing_token }).catch(() => null),
-    deadline, 'runtime lease release');
+    if (!leaseLost) {
+      await bounded(releaseLease({ resourceType: 'RUNTIME', resourceId: runtime.env.DISCORD_GUILD_ID,
+        holder: runtime.runtimeHolder, fencingToken: runtime.runtimeLease.fencing_token }).catch(() => null),
+      deadline, 'runtime lease release');
+    }
   } catch (error) { failure = error; }
-  runtime.client.destroy();
+  if (!leaseLost) runtime.client.destroy();
   await bounded(closePools().catch(() => null), deadline, 'database close').catch((error) => { failure ??= error; });
   runtime.health.live = false;
   await bounded(closeHealthServer(runtime.server).catch(() => null), deadline, 'health close')

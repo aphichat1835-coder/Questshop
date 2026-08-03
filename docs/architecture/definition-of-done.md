@@ -14,7 +14,7 @@ idempotency/concurrency behavior, observability, feature gate, tests, rollback p
 | Outbox | transactionally enqueued projection; latest-state rendering; heartbeat and fencing for event/projection leases; nonce reconciliation; Discord error contract; durable attempts; replay-linked DLQ |
 | Discord UI | persistent setup/update/move; ephemeral secrets; allowed-mention allowlist; terminal controls disabled; Thai/mobile-safe content |
 | Admin | Owner/Admin split; preview and confirmation for money/repair/receiver; reason/correlation/audit; no token read path |
-| Operations | permission drift; incidents and feature containment; metrics/SLO evaluator; encrypted streaming backup; restore drill; retention/key rotation |
+| Operations | surface setup permission preconditions; incidents and feature containment; metrics/SLO evaluator; encrypted streaming backup; restore drill; retention/key rotation |
 
 The evidence command set is `npm run check`, `npm run lint`, PostgreSQL-backed `npm test`, `npm audit`,
 Docker build and the fake-adapter load test. Live Discord, TrueMoney, S3 and managed-database evidence is tracked

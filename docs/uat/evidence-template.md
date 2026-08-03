@@ -56,7 +56,7 @@ link belongs exclusively in the validated `log-payments` surface.
 | Real supported desktop Quest | | verify then manual URL claim only | | |
 | `quest-new` discovery | | announcement hides customer source | | |
 | Discord 403/404/429/5xx | | scoped surface/DLQ/retry behavior | | |
-| Permission-drift repair | | only affected surface stops | | |
+| Surface setup permissions | | setup rejects missing/private-room access | | |
 
 For every Quest run, record the Order Item ID, Job ID and shortened support
 code.  Do not record a Discord user token.
@@ -99,4 +99,3 @@ code.  Do not record a Discord user token.
       Decision-Complete plan.
 - [ ] Status is `done` only after the evidence is stored for this exact SHA;
       otherwise the status remains `implemented-but-unverified`.
-

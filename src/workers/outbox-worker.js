@@ -44,10 +44,11 @@ async function updateFailedProjection(client, event, projection, error, missing)
 async function recordSurfaceFailure(client, event, projection, error, details) {
   if (!projection || projection.surface_key.startsWith('DM:')) return;
   if (details.forbidden) {
-    await client.query(`UPDATE surfaces SET state='DRIFTED',state_version=state_version+1,
-      updated_at=clock_timestamp() WHERE surface_key=$1 AND state<>'DRIFTED'`, [projection.surface_key]);
+    // A delivery 403 is an operational delivery failure, not a permission
+    // drift detector.  Keep the surface anchor unchanged and preserve an
+    // incident for an administrator to inspect manually.
     await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-      VALUES(gen_random_uuid(),'PERMISSION_DRIFT',$1,'OPEN','CRITICAL',$2,$3)
+      VALUES(gen_random_uuid(),'DISCORD_SURFACE_FORBIDDEN',$1,'OPEN','ERROR',$2,$3)
       ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
         evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
     [projection.surface_key, { source: 'DISCORD_403', code: error.code }, event.trace_id]);

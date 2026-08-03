@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
+import { promisify } from 'node:util';
 import { Upload } from '@aws-sdk/lib-storage';
 import { GetObjectCommand, HeadObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { v7 as uuidv7 } from 'uuid';
@@ -14,7 +15,7 @@ import {
 } from '../../config/versions.js';
 
 const MAGIC = Buffer.from('QSBK1');
-const PG_DUMP = '/usr/local/bin/pg_dump';
+const execFileAsync = promisify(execFile);
 
 function currentKey(keyring) {
   return { version: keyring.current, key: Buffer.from(keyring.keys[String(keyring.current)], 'base64') };
@@ -34,11 +35,26 @@ function processFailure(child, stderr) {
   return new Promise((resolve, reject) => child.once('close', (code) => code === 0 ? resolve() : reject(new Error(`pg_dump failed (${code}): ${stderr.value.slice(-500)}`))));
 }
 
+export async function validateBackupTools(env, { exec = execFileAsync } = {}) {
+  for (const [name, path] of [['pg_dump', env.PG_DUMP_PATH ?? 'pg_dump'],
+    ['pg_restore', env.PG_RESTORE_PATH ?? 'pg_restore']]) {
+    try {
+      await exec(path, ['--version'], { timeout: 5_000, windowsHide: true });
+    } catch (error) {
+      throw Object.assign(new Error(`${name} is unavailable at configured path`), {
+        code: 'BACKUP_TOOL_UNAVAILABLE', cause: error,
+      });
+    }
+  }
+  return true;
+}
+
 export async function createEncryptedBackup({
   env,
   schemaVersion,
   reason = 'scheduled',
   backupId = uuidv7(),
+  pgDumpPath = env.PG_DUMP_PATH ?? 'pg_dump',
   s3 = createS3Client(env),
   spawnProcess = spawn,
   upload = (client, params) => new Upload({ client, params }).done(),
@@ -57,7 +73,7 @@ export async function createEncryptedBackup({
   const cipher = createCipheriv('aes-256-gcm', key, nonce);
   cipher.setAAD(header);
   const connection = dumpConnection(env.DATABASE_BACKUP_URL);
-  const child = spawnProcess(PG_DUMP, ['--format=custom', '--no-owner', '--no-acl', `--dbname=${connection.url}`], {
+  const child = spawnProcess(pgDumpPath, ['--format=custom', '--no-owner', '--no-acl', `--dbname=${connection.url}`], {
     env: { ...process.env, PGPASSWORD: connection.password }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   const stderr = { value: '' };

@@ -26,7 +26,7 @@ export function renderAdminPanel() {
     ['pricing', 'Pricing'], ['promotions', 'Promotions'], ['orders', 'Orders และ Runner'],
     ['payments', 'Payments และ Manual Review'], ['wallet', 'Wallet / Refund / Adjustment'],
     ['blocklist', 'Blocklist'], ['monitors', 'Monitor Accounts'], ['receivers', 'Receiver Versions'],
-    ['surfaces', 'Surfaces และ Permissions'], ['dlq', 'DLQ และ Incidents'], ['backup', 'Backup / Restore'],
+    ['surfaces', 'Surfaces'], ['dlq', 'DLQ และ Incidents'], ['backup', 'Backup / Restore'],
     ['branding', 'Branding / Config'], ['secrets', 'Secret/Key version status'],
   ].map(([value, label]) => ({ value, label }));
   return {

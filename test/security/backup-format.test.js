@@ -4,7 +4,7 @@ import { createCipheriv, createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { setImmediate } from 'node:timers';
-import { createEncryptedBackup, downloadAndDecryptBackup } from '../../src/adapters/s3/backup.js';
+import { createEncryptedBackup, downloadAndDecryptBackup, validateBackupTools } from '../../src/adapters/s3/backup.js';
 
 const MAGIC = Buffer.from('QSBK1');
 const key = Buffer.alloc(32, 11);
@@ -84,7 +84,7 @@ test('backup creation streams a pg_dump through encryption then verifies uploade
   };
   const env = { S3_BUCKET: 'test', GIT_SHA: 'test-sha',
     DATABASE_BACKUP_URL: 'postgresql://backup-user:backup-password@db.example.test:5432/questshop',
-    BACKUP_ENCRYPTION_KEYS_JSON: keyring };
+    BACKUP_ENCRYPTION_KEYS_JSON: keyring, PG_DUMP_PATH: '/usr/local/bin/pg_dump' };
   const backup = await createEncryptedBackup({ env, schemaVersion: 13, reason: 'test',
     backupId: '019fc530-2000-7000-8000-000000000001', s3, spawnProcess, upload });
   assert.equal(backup.objectVersion, 'fake-version-1');
@@ -101,4 +101,18 @@ test('backup creation streams a pg_dump through encryption then verifies uploade
   for await (const chunk of restored.dumpStream) chunks.push(Buffer.from(chunk));
   assert.deepEqual(Buffer.concat(chunks), clear);
   assert.equal(restored.metadata.schemaVersion, 13);
+});
+
+test('backup tools are validated through configured executable paths', async () => {
+  const calls = [];
+  await validateBackupTools({ PG_DUMP_PATH: '/opt/postgres/bin/pg_dump', PG_RESTORE_PATH: '/opt/postgres/bin/pg_restore' }, {
+    exec: async (binary, args) => { calls.push({ binary, args }); return { stdout: `${binary} 16`, stderr: '' }; },
+  });
+  assert.deepEqual(calls, [
+    { binary: '/opt/postgres/bin/pg_dump', args: ['--version'] },
+    { binary: '/opt/postgres/bin/pg_restore', args: ['--version'] },
+  ]);
+  await assert.rejects(() => validateBackupTools({ PG_DUMP_PATH: 'missing-pg_dump', PG_RESTORE_PATH: 'pg_restore' }, {
+    exec: async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); },
+  }), (error) => error.code === 'BACKUP_TOOL_UNAVAILABLE' && /pg_dump/.test(error.message));
 });

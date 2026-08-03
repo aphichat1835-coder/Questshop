@@ -12,11 +12,20 @@ function fullJitter(attempt, capMs = 1000, baseMs = 25) {
 async function rollbackOrRelease(client, error) {
   try {
     await client.query('ROLLBACK');
-    return false;
-  } catch {
-    client.release(true);
-    if (!isRetryableTransactionError(error)) throw error;
-    return true;
+    return { destroyed: false, error };
+  } catch (rollbackError) {
+    // Mark the client as destroyed before invoking release.  node-postgres
+    // can throw while destroying a broken socket; the outer finally must never
+    // attempt a second release and hide the original transaction failure.
+    const result = { destroyed: true, error };
+    try {
+      client.release(true);
+    } catch (releaseError) {
+      result.rollbackError = rollbackError;
+      result.releaseError = releaseError;
+    }
+    if (!result.rollbackError) result.rollbackError = rollbackError;
+    return result;
   }
 }
 
@@ -49,9 +58,13 @@ export async function withTransaction({
       return result;
     } catch (error) {
       lastError = error;
-      destroyed = await rollbackOrRelease(client, error);
+      const rollback = await rollbackOrRelease(client, error);
+      destroyed = rollback.destroyed;
+      if (destroyed && (!isRetryableTransactionError(error) || attempt + 1 >= maxAttempts)) {
+        throw rollback.error;
+      }
       if (destroyed) continue;
-      if (!isRetryableTransactionError(error) || attempt + 1 >= maxAttempts) throw error;
+      if (!isRetryableTransactionError(error) || attempt + 1 >= maxAttempts) throw rollback.error;
     } finally {
       if (!destroyed) client.release();
     }

@@ -21,7 +21,7 @@ This matrix separates implemented controls from evidence that can only be produc
 | Customer/admin Discord surfaces | setup/router/renderers | session binding/security tests | production guild layout and permissions |
 | Manual review and money authority | reviews service/Admin panel | atomic ambiguous-credit test | Owner review workflow UAT |
 | Blocklist and Admin audit | blocklist/Admin services | database constraints and audit paths | Admin role UAT |
-| Permission drift and repair | Discord permission monitor/repair | unexpected inherited Role detection, isolated Surface disable and Owner repair simulation | production overwrite drift/repair test |
+| Surface setup permissions | Discord Surface setup | reject missing bot access/private-room exposure at install time; 403 delivery incidents remain manual | production channel-layout setup test |
 | Health, metrics, SLO alerts, gates | bootstrap health and alert worker | financial invariant and scheduler-lag alerts; syntax/lint coverage for duplicate-credit and latency-SLO paths | external alert delivery/monthly uptime observation |
 | Backup, restore, retention, keys | S3 backup stream, drill script, retention/key worker | fake S3/pg_dump upload-verify-decrypt contract with versioned manifest, stream code checks and ledger retention test | real S3 backup and temporary-DB restore drill |
 | Deployment, rollback, CI, load | Dockerfile, workflow, scripts, UAT docs | Docker build and fake load test | same-SHA deploy/rollback rehearsal |

@@ -12,7 +12,7 @@ Every incident follows: Detect → Contain → Preserve evidence → Recover →
 | Non-financial DLQ | Preserve delivery evidence | Owner replay or discard with reason/audit |
 | Quest schema/executor failure | Pause affected Quest only | Pin compatible engine, retest, reopen sale |
 | Monitor token invalid | Quarantine account immediately | Owner rotates credential, then uses **เช็คระบบ Token** to verify login and Quest-list access |
-| Permission drift | Disable exposed surface only | Owner reviews diff and explicitly repairs/validates |
+| Discord surface forbidden (403) | Preserve the outbox event and incident; do not change surface state automatically | Owner fixes the Discord channel permission manually, then replays the affected outbox event |
 | Discord outage / 429 | Retain outbox; obey Retry-After | Resume coalesced delivery after health recovers |
 | Backup / restore failure | Block migrations/deploy | Repair storage/key/role, then complete a verified drill |
 | Secret compromise | Disable affected feature; retain evidence | Activate new key version, resumable re-encryption, restore test |
@@ -41,7 +41,7 @@ verification queries and reopening approval. Never paste tokens, cookies, databa
 - Ambiguous TrueMoney remains reserved for Owner decision until the TrueMoney application provides evidence.
 - A worker crash with an `IN_FLIGHT`, `ACCEPTED` or `UNCERTAIN` mutation enters Manual Review; fresh provider state is mandatory.
 - Financial/Audit DLQ can be replayed but never discarded. Replay creates a new Outbox event and parent trace.
-- Permission repair is never automatic. The Owner previews the surface/version, confirms, applies overwrites and revalidates.
+- Surface permissions are configured and checked as a one-time precondition during setup. Runtime delivery failures are recorded as incidents; the bot never changes channel overwrites automatically.
 - Database restore is disaster-only for production. Stop the store, preserve the failed database and reconcile every credit.
 - Full voucher-link exposure requires disabling `LOG_PAYMENTS`, correcting access, preserving audit and reviewing viewers.
 - A user block never confiscates Wallet credit and never changes an active job unless Admin performs a separate audited action.

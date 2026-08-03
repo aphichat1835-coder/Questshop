@@ -11,14 +11,14 @@ import { routeInteraction } from '../discord/interactions/router.js';
 import { startWorkers } from '../workers/worker-manager.js';
 import { closeHealthServer, createHealthState, startHealthServer } from './health-server.js';
 import { createLogger } from '../shared/logger.js';
-import { checkPermissionDrift } from '../discord/permissions/drift.js';
-import { createEncryptedBackup } from '../adapters/s3/backup.js';
+import { createEncryptedBackup, validateBackupTools } from '../adapters/s3/backup.js';
 import { runMaintenance } from '../workers/maintenance-worker.js';
 import { validateKeyringCoverage } from './keyring-coverage.js';
 import { validateRuntimeRole } from '../db/role-contract.js';
 import { processOutbox } from '../workers/outbox-worker.js';
 
-export async function startup({ health = createHealthState(), server: existingServer = null } = {}) {
+export async function startup({ health = createHealthState(), server: existingServer = null,
+  onRuntimeLeaseLost = null } = {}) {
   const requestedPort = /^\d+$/.test(process.env.PORT ?? '') ? Number(process.env.PORT) : 3000;
   const bootstrapPort = requestedPort >= 1 && requestedPort <= 65535 ? requestedPort : 3000;
   const logger = createLogger({ gitSha: process.env.GIT_SHA ?? 'bootstrap' });
@@ -30,16 +30,22 @@ export async function startup({ health = createHealthState(), server: existingSe
   try {
     const env = loadEnvironment();
     health.checks.config = 'OK';
+    if (env.NODE_ENV === 'production' && env.BACKUP_ENABLED) {
+      await validateBackupTools(env);
+      health.checks.backupTools = 'OK';
+    } else health.checks.backupTools = env.NODE_ENV === 'production'
+      ? 'DISABLED_BY_CONFIG' : 'SKIPPED_NON_PRODUCTION';
     const directPool = getDirectPool(env);
     const migrationTable = (await directPool.query("SELECT to_regclass('public.schema_migrations') AS value")).rows[0].value;
     let preMigrationBackup = null;
     if (migrationTable) {
       const schemaVersion = Number((await directPool.query('SELECT COALESCE(max(version),0) AS value FROM schema_migrations')).rows[0].value);
       const latestVersion = Math.max(...(await listMigrations()).map((migration) => migration.version));
-      if (schemaVersion < latestVersion) {
+      if (env.BACKUP_ENABLED && schemaVersion < latestVersion) {
         preMigrationBackup = await createEncryptedBackup({ env, schemaVersion, reason: 'pre-migration' });
         health.checks.preMigrationBackup = 'VERIFIED';
-      } else health.checks.preMigrationBackup = 'NO_PENDING_MIGRATION';
+      } else health.checks.preMigrationBackup = env.BACKUP_ENABLED
+        ? 'NO_PENDING_MIGRATION' : 'DISABLED_BY_CONFIG';
     } else health.checks.preMigrationBackup = 'FIRST_INSTALL_NOT_APPLICABLE';
     await runMigrations({ gitSha: env.GIT_SHA,
       runtimeRole: decodeURIComponent(new URL(env.DATABASE_POOL_URL).username) });
@@ -68,15 +74,10 @@ export async function startup({ health = createHealthState(), server: existingSe
     client.questshop = { env, logger, health, pool, config };
     client.on('interactionCreate', routeInteraction);
     client.on('error', (error) => logger.error({ error }, 'discord client error'));
-    const permissionEvent = () => checkPermissionDrift({ client, pool, env })
-      .catch((error) => logger.error({ error }, 'permission drift event check failed'));
-    client.on('channelUpdate', permissionEvent);
-    client.on('roleUpdate', permissionEvent);
     await client.login(env.DISCORD_BOT_TOKEN);
     if (!client.isReady()) await once(client, 'ready');
     const guild = await client.guilds.fetch(env.DISCORD_GUILD_ID);
     await guild.members.fetchMe();
-    await checkPermissionDrift({ client, pool, env });
     await runMaintenance({ env, holder: 'startup-recovery', client, pool,
       runnerConcurrency: Number(config.values?.runnerConcurrency ?? env.RUNNER_CONCURRENCY) });
     health.checks.discord = 'OK';
@@ -98,6 +99,10 @@ export async function startup({ health = createHealthState(), server: existingSe
         } catch (error) {
           health.ready = false; health.status = 'INCIDENT'; health.lastError = error;
           abortController.abort(error);
+          Promise.resolve(onRuntimeLeaseLost?.(error)).catch((callbackError) => {
+            logger.error({ error: callbackError }, 'runtime lease-loss shutdown failed');
+          });
+          break;
         }
       }
     })().catch((error) => { if (error?.name !== 'AbortError') throw error; });
@@ -107,7 +112,7 @@ export async function startup({ health = createHealthState(), server: existingSe
     health.status = storeOpen ? 'HEALTHY' : 'MAINTENANCE';
     logger.info({ guildId: env.DISCORD_GUILD_ID }, 'Questshop ready');
     return { env, logger, health, server, pool, client, config, workers, abortController, heartbeat,
-      runtimeLease, runtimeHolder: holder };
+      runtimeLease, runtimeHolder: holder, acceptingInteractions: true, shutdownPromise: null };
   } catch (error) {
     health.lastError = error; health.status = 'NOT_READY';
     logger.error({ error }, 'Questshop startup failed');

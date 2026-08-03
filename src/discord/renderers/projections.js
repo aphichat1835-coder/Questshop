@@ -7,6 +7,12 @@ const escape = (value) => escapeMarkdown(String(value ?? 'ไม่ระบุ'
 const baht = (cents) => `${(Number(cents ?? 0) / 100).toFixed(2)} บาท`;
 const timestamp = (value, style = 'F') => value ? `<t:${Math.floor(new Date(value).getTime() / 1000)}:${style}>` : 'ไม่ระบุ';
 const noMentions = { parse: [] };
+function safeHttpsUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'https:' ? url.toString().slice(0, 2000) : null;
+  } catch { return null; }
+}
 
 async function renderRefund(pool, projection, { client }) {
   const refund = (await pool.query(`SELECT f.*,i.order_id,i.quest_id,i.quest_name,
@@ -45,15 +51,44 @@ async function renderTopupReceipt(pool, projection) {
   allowedMentions: noMentions };
 }
 
-async function renderOrderDm(pool, projection) {
+async function renderOrderDm(pool, projection, { env = {} } = {}) {
   const aggregate = (await pool.query(`SELECT a.*,o.id,o.account_username FROM order_aggregates a
     JOIN orders o ON o.id=a.order_id WHERE a.order_id=$1`, [projection.aggregate_id])).rows[0];
+  if (!aggregate) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('สรุป Order ไม่พบ')], allowedMentions: noMentions };
+  const items = (await pool.query(`SELECT i.id,i.sequence_number,i.quest_name,i.state,i.price_cents,i.claim_url,
+      i.terminal_reason,r.state AS reservation_state,r.amount_cents,p.message_id
+    FROM order_items i LEFT JOIN wallet_reservations r ON r.order_item_id=i.id
+    LEFT JOIN message_projections p ON p.projection_type='QUEST_HISTORY'
+      AND p.aggregate_id=i.id::text AND p.surface_key='QUEST_HISTORY'
+    WHERE i.order_id=$1 ORDER BY i.sequence_number`, [projection.aggregate_id])).rows;
+  const totals = (await pool.query(`SELECT
+      COALESCE(sum(r.amount_cents) FILTER (WHERE r.state='CAPTURED'),0)::bigint AS captured_cents,
+      COALESCE(sum(r.amount_cents) FILTER (WHERE r.state='RELEASED'),0)::bigint AS released_cents,
+      COALESCE(sum(r.amount_cents) FILTER (WHERE r.state='RESERVED'),0)::bigint AS reserved_cents
+    FROM order_items i JOIN wallet_reservations r ON r.order_item_id=i.id WHERE i.order_id=$1`, [projection.aggregate_id])).rows[0];
+  const orderUser = (await pool.query('SELECT discord_user_id FROM orders WHERE id=$1', [projection.aggregate_id])).rows[0];
+  const wallet = orderUser ? (await pool.query('SELECT available_cents,reserved_cents FROM wallets WHERE discord_user_id=$1',
+    [orderUser.discord_user_id])).rows[0] : null;
+  const historySurface = (await pool.query("SELECT guild_id,channel_id FROM surfaces WHERE surface_key='QUEST_HISTORY'")).rows[0];
+  const historyBase = historySurface && env.DISCORD_GUILD_ID
+    ? `https://discord.com/channels/${historySurface.guild_id ?? env.DISCORD_GUILD_ID}/${historySurface.channel_id}` : null;
+  const itemLines = items.map((item) => {
+    const historyUrl = historyBase && item.message_id ? `${historyBase}/${item.message_id}` : null;
+    const claimUrl = safeHttpsUrl(item.claim_url);
+    const links = [historyUrl ? `[ประวัติ](${historyUrl})` : null, claimUrl ? `[รับรางวัล](${claimUrl})` : null]
+      .filter(Boolean).join(' • ');
+    return `${item.sequence_number}. **${escape(item.quest_name)}** — ${escape(item.state)} — ${baht(item.price_cents)}${links ? ` • ${links}` : ''}`;
+  });
   const description = [
     `**Order ID:** \`${aggregate.id}\``, `**บัญชี:** ${escape(aggregate.account_username)}`,
     `**ทั้งหมด:** ${aggregate.total_items}`, `**สำเร็จ:** ${aggregate.captured_items}`,
     `**คืนยอด:** ${aggregate.released_items}`, `**ตรวจสอบ:** ${aggregate.review_items}`,
+    `**ยอด Capture:** ${baht(totals.captured_cents)}`, `**ยอดคืน:** ${baht(totals.released_cents)}`,
+    `**ยอดจองคงเหลือ:** ${baht(totals.reserved_cents)}`,
+    `**Wallet ปัจจุบัน:** ${baht(wallet?.available_cents)} พร้อมใช้ / ${baht(wallet?.reserved_cents)} จอง`,
+    '', '**รายละเอียดรายเควส:**', ...(itemLines.length ? itemLines : ['ยังไม่มีรายการ']),
   ].join('\n');
-  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('สรุป Order Questshop').setDescription(description)],
+  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('สรุป Order Questshop').setDescription(description.slice(0, 4000))],
     allowedMentions: noMentions };
 }
 
@@ -102,7 +137,7 @@ async function renderQuestNew(pool, projection) {
   const description = [
     `**Quest ID:** \`${escape(quest.quest_id)}\``, `**ประเภท:** ${escape(quest.task_type)}`,
     `**เป้าหมาย:** ${escape(quest.task_target)}`, `**Orbs:** ${quest.orbs ?? 'ไม่ระบุ'}`,
-    `**ราคา:** ${price}`, `**สถานะซื้อ:** ${escape(quest.sale_state)}`,
+    `**ราคา:** ${price}`,
     `**ตรวจพบ:** ${timestamp(quest.detected_at)}`, `**อัปเดต:** ${timestamp(quest.updated_at, 'R')}`,
     `**หมดอายุ:** ${timestamp(quest.expires_at)}`,
   ].join('\n');
@@ -263,20 +298,32 @@ async function renderAdminAudit(pool, projection) {
 }
 
 async function renderQuestHistory(pool, projection) {
-  const item = (await pool.query(`SELECT i.*,o.account_id,o.account_username,o.account_avatar_url,o.trace_id
-    FROM order_items i JOIN orders o ON o.id=i.order_id WHERE i.id=$1`, [projection.aggregate_id])).rows[0];
-  const complete = item.state === 'READY_TO_CLAIM';
-  const historyColor = complete ? color.success : color.pending;
-  const historyTitle = complete ? '✅ Quest เสร็จสมบูรณ์' : `⏳ ${escape(item.state)}`;
+  const item = (await pool.query(`SELECT i.*,o.account_id,o.account_username,o.account_avatar_url,o.trace_id,
+      r.state AS reservation_state,r.amount_cents AS reservation_amount
+    FROM order_items i JOIN orders o ON o.id=i.order_id
+    LEFT JOIN wallet_reservations r ON r.order_item_id=i.id WHERE i.id=$1`, [projection.aggregate_id])).rows[0];
+  if (!item) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบประวัติ Quest')], allowedMentions: noMentions };
+  const states = {
+    READY_TO_CLAIM: { title: '✅ Quest เสร็จสมบูรณ์', tone: color.success },
+    EXPIRED_RELEASED: { title: '↩️ คืนเงิน — Quest หมดอายุก่อนเริ่ม', tone: color.failure },
+    EXTERNAL_COMPLETED_RELEASED: { title: '↩️ คืนเงิน — บัญชีทำ Quest เสร็จจากที่อื่น', tone: color.failure },
+    STOPPED_RELEASED: { title: '↩️ คืนเงิน — งานถูกหยุด', tone: color.failure },
+    FAILED_RELEASED: { title: '↩️ คืนเงิน — ทำ Quest ไม่สำเร็จ', tone: color.failure },
+    MANUAL_REVIEW: { title: '🟠 รอแอดมินตรวจสอบ', tone: color.pending },
+  };
+  const status = states[item.state] ?? { title: `⏳ กำลังดำเนินการ — ${escape(item.state)}`, tone: color.pending };
+  const claimUrl = safeHttpsUrl(item.claim_url);
   const description = [
     `**บัญชี:** ${escape(item.account_username)}`, `**Account ID:** \`${escape(item.account_id)}\``,
     `**Quest:** ${escape(item.quest_name)}`, `**Order:** \`${escape(item.order_id)}\``,
+    `**สถานะการเงิน:** ${escape(item.reservation_state)}`, `**ราคา/ยอดจอง:** ${baht(item.reservation_amount ?? item.price_cents)}`,
     `**Progress:** ${item.progress_bucket}%`, `**Support:** \`${supportCode(item.trace_id)}\``,
-  ].join('\n');
-  const embed = new EmbedBuilder().setColor(historyColor).setTitle(historyTitle).setDescription(description).setTimestamp(item.updated_at);
+    item.terminal_reason ? `**เหตุผล:** ${escape(item.terminal_reason)}` : null,
+  ].filter(Boolean).join('\n');
+  const embed = new EmbedBuilder().setColor(status.tone).setTitle(status.title).setDescription(description).setTimestamp(item.updated_at);
   if (item.account_avatar_url) embed.setThumbnail(item.account_avatar_url);
-  const components = complete && item.claim_url
-    ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(item.claim_url).setLabel('รับรางวัล Quest นี้'))]
+  const components = item.state === 'READY_TO_CLAIM' && claimUrl
+    ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(claimUrl).setLabel('รับรางวัล Quest นี้'))]
     : [];
   return { embeds: [embed], components, allowedMentions: noMentions };
 }

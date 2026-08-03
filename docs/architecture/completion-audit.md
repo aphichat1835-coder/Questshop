@@ -44,7 +44,7 @@ or live check runs.  It does **not** replace the live evidence required for a pr
 
 | Evidence | Result |
 |---|---|
-| Node `22.22.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 61 tests |
+| Node `22.22.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 69 tests |
 | `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
 | `git diff --check` | Passed |
 | Git tracked files | Neither legacy reference project is tracked; both are ignored locally |
@@ -63,14 +63,14 @@ contracts, not evidence for a managed production service.
 | 5. Error classes, retry and backoff budgets | payment, runner, outbox services/workers and their crash/fault tests | Source-confirmed for simulated errors. Provider and Discord error behaviour remains live evidence. |
 | 6. Fair queue, lease, lock and fencing | `src/domain/runner/service.js`, `src/db/leases.js`, concurrency/crash tests | Source-confirmed. Runtime contention at production load remains. |
 | 7. Manual review | `src/domain/reviews`, Admin router and atomic review test | Source-confirmed. Owner workflow UAT remains. |
-| 8. Discovery, monitor and expiry | catalog services, monitor worker, expiry service, catalog-retest test | Source-confirmed. Live Quest metadata/contract drift remains. |
+| 8. Discovery, monitor and expiry | catalog services, monitor worker, expiry service, event-driven catalog-retest test | Source-confirmed. Live Quest metadata/contract drift remains; no time-based retest is scheduled. |
 | 9. TrueMoney Direct and receiver versions | `src/adapters/truemoney`, payments, receiver service and voucher/crash tests | Source-confirmed with pinned fixtures. A real low-value success, ambiguous result and schema-drift test remain mandatory. |
 | 10. Wallet, price and promotion | wallet/ledger/pricing/promotion domains and settlement tests | Source-confirmed. Owner financial pre-launch compensation sign-off remains. |
 | 11. Interaction security and Discord rate limits | opaque component IDs, server sessions, outbox and security tests | Source-confirmed. Actual Discord REST/Gateway behaviour remains. |
 | 12. Correlation and PostgreSQL time | correlation, transition, transaction, PostgreSQL time modules and durable interaction-session traces | Source-confirmed. Managed database clock/role observation remains. |
 | 13. PostgreSQL production contract | pools, transaction wrapper, migrations, `postgresql-roles.md` | Source-confirmed. Managed PostgreSQL TLS, role grants and backup roles remain. |
 | 14. Startup, shutdown and health | bootstrap, shutdown, health server and worker manager | Source-confirmed. Deployment/restart drill remains. |
-| 15. Permission drift | permission monitor/repair and security tests | Source-confirmed. Real overwrite drift/repair remains. |
+| 15. Surface setup permissions | `src/discord/surfaces/setup.js`, surface policy test, migration `0019_remove_permission_drift.sql` | Runtime Permission Drift detector/repair was intentionally removed per Owner decision. One-time setup permission preconditions remain; Discord 403 recovery is manual. |
 | 16. Engine/config versioning | versions, config service, runner pinning and compatibility test | Source-confirmed. N/N-1 deployment drain remains. |
 | 17. Retention and secrets | keyring, retention/key workers, migrations and coverage tests | Source-confirmed. Live key rotation plus restore test remains. |
 | 18. Backup and restore | encrypted S3 adapter, backup/restore scripts and fake-S3 contract tests | Source-confirmed. Real S3 upload and temporary managed-DB restore drill remain. |
@@ -87,7 +87,7 @@ contracts, not evidence for a managed production service.
 | 1. Architecture, dependencies and code layout | root `package.json`; `src/`, `migrations/`, `scripts/`, `docs/`, `test/` | Source-confirmed. Actual host resource profile remains. |
 | 2. Domain contracts and PostgreSQL schema | domain services, migration checksum runner, migration integration test | Source-confirmed. Production migration execution remains. |
 | 3. Financial, checkout, runner and outbox logic | payment/wallet/checkout/runner/outbox services plus concurrency/crash tests | Source-confirmed for all simulated acceptance paths. Live external mutation paths remain. |
-| 4. Discord UX, Admin, security and operations | router, renderers, surfaces, permissions, health and operations workers | Source-confirmed. Real client layout, permissions and acknowledgement latency remain. |
+| 4. Discord UX, Admin, security and operations | router, renderers, surfaces, health and operations workers | Source-confirmed. Real client layout, setup permissions and acknowledgement latency remain. |
 | 5. Development gates and proof plan | CI, Dockerfile, test suites, load test, UAT and runbooks | Automated local gate is passed. Production gates are still intentionally closed until Owner UAT. |
 
 ## Explicit non-claims

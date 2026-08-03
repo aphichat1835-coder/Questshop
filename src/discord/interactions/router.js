@@ -31,7 +31,6 @@ import { refundCapturedOrderItem } from '../../domain/wallet/service.js';
 import { blockUser, unblockUser } from '../../domain/blocklist/service.js';
 import { addEvidence, assignReview, resolveSubjectReview } from '../../domain/reviews/service.js';
 import { parseBahtToCents } from '../../shared/money.js';
-import { repairPermissionDrift } from '../permissions/drift.js';
 import { activateReceiver } from '../../domain/admin/receiver-service.js';
 import {
   addMonitor, checkAllMonitorHealth, checkMonitorHealth, rotateMonitorCredential, setMonitorState,
@@ -242,11 +241,9 @@ async function renderPaymentsPanel(interaction, runtime) {
 
 async function renderSurfacesPanel(interaction, runtime) {
   const surfaces = (await runtime.pool.query('SELECT * FROM surfaces ORDER BY surface_key')).rows;
-  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Surfaces และ Permission Drift',
-    listRows(surfaces, (surface) => `${surface.state === 'ACTIVE' ? '🟢' : '🔴'} **${surface.surface_key}** • <#${surface.channel_id}> • v${surface.state_version}`, 'ยังไม่ได้ติดตั้ง Surface'))],
-  components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('perm_repair'))
-    .setLabel('Preview / Repair Permission').setStyle(ButtonStyle.Danger)
-    .setDisabled(interaction.user.id !== runtime.env.OWNER_ID || !surfaces.some((row) => row.state === 'DRIFTED')))] });
+  return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Surfaces',
+    listRows(surfaces, (surface) => `${surface.state === 'ACTIVE' ? '🟢' : '🟠'} **${surface.surface_key}** • <#${surface.channel_id}> • v${surface.state_version}`, 'ยังไม่ได้ติดตั้ง Surface'))],
+    components: [] });
 }
 
 async function renderPricingPanel(interaction, runtime) {
@@ -490,7 +487,7 @@ async function assertSurfaceBinding(interaction, route, runtime) {
 }
 
 function isBackofficeRoute(route) {
-  const prefixes = ['admin', 'gate_', 'wallet_', 'refund_', 'block_', 'review_', 'perm_',
+  const prefixes = ['admin', 'gate_', 'wallet_', 'refund_', 'block_', 'review_',
     'price_', 'promo_', 'receiver_', 'monitor_', 'catalog_', 'adminorder_', 'dlq_', 'config_', 'breaker_', 'test_fail_'];
   return prefixes.some((prefix) => route === prefix || route.startsWith(prefix));
 }
@@ -1018,60 +1015,6 @@ if (route.route === 'review_resolve_confirm' && interaction.isButton()) {
   contextFor(interaction, 'review_resolve_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply({ content: `Review สำเร็จ: **${result.review.state}** • ${session.payload.decision}`, components: [] });
-}
-}
-
-async function handlePermissionRepair({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'perm_repair' && interaction.isButton()) {
-  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Permission repair ใช้ได้เฉพาะ Owner');
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'PERMISSION_REPAIR_PREPARE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'permission_repair_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('perm_repair_submit', session.id, 'Permission Repair', [
-    { id: 'surface', label: 'Surface key', placeholder: 'LOG_PAYMENTS', max: 32 },
-    { id: 'reason', label: 'เหตุผลการซ่อม', long: true, max: 500 },
-  ]));
-}
-}
-
-async function handlePermissionRepairSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'perm_repair_submit' && interaction.isModalSubmit()) {
-  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Permission repair ใช้ได้เฉพาะ Owner');
-  await interaction.deferReply({ ephemeral: true });
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PERMISSION_REPAIR_PREPARE' },
-  contextFor(interaction, 'permission_repair_load'), { pool: runtime.pool });
-  const surfaceKey = interaction.fields.getTextInputValue('surface').trim().toUpperCase();
-  const surface = (await runtime.pool.query('SELECT * FROM surfaces WHERE surface_key=$1', [surfaceKey])).rows[0];
-  if (surface?.state !== 'DRIFTED') throw new QuestshopError('SURFACE_NOT_DRIFTED', 'Surface นี้ไม่อยู่ในสถานะ Drifted');
-  const payload = { surfaceKey, expectedVersion: String(surface.state_version),
-    reason: interaction.fields.getTextInputValue('reason').trim() };
-  const confirm = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message?.id ?? null,
-    operation: 'PERMISSION_REPAIR_CONFIRM', payload, configVersion: runtime.config.version },
-  contextFor(interaction, 'permission_repair_confirm_session'), { pool: runtime.pool });
-  return interaction.editReply({ content: `ยืนยันซ่อม **${surfaceKey}** ที่ <#${surface.channel_id}>\nระบบจะจำกัด View Channel ของ @everyone/overwrite ที่ไม่คาดหมาย และคืนสิทธิ์ Bot/Owner/Admin\nเหตุผล: ${payload.reason}`,
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
-      .setCustomId(customId('perm_repair_confirm', confirm.id)).setLabel('ยืนยันซ่อม Permission')
-      .setStyle(ButtonStyle.Danger))] });
-}
-}
-
-async function handlePermissionRepairConfirm({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'perm_repair_confirm' && interaction.isButton()) {
-  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'Permission repair ใช้ได้เฉพาะ Owner');
-  await interaction.deferReply({ ephemeral: true });
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PERMISSION_REPAIR_CONFIRM' },
-  contextFor(interaction, 'permission_repair_confirm_load'), { pool: runtime.pool });
-  const current = (await runtime.pool.query('SELECT state_version FROM surfaces WHERE surface_key=$1',
-    [session.payload.surfaceKey])).rows[0];
-  if (String(current?.state_version) !== session.payload.expectedVersion) throw new QuestshopError('STALE_STATE', 'Surface เปลี่ยนหลัง Preview');
-  await repairPermissionDrift({ client: interaction.client, pool: runtime.pool, env: runtime.env,
-    surfaceKey: session.payload.surfaceKey, adminRoleId: runtime.config.values?.adminRoleId,
-    reason: session.payload.reason }, contextFor(interaction, 'permission_repair_execute'));
-  await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`ซ่อมและตรวจ Permission ของ **${session.payload.surfaceKey}** ผ่านแล้ว`);
 }
 }
 
@@ -1703,9 +1646,6 @@ const ROUTE_HANDLERS = Object.freeze({
   "review_resolve": handleReviewResolve,
   "review_resolve_submit": handleReviewResolveSubmit,
   "review_resolve_confirm": handleReviewResolveConfirm,
-  "perm_repair": handlePermissionRepair,
-  "perm_repair_submit": handlePermissionRepairSubmit,
-  "perm_repair_confirm": handlePermissionRepairConfirm,
   "catalog_sale": handleCatalogSale,
   "catalog_sale_submit": handleCatalogSaleSubmit,
   "adminorder_review": handleOrderReview,
@@ -1793,6 +1733,9 @@ export async function routeInteraction(interaction) {
   const metrics = startInteractionMetrics(interaction, runtime);
   let failure = null;
   try {
+    if (runtime.acceptingInteractions === false) {
+      throw new QuestshopError('RUNTIME_NOT_ACTIVE', 'ระบบกำลังหยุดทำงานชั่วคราว กรุณาลองใหม่ภายหลัง');
+    }
     if (!interaction.inGuild() || interaction.guildId !== runtime.env.DISCORD_GUILD_ID) return;
     if (await handleSurfaceCommand(interaction, runtime)) return;
     const route = parseCustomId(interaction.customId);
