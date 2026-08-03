@@ -9,7 +9,7 @@ WHERE state = 'DRIFTED';
 
 UPDATE incidents
 SET state = 'RESOLVED',
-    severity = 'LOW',
+    severity = 'WARNING',
     evidence = evidence || jsonb_build_object(
       'resolved_reason', 'PERMISSION_DRIFT_FEATURE_REMOVED',
       'resolved_at', clock_timestamp()
