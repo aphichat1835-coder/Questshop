@@ -9,6 +9,8 @@ import { REVIEW_TRANSITIONS } from './states.js';
 import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
 import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
 import { TOPUP_TRANSITIONS } from '../payments/states.js';
+import { TEST_TRANSITIONS } from '../catalog/states.js';
+import { createMonitorTestBatch, hasCurrentTestPass } from '../catalog/test-gate.js';
 import {
   captureReservationInTransaction,
   creditRedeemedTopupInTransaction,
@@ -310,6 +312,69 @@ async function applyOrderItemDecision(client, review, decision, input, context) 
   return { orderItemId: item.id, status: released.state };
 }
 
+async function applyQuestDecision(client, review, decision, context) {
+  if (decision !== 'RETRY') {
+    throw new TypeError('Quest Manual Review รองรับเฉพาะ RETRY; ใช้ Catalog action หากต้องการเปลี่ยนสถานะขาย');
+  }
+  const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
+    [review.subject_id])).rows[0];
+  if (!quest) throw new StaleStateError('quest', review.subject_id);
+  if (await hasCurrentTestPass(client, quest)) {
+    return { questId: quest.quest_id, status: 'TEST_ALREADY_PASSED' };
+  }
+
+  const active = (await client.query(`SELECT id,state FROM quest_test_runs
+    WHERE quest_id=$1 AND state IN ('TEST_QUEUED','TESTING')
+    ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id])).rows[0];
+  if (active) return { questId: quest.quest_id, status: 'TEST_ALREADY_SCHEDULED', testRunId: active.id };
+
+  const manual = (await client.query(`SELECT * FROM quest_test_runs
+    WHERE quest_id=$1 AND state='MANUAL_REVIEW'
+    ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id])).rows[0];
+  if (!manual) throw new StaleStateError('quest_test', quest.quest_id);
+  const batch = manual.batch_id
+    ? (await client.query('SELECT * FROM quest_test_batches WHERE id=$1 FOR UPDATE', [manual.batch_id])).rows[0]
+    : null;
+  const targetMonitorReady = manual.target_monitor_id && (await client.query(`SELECT 1 FROM monitor_accounts
+    WHERE id=$1 AND state='ACTIVE' AND 'TEST'=ANY(capabilities)`, [manual.target_monitor_id])).rowCount > 0;
+
+  // Reuse an active batch only when its original Monitor is still usable.  An
+  // auth/quarantine review must seed a fresh batch, otherwise the queued run
+  // would be permanently ineligible for acquisition.
+  if (batch && ['QUEUED', 'RUNNING'].includes(batch.state) && targetMonitorReady) {
+    assertTransition(TEST_TRANSITIONS, manual.state, 'TEST_QUEUED');
+    const queued = (await client.query(`UPDATE quest_test_runs SET state='TEST_QUEUED',
+      state_version=state_version+1,error_class='ADMIN_RETRY',completed_at=NULL,
+      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp(),
+      evidence=evidence||$3::jsonb
+      WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`, [
+      manual.id, manual.state_version, { reviewId: review.id, decision: 'RETRY' },
+    ])).rows[0];
+    if (!queued) throw new StaleStateError('quest_test', manual.id);
+    await recordTransition(client, { aggregateType: 'QUEST_TEST', aggregateId: queued.id,
+      fromState: manual.state, toState: 'TEST_QUEUED', stateVersion: queued.state_version,
+      reasonCode: 'ADMIN_RETRY', context });
+    return { questId: quest.quest_id, status: queued.state, testRunId: queued.id, batchId: batch.id };
+  }
+
+  if (batch && ['QUEUED', 'RUNNING'].includes(batch.state)) {
+    const retired = (await client.query(`UPDATE quest_test_batches SET state='FAILED',
+      state_version=state_version+1,latest_error=latest_error||$3::jsonb,
+      completed_at=clock_timestamp(),updated_at=clock_timestamp()
+      WHERE id=$1 AND state=$2 AND state_version=$4 RETURNING *`, [batch.id, batch.state,
+      { code: 'ADMIN_RETRY_RESEEDED', reviewId: review.id }, batch.state_version])).rows[0];
+    if (!retired) throw new StaleStateError('quest_test_batch', batch.id);
+    await recordTransition(client, { aggregateType: 'QUEST_TEST_BATCH', aggregateId: retired.id,
+      fromState: batch.state, toState: 'FAILED', stateVersion: retired.state_version,
+      reasonCode: 'ADMIN_RETRY_RESEEDED', context });
+  }
+
+  const seeded = await createMonitorTestBatch(client, { quest, context,
+    requestedBy: context.actorId, force: true });
+  return { questId: quest.quest_id, status: seeded.queued ? 'TEST_QUEUED' : 'NO_ACTIVE_MONITOR',
+    batchId: seeded.batch.id, testRunId: seeded.queued?.id ?? null };
+}
+
 export async function resolveSubjectReview({ reviewId, decision, reason, isOwner,
   amountCents = null, providerTransactionId = null, claimUrl = null,
   expectedVersion = null }, context, options = {}) {
@@ -325,6 +390,8 @@ export async function resolveSubjectReview({ reviewId, decision, reason, isOwner
         applied = await applyTopupDecision(client, review, decision, input, context);
       } else if (review.subject_type === 'ORDER_ITEM') {
         applied = await applyOrderItemDecision(client, review, decision, input, context);
+      } else if (review.subject_type === 'QUEST') {
+        applied = await applyQuestDecision(client, review, decision, context);
       } else {
         throw new TypeError(`unsupported manual review subject: ${review.subject_type}`);
       }

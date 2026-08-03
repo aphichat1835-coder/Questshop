@@ -8,7 +8,7 @@ idempotency/concurrency behavior, observability, feature gate, tests, rollback p
 | Foundation | validated environment; separate direct/pooled/backup/restore roles; migration checksum and compatibility; runtime lease; health-first startup; 25-second shutdown |
 | Wallet | integer satang; row lock; serializable retry; append-only hash chain; reservation states; compensation and checkpoint retention |
 | Payment | voucher allowlist/HMAC; receiver/promotion snapshot; intent phase; no blind retry after possible send; exact-once credit; Owner-only ambiguity |
-| Catalog | three independent axes; immutable metadata revisions; dynamic price; executor support; expiry admission; discovery does not identify customer |
+| Catalog | three independent axes; immutable metadata revisions; dynamic price; executor support; expiry admission; customer discovery is logged privately with the customer and Quest-account identity but never a raw Token |
 | Checkout | actor/guild/channel-bound session; encrypted token; pagination; quote hash/version; signed 30-second external preflight; account uniqueness; bulk item reserve |
 | Queue/Runner | fair scheduling; lazy materialization; durable mutation checkpoint; lease/fencing; bounded retry; fresh verification; capture/release; no claim API |
 | Outbox | transactionally enqueued projection; latest-state rendering; heartbeat and fencing for event/projection leases; nonce reconciliation; Discord error contract; durable attempts; replay-linked DLQ |

@@ -7,6 +7,7 @@ import { createContext } from '../../src/shared/correlation.js';
 import { ingestDiscovery } from '../../src/domain/catalog/service.js';
 import { advanceMonitorTestBatch, markMonitorTestBatchPassed } from '../../src/domain/catalog/test-gate.js';
 import { forcePublishFailedMonitorTest } from '../../src/domain/admin/operations-service.js';
+import { openReview, resolveSubjectReview } from '../../src/domain/reviews/service.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -66,4 +67,43 @@ test('Monitor discovery stays private until a batch passes; exhausted monitors c
   assert.equal((await pool.query("SELECT sale_state FROM quests WHERE quest_id='monitor-passed'")).rows[0].sale_state, 'OPEN');
   assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM message_projections
     WHERE projection_type='QUEST_NEW' AND aggregate_id='monitor-passed'`)).rows[0].count), 1);
+});
+
+test('Admin retry resolves a Quest Manual Review by seeding a fresh test batch', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const traceId = uuidv7();
+  const context = createContext({ traceId, actorType: 'ADMIN', actorId: 'admin', guildId: 'guild',
+    idempotencyKey: 'quest-review-retry' });
+  const monitor = uuidv7(); const failedBatch = uuidv7(); const manualRun = uuidv7();
+  await pool.query(`INSERT INTO monitor_accounts(id,account_id,capabilities,state,priority)
+    VALUES($1,'retry-monitor',ARRAY['TEST'],'ACTIVE',1)`, [monitor]);
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,name,task_type,task_target,url,expires_at,
+    executor_id,engine_version,executor_version,contract_version)
+    VALUES('quest-review-retry','SUPPORTED','Quest review retry','WATCH_VIDEO',60,
+      'https://discord.com/quests/quest-review-retry',clock_timestamp()+interval '1 day','video','1','1','1')`);
+  await pool.query(`INSERT INTO quest_test_batches(id,quest_id,state,monitor_order,trace_id,requested_by,
+    completed_at) VALUES($1,'quest-review-retry','FAILED',ARRAY[$2]::uuid[],$3,'SYSTEM',clock_timestamp())`,
+  [failedBatch, monitor, traceId]);
+  await pool.query(`INSERT INTO quest_test_runs(id,quest_id,batch_id,target_monitor_id,state,engine_version,
+    executor_version,contract_version,attempt_in_monitor,trace_id,error_class,completed_at)
+    VALUES($1,'quest-review-retry',$2,$3,'MANUAL_REVIEW','1','1','1',1,$4,'TEST_WORKER_CRASH',clock_timestamp())`,
+  [manualRun, failedBatch, monitor, traceId]);
+  const review = await withTransaction({ pool, isolation: 'SERIALIZABLE' }, (client) => openReview(client, {
+    subjectType: 'QUEST', subjectId: 'quest-review-retry', reason: 'uncertain monitor mutation', context,
+  }));
+  const result = await resolveSubjectReview({ reviewId: review.id, decision: 'RETRY',
+    reason: 'operator approved a clean Monitor retest', isOwner: false,
+    expectedVersion: review.state_version }, context, { pool });
+  assert.equal(result.review.state, 'RESOLVED');
+  assert.equal(result.applied.status, 'TEST_QUEUED');
+  assert.notEqual(result.applied.batchId, failedBatch);
+  assert.equal((await pool.query('SELECT state FROM quest_test_runs WHERE id=$1', [manualRun])).rows[0].state,
+    'MANUAL_REVIEW');
+  const queued = (await pool.query(`SELECT * FROM quest_test_runs WHERE id=$1`, [result.applied.testRunId])).rows[0];
+  assert.equal(queued.state, 'TEST_QUEUED');
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM monitor_accounts
+    WHERE id=$1 AND state='ACTIVE' AND 'TEST'=ANY(capabilities)`, [queued.target_monitor_id])).rows[0].count), 1);
+  assert.equal((await pool.query(`SELECT count(*)::integer AS count FROM state_transitions
+    WHERE aggregate_type='QUEST_TEST_BATCH' AND aggregate_id=$1 AND to_state='RUNNING'`,
+  [result.applied.batchId])).rows[0].count, 1);
 });

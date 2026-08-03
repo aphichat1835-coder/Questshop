@@ -44,7 +44,7 @@ or live check runs.  It does **not** replace the live evidence required for a pr
 
 | Evidence | Result |
 |---|---|
-| Package target Node `22.22.0`, local runtime Node `24.14.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 75 tests; the local runtime is newer than the pinned production target and CI/Docker still pin Node 22.22.0 |
+| Package target Node `22.22.0`, local runtime Node `24.14.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 76 tests; the local runtime is newer than the pinned production target and CI/Docker still pin Node 22.22.0 |
 | `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
 | `git diff --check` | Passed |
 | Git tracked files | Neither legacy reference project is tracked; both are ignored locally |
@@ -62,7 +62,7 @@ contracts, not evidence for a managed production service.
 | 4. Fixed state machines | domain `states.js`, `migrations/0001_initial.sql`, `test/unit/states.test.js` | Source-confirmed. Production trace sampling remains. |
 | 5. Error classes, retry and backoff budgets | payment, runner, outbox services/workers and their crash/fault tests | Source-confirmed for simulated errors. Provider and Discord error behaviour remains live evidence. |
 | 6. Fair queue, lease, lock and fencing | `src/domain/runner/service.js`, `src/db/leases.js`, concurrency/crash tests | Source-confirmed. Runtime contention at production load remains. |
-| 7. Manual review | `src/domain/reviews`, Admin router and atomic review test | Source-confirmed. Owner workflow UAT remains. |
+| 7. Manual review | `src/domain/reviews`, Admin router, atomic review and Quest-test retry/reseed tests | Source-confirmed. A Quest test review can requeue an eligible retained Monitor attempt or seed a fresh batch; Owner workflow UAT remains. |
 | 8. Discovery, monitor and expiry | catalog services, monitor worker, expiry service, event-driven catalog-retest test | Source-confirmed. Live Quest metadata/contract drift remains; no time-based retest is scheduled. |
 | 9. TrueMoney Direct and receiver versions | `src/adapters/truemoney`, payments, receiver service and voucher/crash tests | Source-confirmed with pinned fixtures. A real low-value success, ambiguous result and schema-drift test remain mandatory. |
 | 10. Wallet, price and promotion | wallet/ledger/pricing/promotion domains and settlement tests | Source-confirmed. Owner financial pre-launch compensation sign-off remains. |
@@ -78,7 +78,7 @@ contracts, not evidence for a managed production service.
 | 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. External alert delivery and monthly SLO evidence remain. |
 | 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
 | 22. Development sequence and feature gates | feature-gate config, Admin controls and pre-launch document | Source-confirmed. Owner must enable gates in the required live order. |
-| 23. Definition of Done and acceptance | definition-of-done, traceability and 75 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
+| 23. Definition of Done and acceptance | definition-of-done, traceability and 76 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
 
 ## Technical Blueprint plan
 
