@@ -14,9 +14,9 @@ The Owner superseded the earlier “test is not a gate” rule with this operati
    first verified pass stops the batch and permits `quest-new` publication and public sale.
 3. If every available Monitor fails, it creates a detailed `LOG_QUEST_OPERATIONS` alert with
    **ส่งเลย** (audited Admin override, never a forged `TEST_PASSED`) and **ลองทดสอบอีกครั้ง**.
-4. A supported Quest newly discovered from a customer checkout may be admitted only for that
-   authenticated Quest account. It is logged with the customer and account identity, never a raw Token,
-   and it does not open general public sale.
+4. A supported Quest newly discovered from a customer checkout is announced in `quest-new` after its
+   first analysis and may be admitted only for that authenticated Quest account. It is logged with the
+   customer and account identity, never a raw Token, and it does not open general public sale.
 
 Implementation: migration `0017_monitor_test_sale_gate.sql`, `domain/catalog/test-gate.js`, catalog,
 checkout, test worker, admin override and Discord projection/router changes. Automated evidence:

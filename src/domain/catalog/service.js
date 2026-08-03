@@ -147,8 +147,12 @@ export async function pauseQuestForRetest(client, quest, context) {
   return paused;
 }
 
-async function queueDiscoveryProjections(client, quest, revision, context) {
-  const shouldPublish = quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN';
+async function queueDiscoveryProjections(client, quest, revision, context, source) {
+  // Monitor discovery waits for a verified test gate. Customer checkout
+  // discovery is announced after analysis, but remains account-scoped and
+  // does not open public sale.
+  const shouldPublish = source === 'CUSTOMER_CHECKOUT'
+    || quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN';
   const announcementNotBefore = quest.announcement_state === 'ANNOUNCED'
     ? (await client.query("SELECT clock_timestamp()+interval '30 seconds' AS value")).rows[0].value
     : null;
@@ -184,7 +188,7 @@ export async function ingestDiscovery({
     }
     const sale = await reconcileSale(client, quest, merged, context, runnerConcurrency);
     quest = needsRetest ? await pauseQuestForRetest(client, sale.quest, context) : sale.quest;
-    await queueDiscoveryProjections(client, quest, metadata.revision, context);
+    await queueDiscoveryProjections(client, quest, metadata.revision, context, source);
     return { quest, price: sale.price, expiry: sale.expiry, revision: metadata.revision };
   });
 }

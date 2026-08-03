@@ -40,6 +40,8 @@ test('large checkout reserves all items but materializes one account job', async
     channelId: '10000000000000003', messageId: null, token: 'test-token-value', env }, context('session'), options);
   assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM checkout_quest_options
     WHERE session_id=$1 AND admission_scope='CUSTOMER_ACCOUNT'`, [created.session.id])).rows[0].count), 5);
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM message_projections
+    WHERE projection_type='QUEST_NEW' AND aggregate_id LIKE 'checkout-%'`)).rows[0].count), 5);
   assert.equal(Number((await pool.query("SELECT count(*)::integer AS count FROM quests WHERE sale_state='CLOSED'"))
     .rows[0].count), 5);
   await assert.rejects(() => getSelectionPage({ sessionId: created.session.id, actorId: user,
