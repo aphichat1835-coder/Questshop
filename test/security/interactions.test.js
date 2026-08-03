@@ -63,6 +63,7 @@ test('server interaction session enforces actor guild channel operation and Post
   const session = await createAdminSession({ actorId: 'actor-a', guildId: 'guild-a',
     channelId: 'channel-a', messageId: 'message-a', operation: 'SECURITY_TEST',
     payload: { opaque: true }, configVersion: 1 }, context, { pool });
+  assert.equal(session.trace_id, context.traceId);
   assert.equal((await loadAdminSession({ sessionId: session.id, actorId: 'actor-a', guildId: 'guild-a',
     channelId: 'channel-a', messageId: 'message-a', operation: 'SECURITY_TEST' }, context, { pool })).id, session.id);
   await assert.rejects(() => loadAdminSession({ sessionId: session.id, actorId: 'actor-b',

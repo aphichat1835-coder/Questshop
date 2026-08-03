@@ -34,6 +34,7 @@ function preflightPayload({ session, credential, items, profile, quests, dbNow }
   const fresh = new Map(quests.map((quest) => [quest.id, quest]));
   return JSON.stringify({
     sessionId: session.id,
+    traceId: session.trace_id,
     actorId: session.actor_id,
     guildId: session.guild_id,
     accountId: credential.account_id,
@@ -122,14 +123,14 @@ export async function createSession({
     const session = (await client.query(`
       INSERT INTO interaction_sessions(
         id, actor_id, guild_id, channel_id, message_id, operation,
-        config_version, payload, expires_at
-      ) VALUES ($1,$2,$3,$4,$5,'CHECKOUT',$6,$7,
+        config_version, payload, trace_id, expires_at
+      ) VALUES ($1,$2,$3,$4,$5,'CHECKOUT',$6,$7,$8,
         transaction_timestamp() + interval '${SESSION_TTL_MINUTES} minutes') RETURNING *
     `, [sessionId, discordUserId, guildId, channelId, messageId, configVersion, {
       accountId: String(profile.id),
       username: profile.global_name ?? profile.username ?? String(profile.id),
       avatarUrl: avatarUrl(profile),
-    }])).rows[0];
+    }, context.traceId])).rows[0];
     await client.query(`
       INSERT INTO checkout_credentials(
         session_id, account_id, key_version, nonce, ciphertext, auth_tag
@@ -150,6 +151,10 @@ export async function createSession({
         eligibility.quest.current_metadata_revision, eligibility.quest.expires_at, quest.progress,
       ]);
     }
+    await enqueueProjection(client, {
+      projectionType: 'CHECKOUT_AUDIT', aggregateType: 'INTERACTION_SESSION', aggregateId: sessionId,
+      aggregateVersion: session.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
+    });
     return { session, profile, optionsCount: candidates.length };
   });
 }
@@ -298,38 +303,45 @@ async function loadPreflight({ sessionId, actorId, guildId, channelId, messageId
 async function validateConfirmationSession(client, sessionInput, preflight, env) {
   const { sessionId, actorId, guildId, channelId, messageId } = sessionInput;
   const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
-    const currentConfigVersion = await activeConfigVersion(client);
-    if (currentConfigVersion !== Number(session.config_version)) {
-      throw new QuestshopError('QUOTE_EXPIRED', 'การตั้งค่าร้านเปลี่ยนไป กรุณาเริ่ม Quote ใหม่');
-    }
-    const freshEnough = (await client.query(`
-      SELECT $1::timestamptz >= clock_timestamp() - interval '${PREFLIGHT_TTL_SECONDS} seconds' AS ok
-    `, [preflight.dbNow])).rows[0].ok;
-    if (!freshEnough) throw new QuestshopError('PREFLIGHT_EXPIRED', 'การตรวจบัญชีหมดอายุ กรุณายืนยันใหม่');
-    if (!verifyPreflightSignature(preflight, env)) {
-      throw new QuestshopError('PREFLIGHT_SIGNATURE_INVALID', 'ผลการตรวจบัญชีไม่ถูกต้อง กรุณาเริ่มใหม่');
-    }
-    const blocked = (await client.query(`
-      SELECT 1 FROM blocklist_entries
-      WHERE discord_user_id = $1 AND block_type = 'ORDER_BLOCKED' AND revoked_at IS NULL
-        AND starts_at <= clock_timestamp() AND (expires_at IS NULL OR expires_at > clock_timestamp())
-    `, [actorId])).rowCount > 0;
-    if (blocked) throw new QuestshopError('ORDER_BLOCKED', 'บัญชีนี้ถูกระงับการสั่งทำ Quest');
-    const queueCount = Number((await client.query(`
-      SELECT count(*)::integer AS count FROM runner_jobs
-      WHERE state IN ('QUEUED','LEASED','RUNNING','WAITING_RATE_LIMIT','WAITING_RETRY')
-    `)).rows[0].count);
+  if (session.trace_id !== preflight.session.trace_id) {
+    throw new QuestshopError('PREFLIGHT_TRACE_MISMATCH', 'ผลการตรวจบัญชีไม่ตรงกับ Checkout session');
+  }
+  const currentConfigVersion = await activeConfigVersion(client);
+  if (currentConfigVersion !== Number(session.config_version)) {
+    throw new QuestshopError('QUOTE_EXPIRED', 'การตั้งค่าร้านเปลี่ยนไป กรุณาเริ่ม Quote ใหม่');
+  }
+  const freshEnough = (await client.query(`
+    SELECT $1::timestamptz >= clock_timestamp() - interval '${PREFLIGHT_TTL_SECONDS} seconds' AS ok
+  `, [preflight.dbNow])).rows[0].ok;
+  if (!freshEnough) throw new QuestshopError('PREFLIGHT_EXPIRED', 'การตรวจบัญชีหมดอายุ กรุณายืนยันใหม่');
+  if (!verifyPreflightSignature(preflight, env)) {
+    throw new QuestshopError('PREFLIGHT_SIGNATURE_INVALID', 'ผลการตรวจบัญชีไม่ถูกต้อง กรุณาเริ่มใหม่');
+  }
+  const blocked = (await client.query(`
+    SELECT 1 FROM blocklist_entries
+    WHERE discord_user_id = $1 AND block_type = 'ORDER_BLOCKED' AND revoked_at IS NULL
+      AND starts_at <= clock_timestamp() AND (expires_at IS NULL OR expires_at > clock_timestamp())
+  `, [actorId])).rowCount > 0;
+  if (blocked) throw new QuestshopError('ORDER_BLOCKED', 'บัญชีนี้ถูกระงับการสั่งทำ Quest');
+  const queueCount = Number((await client.query(`
+    SELECT count(*)::integer AS count FROM runner_jobs
+    WHERE state IN ('QUEUED','LEASED','RUNNING','WAITING_RATE_LIMIT','WAITING_RETRY')
+  `)).rows[0].count);
   if (queueCount >= 500) throw new QuestshopError('QUEUE_FULL', 'คิวงานเต็ม กรุณาลองใหม่ภายหลัง');
   const selected = (await client.query(`
-      SELECT * FROM checkout_quest_options WHERE session_id = $1 AND selected = true
-      ORDER BY created_at, id FOR UPDATE
-    `, [sessionId])).rows;
-    if (!selected.length) throw new QuestshopError('NO_QUEST_SELECTED', 'กรุณาเลือก Quest');
-    if (!session.payload?.quoteHash
-      || session.payload.quoteHash !== selectionHash(selected, session.config_version)) {
-      throw new QuestshopError('QUOTE_EXPIRED', 'รายการที่เลือกเปลี่ยนไป กรุณาตรวจ Quote ใหม่');
+    SELECT * FROM checkout_quest_options WHERE session_id = $1 AND selected = true
+    ORDER BY created_at, id FOR UPDATE
+  `, [sessionId])).rows;
+  if (!selected.length) throw new QuestshopError('NO_QUEST_SELECTED', 'กรุณาเลือก Quest');
+  if (!session.payload?.quoteHash
+    || session.payload.quoteHash !== selectionHash(selected, session.config_version)) {
+    throw new QuestshopError('QUOTE_EXPIRED', 'รายการที่เลือกเปลี่ยนไป กรุณาตรวจ Quote ใหม่');
   }
   return { session, selected };
+}
+
+function withSessionTrace(context, session) {
+  return { ...context, traceId: session.trace_id };
 }
 
 async function validateSelectedOptions(client, selected, freshById, runnerConcurrency) {
@@ -501,16 +513,17 @@ export async function confirmOrder({ sessionId, actorId, guildId, channelId = nu
   const freshById = new Map(preflight.quests.map((quest) => [quest.id, quest]));
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const { session, selected } = await validateConfirmationSession(client, input, preflight, env);
+    const correlatedContext = withSessionTrace(context, session);
     const validated = await validateSelectedOptions(client, selected, freshById, runnerConcurrency);
-    const orderId = await createOrder(client, actorId, preflight, context, env);
+    const orderId = await createOrder(client, actorId, preflight, correlatedContext, env);
     await storeOrderCredential(client, orderId, preflight, env, guildId);
     const itemRows = await createOrderItems(client, orderId, session, validated);
     await reserveOrderItemsInTransaction(client, {
       discordUserId: actorId,
       items: itemRows.map((item) => ({ itemId: item.id, amountCents: item.price_cents })),
-    }, context);
-    await queueFirstOrderItem(client, itemRows, actorId, preflight, context);
-    await enqueueOrderHistory(client, itemRows, context);
+    }, correlatedContext);
+    await queueFirstOrderItem(client, itemRows, actorId, preflight, correlatedContext);
+    await enqueueOrderHistory(client, itemRows, correlatedContext);
     await finishCheckout(client, sessionId);
     return { orderId, items: itemRows, totalCents: sumCents(itemRows.map((item) => item.price_cents)) };
   });

@@ -20,4 +20,4 @@ export function isRunnerVersionCompatible(value) {
     && supported.stateSchema === Number(value.runner_state_schema_version ?? 1));
 }
 export const MIN_COMPATIBLE_SCHEMA_VERSION = 1;
-export const MAX_COMPATIBLE_SCHEMA_VERSION = 15;
+export const MAX_COMPATIBLE_SCHEMA_VERSION = 16;

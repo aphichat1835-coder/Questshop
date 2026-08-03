@@ -126,6 +126,25 @@ async function renderQuestOperation(pool, projection) {
     .setTimestamp(quest.updated_at)], allowedMentions: noMentions };
 }
 
+async function renderCheckoutAudit(pool, projection) {
+  const session = (await pool.query(`SELECT s.*,
+    (SELECT count(*)::integer FROM checkout_quest_options o WHERE o.session_id=s.id) AS option_count,
+    (SELECT count(*)::integer FROM checkout_quest_options o WHERE o.session_id=s.id AND o.selected) AS selected_count
+    FROM interaction_sessions s WHERE s.id=$1`, [projection.aggregate_id])).rows[0];
+  const profile = session.payload ?? {};
+  const description = [
+    '**Token check:** ผ่าน — Token ถูกเข้ารหัสและไม่บันทึก/แสดงใน Log',
+    `**Quest account:** ${escape(profile.username)} (\`${escape(profile.accountId)}\`)`,
+    `**Quest ที่ซื้อได้:** ${session.option_count}`, `**เลือกแล้ว:** ${session.selected_count}`,
+    `**Session:** ${escape(session.state)}`, `**Trace:** \`${session.trace_id}\``,
+    `**หมดอายุ:** ${timestamp(session.expires_at, 'R')}`,
+  ].join('\n');
+  const embed = new EmbedBuilder().setColor(color.info).setTitle('Checkout • ตรวจ Token')
+    .setDescription(description).setTimestamp(session.created_at);
+  if (profile.avatarUrl) embed.setThumbnail(profile.avatarUrl);
+  return { embeds: [embed], allowedMentions: noMentions };
+}
+
 async function renderManualReview(pool, projection) {
   const review = (await pool.query(`SELECT r.*,
     (SELECT count(*)::integer FROM review_evidence e WHERE e.review_id=r.id) AS evidence_count,
@@ -227,7 +246,8 @@ const renderers = {
   REFUND_LOG: renderRefund, TOPUP_RECEIPT: renderTopupReceipt, ORDER_DM: renderOrderDm,
   PAYMENT_LOG: renderPaymentLog, PAYMENT_STATUS_LOG: renderPaymentLog, QUEST_NEW: renderQuestNew,
   QUEST_OPERATION: renderQuestOperation, MANUAL_REVIEW: renderManualReview, RUNNER_SUMMARY: renderRunnerSummary,
-  SYSTEM_INCIDENT: renderIncident, ADMIN_AUDIT: renderAdminAudit, QUEST_HISTORY: renderQuestHistory,
+  CHECKOUT_AUDIT: renderCheckoutAudit, SYSTEM_INCIDENT: renderIncident, ADMIN_AUDIT: renderAdminAudit,
+  QUEST_HISTORY: renderQuestHistory,
 };
 
 export async function renderProjection(pool, projection, dependencies = {}) {

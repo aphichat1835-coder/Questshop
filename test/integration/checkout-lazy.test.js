@@ -43,9 +43,19 @@ test('large checkout reserves all items but materializes one account job', async
   (error) => error.code === 'NOT_AUTHORIZED');
   await selectAll({ sessionId: created.session.id, actorId: user, guildId: '10000000000000002' }, context('all'), options);
   await buildQuote({ sessionId: created.session.id, actorId: user, guildId: '10000000000000002' }, context('quote'), options);
+  const confirmationTrace = uuidv7();
   const order = await confirmOrder({ sessionId: created.session.id, actorId: user,
-    guildId: '10000000000000002', env }, context('confirm'), options);
+    guildId: '10000000000000002', env }, createContext({ traceId: confirmationTrace,
+    actorType: 'CUSTOMER', actorId: user, guildId: '10000000000000002', idempotencyKey: 'confirm' }), options);
   assert.equal(order.items.length, 5);
+  const persistedSession = (await pool.query('SELECT trace_id FROM interaction_sessions WHERE id=$1', [created.session.id])).rows[0];
+  const persistedOrder = (await pool.query('SELECT trace_id FROM orders WHERE id=$1', [order.orderId])).rows[0];
+  const auditEvent = (await pool.query(`SELECT trace_id FROM outbox_events
+    WHERE aggregate_type='INTERACTION_SESSION' AND aggregate_id=$1`, [created.session.id])).rows[0];
+  assert.equal(persistedSession.trace_id, trace);
+  assert.equal(persistedOrder.trace_id, trace);
+  assert.equal(auditEvent.trace_id, trace);
+  assert.notEqual(persistedOrder.trace_id, confirmationTrace);
   assert.equal(Number((await pool.query('SELECT count(*) AS count FROM runner_jobs')).rows[0].count), 1);
   const wallet = (await pool.query('SELECT * FROM wallets WHERE discord_user_id=$1', [user])).rows[0];
   assert.equal(BigInt(wallet.available_cents), 2_500n);

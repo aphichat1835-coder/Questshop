@@ -36,7 +36,7 @@ contracts, not evidence for a managed production service.
 | 9. TrueMoney Direct and receiver versions | `src/adapters/truemoney`, payments, receiver service and voucher/crash tests | Source-confirmed with pinned fixtures. A real low-value success, ambiguous result and schema-drift test remain mandatory. |
 | 10. Wallet, price and promotion | wallet/ledger/pricing/promotion domains and settlement tests | Source-confirmed. Owner financial pre-launch compensation sign-off remains. |
 | 11. Interaction security and Discord rate limits | opaque component IDs, server sessions, outbox and security tests | Source-confirmed. Actual Discord REST/Gateway behaviour remains. |
-| 12. Correlation and PostgreSQL time | correlation, transition, transaction and PostgreSQL time modules | Source-confirmed. Managed database clock/role observation remains. |
+| 12. Correlation and PostgreSQL time | correlation, transition, transaction, PostgreSQL time modules and durable interaction-session traces | Source-confirmed. Managed database clock/role observation remains. |
 | 13. PostgreSQL production contract | pools, transaction wrapper, migrations, `postgresql-roles.md` | Source-confirmed. Managed PostgreSQL TLS, role grants and backup roles remain. |
 | 14. Startup, shutdown and health | bootstrap, shutdown, health server and worker manager | Source-confirmed. Deployment/restart drill remains. |
 | 15. Permission drift | permission monitor/repair and security tests | Source-confirmed. Real overwrite drift/repair remains. |
@@ -47,7 +47,7 @@ contracts, not evidence for a managed production service.
 | 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. External alert delivery and monthly SLO evidence remain. |
 | 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
 | 22. Development sequence and feature gates | feature-gate config, Admin controls and pre-launch document | Source-confirmed. Owner must enable gates in the required live order. |
-| 23. Definition of Done and acceptance | definition-of-done, traceability and 57 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
+| 23. Definition of Done and acceptance | definition-of-done, traceability and 59 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
 
 ## Technical Blueprint plan
 
