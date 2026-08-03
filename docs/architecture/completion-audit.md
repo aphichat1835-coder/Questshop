@@ -75,7 +75,7 @@ contracts, not evidence for a managed production service.
 | 17. Retention and secrets | keyring, retention/key workers, migrations and coverage tests | Source-confirmed. Live key rotation plus restore test remains. |
 | 18. Backup and restore | encrypted S3 adapter, backup/restore scripts and fake-S3 contract tests | Source-confirmed. The configured database CA is materialized mode `0600` only while `pg_dump`/`pg_restore` run, then removed; an S3 failure terminates an in-flight dump. Real S3 upload and temporary managed-DB restore drill remain. |
 | 19. Deployment, rollback and pre-launch | Docker, CI workflow, pre-launch scripts/docs, an Owner/Admin-only router guard and append-only SHA-bound release evidence | Source-confirmed. Same-SHA deploy, rollback and Owner closeout remain. |
-| 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. External alert delivery and monthly SLO evidence remain. |
+| 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. CI creates a disposable `questshop_loadtest` database and enforces the 200-user/100-order capacity gate. External alert delivery and monthly SLO evidence remain. |
 | 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
 | 22. Development sequence and feature gates | feature-gate config, Admin controls and pre-launch document | Source-confirmed. Owner must enable gates in the required live order. |
 | 23. Definition of Done and acceptance | definition-of-done, traceability and 80 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |

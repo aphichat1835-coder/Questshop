@@ -37,5 +37,10 @@ jobs:
       - run: npm run check
       - run: npm run lint
       - run: npm test
+      - run: >-
+          node --input-type=module -e "import pg from 'pg'; const client = new pg.Client({ connectionString: process.env.TEST_DATABASE_URL }); await client.connect(); await client.query('CREATE DATABASE questshop_loadtest'); await client.end();"
+      - run: npm run load:test
+        env:
+          LOAD_TEST_DATABASE_URL: postgresql://postgres:${{ github.run_id }}_${{ github.run_attempt }}@127.0.0.1:5432/questshop_loadtest
       - run: npm audit --audit-level=high
       - run: docker build -t questshop:${{ github.sha }} .

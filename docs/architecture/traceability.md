@@ -24,7 +24,7 @@ This matrix separates implemented controls from evidence that can only be produc
 | Surface setup permissions | Discord Surface setup, migration `0020_remove_surface_expected_permissions.sql` | reject missing bot access/private-room exposure at install time; no persisted drift snapshot; 403 delivery incidents remain manual | production channel-layout setup test |
 | Health, metrics, SLO alerts, gates | bootstrap health and alert worker | financial invariant and scheduler-lag alerts; authenticated `/statusz` HTTP contract; syntax/lint coverage for duplicate-credit and latency-SLO paths | external alert delivery/monthly uptime observation |
 | Backup, restore, retention, keys | S3 backup stream, drill script, retention/key worker | fake S3/pg_dump upload-verify-decrypt contract with versioned manifest, temporary CA hand-off/cleanup for `pg_dump` and `pg_restore`, dump termination after upload failure, stream code checks and ledger retention test | real S3 backup and temporary-DB restore drill |
-| Deployment, rollback, CI, load | Dockerfile, workflow, scripts, UAT docs | Docker build and fake load test | same-SHA deploy/rollback rehearsal |
+| Deployment, rollback, CI, load | Dockerfile, workflow, scripts, UAT docs | CI Docker build plus disposable 200-user/100-order load test | same-SHA deploy/rollback rehearsal |
 
 Completion labels:
 
