@@ -1,5 +1,8 @@
 # Pre-launch acceptance
 
+Use [`evidence-template.md`](./evidence-template.md) to record every result
+against one exact Git SHA.  Do not record any secret or full voucher URL there.
+
 - Use one production bot/guild/database with all customer gates closed and mark all work `PRELAUNCH`.
 - Run concurrent reserve/capture/release, duplicate voucher, payment crash boundaries, runner lease loss,
   restart recovery, permission drift, Discord 403/404/429/5xx, and DLQ replay on the same Git SHA.
