@@ -405,10 +405,13 @@ function renderBrandingPanel(interaction, runtime) {
 function renderSecretsPanel(interaction, runtime) {
   ownerOnly(interaction, runtime, 'Secret status ใช้ได้เฉพาะ Owner');
   const keys = runtime.env;
+  const backupKeyring = keys.BACKUP_ENCRYPTION_KEYS_JSON;
   const description = [
     `Data encryption key: **v${keys.DATA_ENCRYPTION_KEYS_JSON.current}** (${Object.keys(keys.DATA_ENCRYPTION_KEYS_JSON.keys).length} retained)`,
     `Voucher HMAC key: **v${keys.VOUCHER_HMAC_KEYS_JSON.current}** (${Object.keys(keys.VOUCHER_HMAC_KEYS_JSON.keys).length} retained)`,
-    `Backup key: **v${keys.BACKUP_ENCRYPTION_KEYS_JSON.current}** (${Object.keys(keys.BACKUP_ENCRYPTION_KEYS_JSON.keys).length} retained)`,
+    backupKeyring
+      ? `Backup key: **v${backupKeyring.current}** (${Object.keys(backupKeyring.keys).length} retained)`
+      : 'Backup key: **ไม่ได้ตั้งค่า** (Backup ถูกปิดใน Environment นี้)',
     'ค่าจริงไม่ถูกอ่านกลับหรือแสดงใน Discord และ Rotation ต้องเปลี่ยนผ่าน Environment/Secret manager',
   ].join('\n');
   return interaction.editReply({ embeds: [panelEmbed(0x5865f2, 'Secret / Key version status', description)] });
