@@ -4,6 +4,9 @@ function missingVersions(required, keyring) {
 }
 
 function assertCovered(label, required, keyring) {
+  if (required.length && !keyring) throw Object.assign(new Error(`${label} keyring is not configured`), {
+    code: 'KEYRING_VERSION_MISSING', keyring: label, missingVersions: required,
+  });
   const missing = missingVersions(required, keyring);
   if (missing.length) throw Object.assign(new Error(`${label} keyring is missing required versions: ${missing.join(', ')}`), {
     code: 'KEYRING_VERSION_MISSING', keyring: label, missingVersions: missing,

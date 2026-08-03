@@ -34,6 +34,9 @@ test('startup refuses removal of encryption, voucher HMAC, and backup keys still
     BACKUP_ENCRYPTION_KEYS_JSON: ring([1, 4]) };
   assert.deepEqual(await validateKeyringCoverage(pool, complete), { data: [2], vouchers: [3], backups: [4] });
   await assert.rejects(() => validateKeyringCoverage(pool, { ...complete,
+    BACKUP_ENCRYPTION_KEYS_JSON: undefined }), (error) => error.code === 'KEYRING_VERSION_MISSING'
+      && error.keyring === 'BACKUP_ENCRYPTION');
+  await assert.rejects(() => validateKeyringCoverage(pool, { ...complete,
     VOUCHER_HMAC_KEYS_JSON: ring([1]) }), (error) => error.code === 'KEYRING_VERSION_MISSING'
       && error.keyring === 'VOUCHER_HMAC');
 });
