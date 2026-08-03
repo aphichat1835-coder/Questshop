@@ -3,18 +3,21 @@ import { withTransaction } from '../../db/transaction.js';
 import { ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION } from '../../config/versions.js';
 import { resolvePrice } from '../pricing/resolver.js';
 import { enqueueProjection } from '../outbox/service.js';
-import { recordTransition } from '../shared/transition.js';
+import { assertTransition, recordTransition } from '../shared/transition.js';
 import { evaluateExpiryAdmission } from './expiry.js';
 import { createMonitorTestBatch, hasCurrentTestPass } from './test-gate.js';
+import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS } from './states.js';
 
 async function transitionAnalysis(client, quest, next, context) {
   if (quest.analysis_state === next) return quest;
+  assertTransition(ANALYSIS_TRANSITIONS, quest.analysis_state, next);
   const updated = (await client.query(`
     UPDATE quests SET analysis_state = $2, analysis_version = analysis_version + 1,
       updated_at = transaction_timestamp(),
       first_analysis_at = COALESCE(first_analysis_at, transaction_timestamp())
     WHERE quest_id = $1 AND analysis_version = $3 RETURNING *
   `, [quest.quest_id, next, quest.analysis_version])).rows[0];
+  if (!updated) throw new Error(`Quest analysis state changed concurrently: ${quest.quest_id}`);
   await recordTransition(client, {
     aggregateType: 'QUEST_ANALYSIS', aggregateId: quest.quest_id,
     fromState: quest.analysis_state, toState: next, stateVersion: updated.analysis_version, context,
@@ -37,11 +40,13 @@ async function reconcileSale(client, quest, normalized, context, runnerConcurren
   else if (canSell && ['CLOSED', 'PAUSED'].includes(quest.sale_state)) next = 'OPEN';
   else if (!canSell && quest.sale_state === 'OPEN') next = 'PAUSED';
   if (next === quest.sale_state) return { quest, price, expiry };
+  assertTransition(SALE_TRANSITIONS, quest.sale_state, next);
   const updated = (await client.query(`
     UPDATE quests SET sale_state = $2, sale_version = sale_version + 1,
       updated_at = transaction_timestamp()
     WHERE quest_id = $1 AND sale_version = $3 RETURNING *
   `, [quest.quest_id, next, quest.sale_version])).rows[0];
+  if (!updated) throw new Error(`Quest sale state changed concurrently: ${quest.quest_id}`);
   await recordTransition(client, {
     aggregateType: 'QUEST_SALE', aggregateId: quest.quest_id,
     fromState: quest.sale_state, toState: next, stateVersion: updated.sale_version,
@@ -138,9 +143,11 @@ async function analyzeQuest(client, quest, normalized, context) {
 
 export async function pauseQuestForRetest(client, quest, context) {
   if (quest.sale_state !== 'OPEN') return quest;
+  assertTransition(SALE_TRANSITIONS, quest.sale_state, 'PAUSED');
   const paused = (await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
     updated_at=transaction_timestamp() WHERE quest_id=$1 AND sale_state='OPEN'
       AND sale_version=$2 RETURNING *`, [quest.quest_id, quest.sale_version])).rows[0];
+  if (!paused) throw new Error(`Quest sale state changed during retest pause: ${quest.quest_id}`);
   await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: quest.quest_id,
     fromState: 'OPEN', toState: 'PAUSED', stateVersion: paused.sale_version,
     reasonCode: 'RETEST_REQUIRED', context });

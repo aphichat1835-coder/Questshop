@@ -17,3 +17,7 @@ test('rate-limit recovery is explicit for leased and running jobs', () => {
   assert.ok(RUNNER_JOB_TRANSITIONS.RUNNING.includes('WAITING_RATE_LIMIT'));
   assert.ok(RUNNER_JOB_TRANSITIONS.WAITING_RATE_LIMIT.includes('QUEUED'));
 });
+
+test('queued runner jobs can be moved to manual review without bypassing the graph', () => {
+  assert.ok(RUNNER_JOB_TRANSITIONS.QUEUED.includes('MANUAL_REVIEW'));
+});

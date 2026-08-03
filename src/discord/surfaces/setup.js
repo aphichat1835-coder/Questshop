@@ -58,18 +58,16 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
   else message = await channel.send({ ...body, nonce: `surface-${surfaceKey.toLowerCase()}`, enforceNonce: true });
   await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     await client.query(`
-      INSERT INTO surfaces(surface_key, guild_id, channel_id, message_id, expected_permissions,
+      INSERT INTO surfaces(surface_key, guild_id, channel_id, message_id,
         state, last_validated_at, rendered_config_version)
-      VALUES ($1,$2,$3,$4,$5,'ACTIVE',clock_timestamp(),$6)
+      VALUES ($1,$2,$3,$4,'ACTIVE',clock_timestamp(),$5)
       ON CONFLICT (surface_key) DO UPDATE SET guild_id = EXCLUDED.guild_id,
         channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id,
-        expected_permissions = EXCLUDED.expected_permissions, state = 'ACTIVE',
+        state = 'ACTIVE',
         rendered_config_version = EXCLUDED.rendered_config_version,
         state_version = surfaces.state_version + 1, last_validated_at = clock_timestamp(),
         updated_at = clock_timestamp()
-    `, [surfaceKey, interaction.guildId, channel.id, message.id, {
-      private: PRIVATE.has(surfaceKey), view: true, send: true, embeds: true, history: true,
-    }, Number(config?.version ?? 0)]);
+    `, [surfaceKey, interaction.guildId, channel.id, message.id, Number(config?.version ?? 0)]);
     await appendAdminAudit(client, { action: 'SURFACE_SETUP', targetType: 'SURFACE', targetId: surfaceKey,
       actorId: interaction.user.id, before: existing ?? null,
       after: { channelId: channel.id, messageId: message.id }, reason: 'setup command', context });

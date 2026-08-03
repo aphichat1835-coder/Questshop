@@ -18,9 +18,9 @@
     "load:test": "node scripts/load-test.js",
     "check": "find src scripts test -type f -name '*.js' -print0 | xargs -0 -n1 node --check",
     "lint": "eslint src scripts test",
-    "test": "node --test --test-concurrency=1 test/*/*.test.js",
+    "test": "node scripts/test-files.js",
     "test:unit": "node --test test/unit/*.test.js",
-    "test:integration": "node --test --test-concurrency=1 test/{integration,concurrency,crash}/*.test.js",
+    "test:integration": "node scripts/test-files.js test/integration test/concurrency test/crash",
     "verify": "npm run check && npm run lint && npm test"
   },
   "dependencies": {

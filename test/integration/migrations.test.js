@@ -20,6 +20,9 @@ test('migration runner applies and verifies all checksums idempotently', async (
   const rows = (await pool.query('SELECT version,checksum FROM schema_migrations ORDER BY version')).rows;
   assert.equal(rows.length, MAX_COMPATIBLE_SCHEMA_VERSION);
   assert.ok(rows.every((row) => /^[a-f0-9]{64}$/.test(row.checksum)));
+  const permissionSnapshot = await pool.query(`SELECT 1 FROM information_schema.columns
+    WHERE table_schema='public' AND table_name='surfaces' AND column_name='expected_permissions'`);
+  assert.equal(permissionSnapshot.rowCount, 0);
 
   await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state)
     VALUES('LOG_SYSTEM','guild','channel','message','DRIFTED')

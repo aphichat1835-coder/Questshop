@@ -10,8 +10,9 @@ import { ingestDiscovery } from '../domain/catalog/service.js';
 import { secureJitter } from '../shared/random.js';
 import { withTransaction } from '../db/transaction.js';
 import { RUNNER_VERSION_COMPATIBILITY } from '../config/versions.js';
-import { recordTransition } from '../domain/shared/transition.js';
+import { assertTransition, recordTransition } from '../domain/shared/transition.js';
 import { advanceMonitorTestBatch, markMonitorTestBatchPassed } from '../domain/catalog/test-gate.js';
+import { TEST_TRANSITIONS, SALE_TRANSITIONS } from '../domain/catalog/states.js';
 
 export async function acquireTestRun({ holder, pool }) {
   const engineVersions = RUNNER_VERSION_COMPATIBILITY.map((item) => item.engine);
@@ -73,6 +74,7 @@ export async function renewQuestTestLease(run, options = {}) {
 
 async function updateOwned(pool, run, sql, params, nextState, reasonCode, context) {
   return withTransaction({ pool, isolation: 'READ COMMITTED' }, async (client) => {
+    assertTransition(TEST_TRANSITIONS, 'TESTING', nextState);
     const row = (await client.query(`${sql} AND id=$1 AND state='TESTING' AND lease_owner=$2
       AND fencing_token=$3 AND lease_expires_at>clock_timestamp() RETURNING *`,
     [run.id, run.lease_owner, run.fencing_token, ...params])).rows[0];
@@ -270,6 +272,7 @@ async function pauseQuestForTestFailure(pool, run, error, context) {
     && ['TEST_CONTRACT_UNSUPPORTED', 'TEST_MUTATION_NOT_VERIFIED', 'TEST_COMPLETION_NOT_VERIFIED'].includes(error.code);
   if (!globalFailure) return;
   await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
+    assertTransition(SALE_TRANSITIONS, 'OPEN', 'PAUSED');
     const quest = (await client.query(`UPDATE quests SET sale_state='PAUSED',
       sale_version=sale_version+1,updated_at=clock_timestamp()
       WHERE quest_id=$1 AND sale_state='OPEN' RETURNING *`, [run.quest_id])).rows[0];

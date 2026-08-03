@@ -2,9 +2,13 @@ import { v7 as uuidv7 } from 'uuid';
 import { withTransaction } from '../../db/transaction.js';
 import { AuthorizationError, StaleStateError } from '../../shared/errors.js';
 import { enqueueProjection } from '../outbox/service.js';
-import { recordTransition } from '../shared/transition.js';
+import { assertTransition, recordTransition } from '../shared/transition.js';
 import { appendAdminAudit } from '../admin/audit.js';
 import { redact } from '../../shared/redaction.js';
+import { REVIEW_TRANSITIONS } from './states.js';
+import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
+import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
+import { TOPUP_TRANSITIONS } from '../payments/states.js';
 import {
   captureReservationInTransaction,
   creditRedeemedTopupInTransaction,
@@ -39,6 +43,7 @@ export async function openReview(client, {
 
 export async function assignReview({ reviewId, assigneeId, expectedVersion }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    assertTransition(REVIEW_TRANSITIONS, 'OPEN', 'ASSIGNED');
     const updated = (await client.query(`
       UPDATE manual_reviews
       SET state = 'ASSIGNED', assigned_to = $2, state_version = state_version + 1
@@ -64,9 +69,11 @@ export async function addEvidence({ reviewId, evidenceType, payload }, context, 
     )).rows[0];
     if (!review || review.state === 'RESOLVED') throw new StaleStateError('manual_review', reviewId);
     if (review.state === 'OPEN') {
+      assertTransition(REVIEW_TRANSITIONS, review.state, 'ASSIGNED');
       const assigned = (await client.query(`UPDATE manual_reviews SET state='ASSIGNED',assigned_to=$2,
         state_version=state_version+1 WHERE id=$1 AND state='OPEN' AND state_version=$3 RETURNING *`,
       [reviewId, context.actorId, review.state_version])).rows[0];
+      if (!assigned) throw new StaleStateError('manual_review', reviewId);
       await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
         fromState: 'OPEN', toState: 'ASSIGNED', stateVersion: assigned.state_version, context });
       review = assigned;
@@ -81,9 +88,11 @@ export async function addEvidence({ reviewId, evidenceType, payload }, context, 
         after: { evidenceType }, reason: 'review evidence added', context });
       return review;
     }
+    assertTransition(REVIEW_TRANSITIONS, review.state, 'EVIDENCE_PENDING');
     const pending = (await client.query(`UPDATE manual_reviews SET state='EVIDENCE_PENDING',
       state_version=state_version+1 WHERE id=$1 AND state='ASSIGNED' AND state_version=$2 RETURNING *`,
     [reviewId, review.state_version])).rows[0];
+    if (!pending) throw new StaleStateError('manual_review', reviewId);
     await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
       fromState: 'ASSIGNED', toState: 'EVIDENCE_PENDING', stateVersion: pending.state_version, context });
     await appendAdminAudit(client, { action: 'MANUAL_REVIEW_EVIDENCE_ADDED', targetType: 'MANUAL_REVIEW',
@@ -112,9 +121,11 @@ export async function resolveReview({
     }
     if (review.owner_only && !isOwner) throw new AuthorizationError('รายการนี้ให้ Owner ตัดสินเท่านั้น');
     if (review.state === 'OPEN') {
+      assertTransition(REVIEW_TRANSITIONS, review.state, 'ASSIGNED');
       const assigned = (await client.query(`UPDATE manual_reviews SET state='ASSIGNED',assigned_to=$2,
         state_version=state_version+1 WHERE id=$1 AND state='OPEN' AND state_version=$3 RETURNING *`,
       [reviewId, context.actorId, review.state_version])).rows[0];
+      if (!assigned) throw new StaleStateError('manual_review', reviewId);
       await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
         fromState: 'OPEN', toState: 'ASSIGNED', stateVersion: assigned.state_version, context });
       review = assigned;
@@ -123,22 +134,27 @@ export async function resolveReview({
       payload,actor_type,actor_id,trace_id) VALUES($1,$2,'DECISION_INPUT',$3,$4,$5,$6)`,
     [uuidv7(), reviewId, redact(decisionEvidence), context.actorType, context.actorId, context.traceId]);
     if (review.state === 'ASSIGNED') {
+      assertTransition(REVIEW_TRANSITIONS, review.state, 'EVIDENCE_PENDING');
       const pending = (await client.query(`UPDATE manual_reviews SET state='EVIDENCE_PENDING',
         state_version=state_version+1 WHERE id=$1 AND state='ASSIGNED' AND state_version=$2 RETURNING *`,
       [reviewId, review.state_version])).rows[0];
+      if (!pending) throw new StaleStateError('manual_review', reviewId);
       await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
         fromState: 'ASSIGNED', toState: 'EVIDENCE_PENDING', stateVersion: pending.state_version, context });
       review = pending;
     }
     if (review.state === 'EVIDENCE_PENDING') {
+      assertTransition(REVIEW_TRANSITIONS, review.state, 'DECISION_READY');
       const ready = (await client.query(`UPDATE manual_reviews SET state='DECISION_READY',
         state_version=state_version+1 WHERE id=$1 AND state='EVIDENCE_PENDING' AND state_version=$2 RETURNING *`,
       [reviewId, review.state_version])).rows[0];
+      if (!ready) throw new StaleStateError('manual_review', reviewId);
       await recordTransition(client, { aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
         fromState: 'EVIDENCE_PENDING', toState: 'DECISION_READY', stateVersion: ready.state_version, context });
       review = ready;
     }
     if (review.state !== 'DECISION_READY') throw new StaleStateError('manual_review', reviewId);
+    assertTransition(REVIEW_TRANSITIONS, review.state, 'RESOLVED');
     const applied = await applyDecision(client, review);
     await client.query(`
       INSERT INTO review_decisions(id, review_id, decision, reason, actor_id, trace_id)
@@ -146,8 +162,10 @@ export async function resolveReview({
     `, [uuidv7(), reviewId, decision, reason, context.actorId, context.traceId]);
     const updated = (await client.query(`
       UPDATE manual_reviews SET state = 'RESOLVED', state_version = state_version + 1,
-        resolved_at = transaction_timestamp() WHERE id = $1 RETURNING *
-    `, [reviewId])).rows[0];
+        resolved_at = transaction_timestamp() WHERE id = $1 AND state='DECISION_READY'
+        AND state_version=$2 RETURNING *
+    `, [reviewId, review.state_version])).rows[0];
+    if (!updated) throw new StaleStateError('manual_review', reviewId);
     await recordTransition(client, {
       aggregateType: 'MANUAL_REVIEW', aggregateId: reviewId,
       fromState: review.state, toState: 'RESOLVED', stateVersion: updated.state_version,
@@ -168,9 +186,11 @@ async function applyTopupDecision(client, review, decision, input, context) {
     [review.subject_id])).rows[0];
   if (topup?.status !== 'MANUAL_REVIEW') throw new StaleStateError('topup', review.subject_id);
   if (decision === 'REJECT') {
+    assertTransition(TOPUP_TRANSITIONS, topup.status, 'REJECTED');
     const updated = (await client.query(`UPDATE topups SET status='REJECTED',state_version=state_version+1,
       failure_code=$2,updated_at=transaction_timestamp() WHERE id=$1 AND status='MANUAL_REVIEW' RETURNING *`,
     [topup.id, input.reason])).rows[0];
+    if (!updated) throw new StaleStateError('topup', topup.id);
     await recordTransition(client, { aggregateType: 'TOPUP', aggregateId: topup.id,
       fromState: 'MANUAL_REVIEW', toState: 'REJECTED', stateVersion: updated.state_version,
       reasonCode: 'OWNER_REJECTED', context });
@@ -184,11 +204,13 @@ async function applyTopupDecision(client, review, decision, input, context) {
   if (amount <= 0n || !input.providerTransactionId?.trim()) {
     throw new TypeError('confirmed amount and provider transaction id are required');
   }
+  assertTransition(TOPUP_TRANSITIONS, topup.status, 'REDEEMED');
   const redeemed = (await client.query(`UPDATE topups SET status='REDEEMED',state_version=state_version+1,
     amount_cents=$2,currency='THB',provider_transaction_id=$3,redeemed_at=transaction_timestamp(),
     failure_code=NULL,updated_at=transaction_timestamp()
     WHERE id=$1 AND status='MANUAL_REVIEW' RETURNING *`,
   [topup.id, amount, input.providerTransactionId.trim()])).rows[0];
+  if (!redeemed) throw new StaleStateError('topup', topup.id);
   await recordTransition(client, { aggregateType: 'TOPUP', aggregateId: topup.id,
     fromState: 'MANUAL_REVIEW', toState: 'REDEEMED', stateVersion: redeemed.state_version,
     reasonCode: 'OWNER_CONFIRMED_REDEEMED', context });
@@ -203,13 +225,25 @@ async function applyOrderItemDecision(client, review, decision, input, context) 
   [review.subject_id])).rows[0];
   if (item?.state !== 'MANUAL_REVIEW') throw new StaleStateError('order_item', review.subject_id);
   if (decision === 'RETRY') {
+    assertTransition(ORDER_ITEM_TRANSITIONS, item.state, 'QUEUED');
     const updated = (await client.query(`UPDATE order_items SET state='QUEUED',state_version=state_version+1,
-      updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' RETURNING *`,
-    [item.id])).rows[0];
-    const job = (await client.query(`UPDATE runner_jobs SET state='QUEUED',state_version=state_version+1,
-      available_at=clock_timestamp(),lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-      WHERE order_item_id=$1 AND state='MANUAL_REVIEW' RETURNING id`, [item.id])).rows[0];
-    if (!job) throw new StaleStateError('runner_job', item.id);
+      updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
+    [item.id, item.state_version])).rows[0];
+    if (!updated) throw new StaleStateError('order_item', item.id);
+    const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [item.id])).rows;
+    const retryJobs = jobs.filter((job) => job.state === 'MANUAL_REVIEW');
+    if (!retryJobs.length) throw new StaleStateError('runner_job', item.id);
+    for (const job of retryJobs) {
+      assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'QUEUED');
+      const updatedJob = (await client.query(`UPDATE runner_jobs SET state='QUEUED',state_version=state_version+1,
+        available_at=clock_timestamp(),lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+        WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
+      [job.id, job.state_version])).rows[0];
+      if (!updatedJob) throw new StaleStateError('runner_job', job.id);
+      await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+        fromState: job.state, toState: 'QUEUED', stateVersion: updatedJob.state_version,
+        reasonCode: 'ADMIN_RETRY', context });
+    }
     await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
       fromState: 'MANUAL_REVIEW', toState: 'QUEUED', stateVersion: updated.state_version,
       reasonCode: 'ADMIN_RETRY', context });
@@ -219,27 +253,60 @@ async function applyOrderItemDecision(client, review, decision, input, context) 
     return { orderItemId: item.id, status: updated.state };
   }
   if (decision === 'CAPTURE') {
+    assertTransition(ORDER_ITEM_TRANSITIONS, item.state, 'SETTLING');
     const settling = (await client.query(`UPDATE order_items SET state='SETTLING',state_version=state_version+1,
-      updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' RETURNING *`,
-    [item.id])).rows[0];
-    await client.query(`UPDATE runner_jobs SET state='SETTLING',state_version=state_version+1,
-      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-      WHERE order_item_id=$1 AND state='MANUAL_REVIEW'`, [item.id]);
+      updated_at=transaction_timestamp() WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
+    [item.id, item.state_version])).rows[0];
+    if (!settling) throw new StaleStateError('order_item', item.id);
+    const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [item.id])).rows;
+    const settlingJobs = jobs.filter((job) => job.state === 'MANUAL_REVIEW');
+    if (!settlingJobs.length) throw new StaleStateError('runner_job', item.id);
+    for (const job of settlingJobs) {
+      assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'SETTLING');
+      const updatedJob = (await client.query(`UPDATE runner_jobs SET state='SETTLING',state_version=state_version+1,
+        lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+        WHERE id=$1 AND state='MANUAL_REVIEW' AND state_version=$2 RETURNING *`,
+      [job.id, job.state_version])).rows[0];
+      if (!updatedJob) throw new StaleStateError('runner_job', job.id);
+      await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+        fromState: job.state, toState: 'SETTLING', stateVersion: updatedJob.state_version,
+        reasonCode: 'ADMIN_CAPTURE', context });
+    }
     await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
       fromState: 'MANUAL_REVIEW', toState: 'SETTLING', stateVersion: settling.state_version,
       reasonCode: 'ADMIN_CAPTURE', context });
     const captured = await captureReservationInTransaction(client,
       { orderItemId: item.id, claimUrl: input.claimUrl ?? item.claim_url ?? item.quest_url }, context);
-    await client.query(`UPDATE runner_jobs SET state='COMPLETED',state_version=state_version+1,
-      updated_at=clock_timestamp() WHERE order_item_id=$1`, [item.id]);
+    for (const job of settlingJobs) {
+      assertTransition(RUNNER_JOB_TRANSITIONS, 'SETTLING', 'COMPLETED');
+      const completedJob = (await client.query(`UPDATE runner_jobs SET state='COMPLETED',state_version=state_version+1,
+        updated_at=clock_timestamp() WHERE id=$1 AND state='SETTLING' AND state_version=$2 RETURNING *`,
+      [job.id, Number(job.state_version) + 1])).rows[0];
+      if (!completedJob) throw new StaleStateError('runner_job', job.id);
+      await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+        fromState: 'SETTLING', toState: 'COMPLETED', stateVersion: completedJob.state_version,
+        reasonCode: 'ADMIN_CAPTURE', context });
+    }
     return { orderItemId: item.id, status: captured.state };
   }
   const terminalState = ORDER_RELEASE_DECISIONS[decision];
   if (!terminalState) throw new TypeError('invalid order-item review decision');
+  assertTransition(ORDER_ITEM_TRANSITIONS, item.state, terminalState);
   const released = await releaseReservationInTransaction(client, { orderItemId: item.id,
     terminalState, reason: input.reason }, context);
-  await client.query(`UPDATE runner_jobs SET state='FAILED',state_version=state_version+1,
-    lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE order_item_id=$1`, [item.id]);
+  const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [item.id])).rows;
+  for (const job of jobs) {
+    if (['COMPLETED', 'FAILED'].includes(job.state)) continue;
+    assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'FAILED');
+    const failedJob = (await client.query(`UPDATE runner_jobs SET state='FAILED',state_version=state_version+1,
+      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+      WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+    [job.id, job.state, job.state_version])).rows[0];
+    if (!failedJob) throw new StaleStateError('runner_job', job.id);
+    await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+      fromState: job.state, toState: 'FAILED', stateVersion: failedJob.state_version,
+      reasonCode: input.reason, context });
+  }
   return { orderItemId: item.id, status: released.state };
 }
 

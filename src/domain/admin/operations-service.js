@@ -8,6 +8,7 @@ import { enqueueProjection } from '../outbox/service.js';
 import { openReview } from '../reviews/service.js';
 import { assertTransition, recordTransition } from '../shared/transition.js';
 import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
+import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
 import { appendAdminAudit } from './audit.js';
 
 export async function setQuestSaleState({ questId, nextState, runnerConcurrency = 3,
@@ -72,6 +73,7 @@ export async function forcePublishFailedMonitorTest({ alertId, reason }, context
     if (quest.analysis_state !== 'SUPPORTED' || !quest.executor_id || !price || !expiry.eligible) {
       throw new QuestshopError('QUEST_NOT_SALE_ELIGIBLE', 'Quest ยังมีข้อมูล ราคา หรือเวลาคงเหลือไม่พอสำหรับเปิดขาย');
     }
+    if (quest.sale_state !== 'OPEN') assertTransition(SALE_TRANSITIONS, quest.sale_state, 'OPEN');
     const updatedQuest = (await client.query(`UPDATE quests SET public_test_gate_override=true,
       public_test_gate_override_by=$2,public_test_gate_override_at=clock_timestamp(),
       public_test_gate_override_reason=$3,sale_state='OPEN',sale_version=sale_version+1,
@@ -115,9 +117,20 @@ export async function openOrderItemReview({ orderItemId, reason, ownerOnly = fal
       const updated = (await client.query(`UPDATE order_items SET state='MANUAL_REVIEW',
         state_version=state_version+1,updated_at=transaction_timestamp()
         WHERE id=$1 AND state_version=$2 RETURNING *`, [orderItemId, item.state_version])).rows[0];
-      await client.query(`UPDATE runner_jobs SET state='MANUAL_REVIEW',state_version=state_version+1,
-        lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-        WHERE order_item_id=$1 AND state NOT IN ('COMPLETED','FAILED')`, [orderItemId]);
+      if (!updated) throw new QuestshopError('STALE_STATE', `Order item ${orderItemId} changed during review`);
+      const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [orderItemId])).rows;
+      for (const job of jobs) {
+        if (['COMPLETED', 'FAILED', 'MANUAL_REVIEW'].includes(job.state)) continue;
+        assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'MANUAL_REVIEW');
+        const updatedJob = (await client.query(`UPDATE runner_jobs SET state='MANUAL_REVIEW',
+          state_version=state_version+1,lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+          WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+        [job.id, job.state, job.state_version])).rows[0];
+        if (!updatedJob) throw new QuestshopError('STALE_STATE', `Runner job ${job.id} changed during review`);
+        await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+          fromState: job.state, toState: 'MANUAL_REVIEW', stateVersion: updatedJob.state_version,
+          reasonCode: 'ADMIN_REVIEW', context });
+      }
       await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: orderItemId,
         fromState: item.state, toState: 'MANUAL_REVIEW', stateVersion: updated.state_version,
         reasonCode: 'ADMIN_REVIEW', context });

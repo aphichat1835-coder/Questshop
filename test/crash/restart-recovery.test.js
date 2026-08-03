@@ -105,6 +105,42 @@ test('restart recovery requeues an expired Runner lease with Job and Item transi
   ]);
 });
 
+test('restart recovery checkpoints a crashed running Runner into bounded retry', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const trace = uuidv7(); const rule = uuidv7(); const order = uuidv7(); const item = uuidv7(); const job = uuidv7();
+  await pool.query(`INSERT INTO price_rules(id,rule_type,amount_cents,config_version,actor_id,trace_id)
+    VALUES($1,'DEFAULT',500,1,'owner',$2)`, [rule, trace]);
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,sale_state,name,task_type,task_target,url,expires_at)
+    VALUES('crashed-running-recovery','SUPPORTED','OPEN','Crashed Running Recovery','WATCH_VIDEO',60,
+      'https://discord.com/quests/crashed-running-recovery',clock_timestamp()+interval '1 day')`);
+  await pool.query(`INSERT INTO orders(id,discord_user_id,account_id,trace_id)
+    VALUES($1,'crashed-running-user','crashed-running-account',$2)`, [order, trace]);
+  await pool.query(`INSERT INTO order_items(id,order_id,sequence_number,quest_id,quest_name,task_type,
+    price_cents,price_rule_id,config_version,metadata_revision,engine_version,executor_version,
+    contract_version,runner_state_schema_version,state,deadline_at)
+    VALUES($1,$2,1,'crashed-running-recovery','Crashed Running Recovery','WATCH_VIDEO',500,$3,1,1,'1','1','1',1,
+      'RUNNING',clock_timestamp()+interval '1 day')`, [item, order, rule]);
+  await pool.query(`INSERT INTO runner_jobs(id,order_item_id,discord_user_id,account_id,state,lease_owner,
+    lease_expires_at,fencing_token,deadline_at,engine_version,executor_version,contract_version,
+    runner_state_schema_version,trace_id)
+    VALUES($1,$2,'crashed-running-user','crashed-running-account','RUNNING',$3,
+      clock_timestamp()-interval '1 second',1,clock_timestamp()+interval '1 day','1','1','1',1,$4)`,
+  [job, item, uuidv7(), trace]);
+  const guild = { members: { fetchMe: async () => ({ id: 'bot' }) }, roles: { everyone: { id: 'everyone' } } };
+  const client = { questshop: {}, guilds: { fetch: async () => guild } };
+  await runMaintenance({ env: { DISCORD_GUILD_ID: '10000000000000002', RUNNER_CONCURRENCY: 3 },
+    holder: 'crashed-running-recovery-test', client, pool });
+  const recoveredJob = (await pool.query('SELECT state,available_at FROM runner_jobs WHERE id=$1', [job])).rows[0];
+  assert.equal(recoveredJob.state, 'WAITING_RETRY');
+  assert.ok(new Date(recoveredJob.available_at).getTime() > Date.now());
+  assert.equal((await pool.query('SELECT state FROM order_items WHERE id=$1', [item])).rows[0].state, 'WAITING_RETRY');
+  assert.deepEqual((await pool.query(`SELECT aggregate_type,from_state,to_state FROM state_transitions
+    WHERE aggregate_id=ANY($1::text[]) ORDER BY aggregate_type`, [[job, item]])).rows, [
+    { aggregate_type: 'ORDER_ITEM', from_state: 'RUNNING', to_state: 'WAITING_RETRY' },
+    { aggregate_type: 'RUNNER_JOB', from_state: 'RUNNING', to_state: 'WAITING_RETRY' },
+  ]);
+});
+
 test('restart recovery requeues a rate-limited Runner job after Retry-After', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7(); const rule = uuidv7(); const order = uuidv7(); const item = uuidv7(); const job = uuidv7();
