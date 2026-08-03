@@ -543,7 +543,8 @@ export async function authorizeRoute(interaction, route, runtime) {
     throw new QuestshopError('PRELAUNCH_RESTRICTED', 'ช่วงทดสอบ Pre-launch ใช้ได้เฉพาะ Owner/Admin');
   }
   if (interaction.isButton() && ['start', 'topup'].includes(route.route)) {
-    await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'BUTTON' }, contextFor(interaction, 'button_rate'));
+    await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'BUTTON' },
+      contextFor(interaction, 'button_rate'), { pool: runtime.pool });
   }
   const gates = Object.fromEntries((await runtime.pool.query('SELECT gate, enabled FROM feature_gates')).rows.map((row) => [row.gate, row.enabled]));
   if (backofficeRoute && !isBackoffice(interaction, runtime)) throw new QuestshopError('ADMIN_ONLY', 'เมนูนี้ใช้ได้เฉพาะ Owner/Admin');
@@ -613,7 +614,7 @@ if (route.route === 'voucher_submit' && interaction.isModalSubmit()) {
   } catch (error) {
     if (['INVALID_VOUCHER_URL','INVALID_VOUCHER_CODE'].includes(error.code)) {
       await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'VOUCHER_INVALID' },
-        contextFor(interaction, 'voucher_invalid'));
+        contextFor(interaction, 'voucher_invalid'), { pool: runtime.pool });
     }
     throw error;
   }
@@ -627,7 +628,8 @@ if (route.route === 'token_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
   const entry = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOKEN_ENTRY' }, contextFor(interaction, 'token_entry_load'), { pool: runtime.pool });
-  await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'TOKEN_VALIDATE' }, contextFor(interaction, 'token_rate'));
+  await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'TOKEN_VALIDATE' },
+    contextFor(interaction, 'token_rate'), { pool: runtime.pool });
   const created = await createSession({ discordUserId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null,
     token: interaction.fields.getTextInputValue('token'), env: runtime.env,
@@ -706,7 +708,8 @@ if (route.route === 'quest_quote') {
 async function handleQuestConfirm({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'quest_confirm') {
   await interaction.deferUpdate();
-  await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'ORDER_CONFIRM' }, contextFor(interaction, 'confirm_rate'));
+  await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'ORDER_CONFIRM' },
+    contextFor(interaction, 'confirm_rate'), { pool: runtime.pool });
   const order = await confirmOrder({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId,
     messageId: interaction.message?.id ?? null,

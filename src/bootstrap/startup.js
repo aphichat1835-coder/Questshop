@@ -48,7 +48,7 @@ export async function startup({ health = createHealthState(), server: existingSe
       } else health.checks.preMigrationBackup = backupEnabled
         ? 'NO_PENDING_MIGRATION' : 'DISABLED_BY_CONFIG';
     } else health.checks.preMigrationBackup = 'FIRST_INSTALL_NOT_APPLICABLE';
-    await runMigrations({ gitSha: env.GIT_SHA,
+    await runMigrations({ pool: directPool, gitSha: env.GIT_SHA,
       runtimeRole: decodeURIComponent(new URL(env.DATABASE_POOL_URL).username) });
     if (preMigrationBackup) {
       await directPool.query(`INSERT INTO backup_runs(id,backup_type,state,object_key,checksum,size_bytes,schema_version,
@@ -67,7 +67,7 @@ export async function startup({ health = createHealthState(), server: existingSe
     health.checks.runtimeRole = roleContract.violations.length ? 'DEGRADED' : 'OK';
     health.checks.database = 'OK';
     const holder = uuidv7();
-    let runtimeLease = await acquireLease({ resourceType: 'RUNTIME', resourceId: env.DISCORD_GUILD_ID, holder, ttlSeconds: 60 });
+    let runtimeLease = await acquireLease({ resourceType: 'RUNTIME', resourceId: env.DISCORD_GUILD_ID, holder, ttlSeconds: 60 }, { pool });
     if (!runtimeLease) throw new Error('Another Questshop runtime holds the production guild lease');
     health.checks.runtimeLease = 'OK';
     const config = await loadRuntimeConfig(pool);
@@ -96,7 +96,7 @@ export async function startup({ health = createHealthState(), server: existingSe
         if (abortController.signal.aborted) break;
         try {
         runtimeLease = await renewLease({ resourceType: 'RUNTIME', resourceId: env.DISCORD_GUILD_ID,
-          holder, fencingToken: runtimeLease.fencing_token, ttlSeconds: 60 });
+          holder, fencingToken: runtimeLease.fencing_token, ttlSeconds: 60 }, { pool });
         } catch (error) {
           health.ready = false; health.status = 'INCIDENT'; health.lastError = error;
           abortController.abort(error);

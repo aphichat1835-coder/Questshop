@@ -32,6 +32,12 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
   }
   if (PRIVATE.has(surfaceKey)) {
     const adminRoleId = config?.values?.adminRoleId;
+    if (adminRoleId) {
+      const adminRole = interaction.guild.roles.cache.get(adminRoleId);
+      if (!adminRole || !channel.permissionsFor(adminRole)?.has('ViewChannel')) {
+        throw new QuestshopError('PRIVATE_SURFACE_ADMIN_ROLE_MISSING', 'Admin Role ไม่มีสิทธิ์ดูห้องหลังบ้าน');
+      }
+    }
     const expected = new Set([interaction.guild.roles.everyone.id, member.id, interaction.client.user.id,
       interaction.guild.ownerId, ...(adminRoleId ? [adminRoleId] : []), ...member.roles?.cache?.keys?.() ?? []]);
     const unexpectedRole = [...interaction.guild.roles.cache.values()].find((role) =>

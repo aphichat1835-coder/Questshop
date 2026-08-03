@@ -11,3 +11,9 @@ test('runner terminal states have no transitions', () => {
   assert.deepEqual(RUNNER_JOB_TRANSITIONS.COMPLETED, []);
   assert.deepEqual(RUNNER_JOB_TRANSITIONS.FAILED, []);
 });
+
+test('rate-limit recovery is explicit for leased and running jobs', () => {
+  assert.ok(RUNNER_JOB_TRANSITIONS.LEASED.includes('WAITING_RATE_LIMIT'));
+  assert.ok(RUNNER_JOB_TRANSITIONS.RUNNING.includes('WAITING_RATE_LIMIT'));
+  assert.ok(RUNNER_JOB_TRANSITIONS.WAITING_RATE_LIMIT.includes('QUEUED'));
+});

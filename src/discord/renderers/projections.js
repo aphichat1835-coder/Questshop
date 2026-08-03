@@ -134,10 +134,12 @@ async function renderQuestNew(pool, projection) {
       ORDER BY CASE p.rule_type WHEN 'TEMPORARY' THEN 1 WHEN 'QUEST' THEN 2 WHEN 'TYPE' THEN 3 ELSE 4 END,
         p.priority DESC,p.created_at DESC LIMIT 1) resolved ON true WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
   const price = quest.price_cents == null ? 'ยังไม่กำหนด' : baht(quest.price_cents);
+  const saleStatus = quest.sale_state === 'OPEN' ? 'เปิดขาย' : quest.sale_state === 'PAUSED'
+    ? 'พักขายชั่วคราว' : quest.sale_state === 'EXPIRED' ? 'หมดอายุ' : 'ประกาศแล้วแต่ยังไม่เปิดขายทั่วไป';
   const description = [
     `**Quest ID:** \`${escape(quest.quest_id)}\``, `**ประเภท:** ${escape(quest.task_type)}`,
     `**เป้าหมาย:** ${escape(quest.task_target)}`, `**Orbs:** ${quest.orbs ?? 'ไม่ระบุ'}`,
-    `**ราคา:** ${price}`,
+    `**ราคา:** ${price}`, `**สถานะการรับงาน:** ${saleStatus}`,
     `**ตรวจพบ:** ${timestamp(quest.detected_at)}`, `**อัปเดต:** ${timestamp(quest.updated_at, 'R')}`,
     `**หมดอายุ:** ${timestamp(quest.expires_at)}`,
   ].join('\n');

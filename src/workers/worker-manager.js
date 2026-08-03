@@ -2,7 +2,9 @@ import { v7 as uuidv7 } from 'uuid';
 import { runWorkerLoop } from './loop.js';
 import { processPayment } from './payment-worker.js';
 import { processOutbox } from './outbox-worker.js';
-import { acquireRunnableJob, processRunnerJob, renewRunnerJob } from '../domain/runner/service.js';
+import {
+  acquireRunnableJob, processRunnerJob, renewRunnerJob, requeueDueRunnerJobs,
+} from '../domain/runner/service.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { runMaintenance } from './maintenance-worker.js';
 import { createContext } from '../shared/correlation.js';
@@ -78,7 +80,8 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
         if (index >= effectiveConcurrency) return false;
         const acquisitionContext = createContext({ actorType: 'SYSTEM', actorId: holder,
           guildId: env.DISCORD_GUILD_ID, idempotencyKey: `runner-acquire:${uuidv7()}` });
-        const job = await acquireRunnableJob({ holder }, acquisitionContext);
+        await requeueDueRunnerJobs(acquisitionContext, { pool });
+        const job = await acquireRunnableJob({ holder }, acquisitionContext, { pool });
         if (!job) return false;
         const leaseAbort = new AbortController();
         const jobSignal = AbortSignal.any([signal, leaseAbort.signal]);
@@ -86,11 +89,15 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
           while (!jobSignal.aborted) {
             await delay(15_000, undefined, { signal: jobSignal, ref: false });
             if (jobSignal.aborted) break;
-            try { await renewRunnerJob(job, 60); }
+            try { await renewRunnerJob(job, 60, { pool }); }
             catch (error) { leaseAbort.abort(error); break; }
           }
         })().catch(() => {});
-        try { await processRunnerJob(job, { env: { ...env, RUNNER_CONCURRENCY: effectiveConcurrency }, signal: jobSignal }); }
+        try {
+          await processRunnerJob(job, {
+            env: { ...env, RUNNER_CONCURRENCY: effectiveConcurrency }, signal: jobSignal, options: { pool },
+          });
+        }
         finally { leaseAbort.abort('runner finished'); await heartbeat; }
         return true;
       }, 250);

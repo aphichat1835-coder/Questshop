@@ -11,7 +11,8 @@ import { selectQuestExecutor } from '../../quest-engine/executors/registry.js';
 import { evaluateExpiryAdmission } from '../catalog/expiry.js';
 import { enqueueProjection } from '../outbox/service.js';
 import { openReview } from '../reviews/service.js';
-import { recordTransition } from '../shared/transition.js';
+import { assertTransition, recordTransition } from '../shared/transition.js';
+import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
 import { captureReservation, releaseReservation } from '../wallet/service.js';
 import { progressBucket, RUNNER_JOB_TRANSITIONS } from './states.js';
 import { isRunnerVersionCompatible, RUNNER_VERSION_COMPATIBILITY } from '../../config/versions.js';
@@ -46,35 +47,67 @@ function retryStateForRunnerJob(state) {
   return 'MANUAL_REVIEW';
 }
 
-async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_SHUTDOWN_CHECKPOINT') {
+function retryAfterMs(error) {
+  const raw = Number(error?.data?.retry_after ?? error?.retryAfter ?? error?.retry_after);
+  if (!Number.isFinite(raw) || raw < 0) return null;
+  return raw > 1_000 ? raw : raw * 1_000;
+}
+
+async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_SHUTDOWN_CHECKPOINT', {
+  stateOverride = null, delayMs = null,
+} = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const current = (await client.query(`SELECT * FROM runner_jobs WHERE id=$1 AND lease_owner=$2
       AND fencing_token=$3 AND lease_expires_at>clock_timestamp() FOR UPDATE`,
     [job.id, job.lease_owner, job.fencing_token])).rows[0];
     if (!current) throw new FencingLostError(`runner:${job.id}`);
-    const next = retryStateForRunnerJob(current.state);
+    const item = (await client.query('SELECT * FROM order_items WHERE id=$1 FOR UPDATE',
+      [current.order_item_id])).rows[0];
+    const itemFinal = ['READY_TO_CLAIM', 'EXPIRED_RELEASED', 'EXTERNAL_COMPLETED_RELEASED',
+      'STOPPED_RELEASED', 'FAILED_RELEASED', 'MANUAL_REVIEW'].includes(item?.state);
+    if (itemFinal) {
+      const terminalJobState = item.state === 'READY_TO_CLAIM' ? 'COMPLETED'
+        : item.state === 'MANUAL_REVIEW' ? 'MANUAL_REVIEW' : 'FAILED';
+      assertJobTransition(current.state, terminalJobState);
+      const terminal = (await client.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
+        lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+        WHERE id=$1 AND state_version=$3 RETURNING *`,
+      [current.id, terminalJobState, current.state_version])).rows[0];
+      await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: current.id,
+        fromState: current.state, toState: terminalJobState, stateVersion: terminal.state_version,
+        reasonCode: 'CHECKPOINT_RECONCILED_TERMINAL_ITEM', context });
+      return terminal;
+    }
+    const next = stateOverride ?? retryStateForRunnerJob(current.state);
+    assertJobTransition(current.state, next);
+    const delaySeconds = delayMs == null
+      ? null
+      : Math.max(0, Math.ceil(Number(delayMs) / 1_000));
     const itemNext = next;
     const updatedJob = (await client.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
-      available_at=clock_timestamp()+make_interval(secs => floor(random()*LEAST(300::double precision,
-        5::double precision*power(2::double precision,GREATEST(0,attempt_count-1))))::integer),
+      available_at=CASE WHEN $3::integer IS NULL THEN clock_timestamp()+make_interval(secs => floor(random()*LEAST(300::double precision,
+        5::double precision*power(2::double precision,GREATEST(0,attempt_count-1))))::integer)
+        ELSE clock_timestamp()+make_interval(secs => $3::integer) END,
       lease_owner=NULL,lease_expires_at=NULL,
-      updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [current.id, next])).rows[0];
+      updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [current.id, next, delaySeconds])).rows[0];
     await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: current.id,
       fromState: current.state, toState: next, stateVersion: updatedJob.state_version,
       reasonCode, context });
-    const item = (await client.query(`UPDATE order_items SET state=$2,state_version=state_version+1,
+    const updatedItem = (await client.query(`UPDATE order_items SET state=$2,state_version=state_version+1,
       updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [current.order_item_id, itemNext])).rows[0];
-    await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
-      fromState: current.state, toState: itemNext, stateVersion: item.state_version,
+    await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: updatedItem.id,
+      fromState: item.state, toState: itemNext, stateVersion: updatedItem.state_version,
       reasonCode, context });
     if (next === 'MANUAL_REVIEW') await openReview(client, { subjectType: 'ORDER_ITEM',
-      subjectId: item.id, reason: `${reasonCode}_DURING_SETTLEMENT`, financial: true,
+      subjectId: updatedItem.id, reason: `${reasonCode}_DURING_SETTLEMENT`, financial: true,
       ownerOnly: false, context });
     return updatedJob;
   });
 }
 
 function retryDelay(error) {
+  const retryAfter = retryAfterMs(error);
+  if (retryAfter != null) return retryAfter + secureJitter(Math.min(1_000, retryAfter));
   const seconds = Number(error?.data?.retry_after ?? error?.retryAfter);
   const cap = Number.isFinite(seconds) ? Math.min(60_000, seconds * 1000) : 1000;
   return secureJitter(cap);
@@ -181,6 +214,49 @@ export async function acquireRunnableJob({ holder, ttlSeconds = 60 }, context, o
       aggregateId: job.id, aggregateVersion: job.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context });
     return job;
   });
+}
+
+export async function requeueDueRunnerJobsInTransaction(client, context, { includeExpired = false } = {}) {
+  const candidates = (await client.query(`
+      SELECT j.*, i.state AS item_state, i.state_version AS item_state_version
+      FROM runner_jobs j JOIN order_items i ON i.id=j.order_item_id
+      WHERE j.state IN ('WAITING_RATE_LIMIT','WAITING_RETRY')
+        AND j.available_at <= clock_timestamp()
+        AND ($1::boolean OR j.deadline_at > clock_timestamp())
+      ORDER BY j.available_at, j.created_at
+      FOR UPDATE OF j,i SKIP LOCKED
+      LIMIT 25
+    `, [includeExpired])).rows;
+  let moved = 0;
+  for (const job of candidates) {
+    assertJobTransition(job.state, 'QUEUED');
+    assertTransition(ORDER_ITEM_TRANSITIONS, job.item_state, 'QUEUED');
+    const updatedJob = (await client.query(`UPDATE runner_jobs SET state='QUEUED',
+      state_version=state_version+1,updated_at=clock_timestamp()
+      WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+    [job.id, job.state, job.state_version])).rows[0];
+    if (!updatedJob) continue;
+    const updatedItem = (await client.query(`UPDATE order_items SET state='QUEUED',
+      state_version=state_version+1,updated_at=clock_timestamp()
+      WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+    [job.order_item_id, job.item_state, job.item_state_version])).rows[0];
+    if (!updatedItem) throw new QuestshopError('ITEM_STATE_CONFLICT', 'Runner item changed during retry requeue');
+    const reasonCode = job.state === 'WAITING_RATE_LIMIT' ? 'RATE_LIMIT_DUE' : 'RETRY_DUE';
+    await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+      fromState: job.state, toState: 'QUEUED', stateVersion: updatedJob.state_version,
+      reasonCode, context });
+    await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: job.order_item_id,
+      fromState: job.item_state, toState: 'QUEUED', stateVersion: updatedItem.state_version,
+      reasonCode, context });
+    moved += 1;
+  }
+  return moved;
+}
+
+export async function requeueDueRunnerJobs(context, options = {}) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, (client) => (
+    requeueDueRunnerJobsInTransaction(client, context)
+  ));
 }
 
 export async function renewRunnerJob(job, ttlSeconds = 60, options = {}) {
@@ -614,6 +690,18 @@ async function resolveRunnerFailure({ state, job, context, options, error }) {
   if (error?.name === 'AbortError' && error.code !== 'MUTATION_AMBIGUOUS') {
     await checkpointRetryJob(state.runningJob, context, options);
     return { outcome: 'CHECKPOINTED_FOR_RESTART', error };
+  }
+  if (error?.status === 429) {
+    if (Number(state.runningJob.attempt_count) < 10) {
+      await checkpointRetryJob(state.runningJob, context, options, 'RATE_LIMITED', {
+        stateOverride: 'WAITING_RATE_LIMIT', delayMs: retryAfterMs(error) ?? 1_000,
+      });
+      return { outcome: 'WAITING_RATE_LIMIT', error };
+    }
+    const exhausted = Object.assign(new QuestshopError('RATE_LIMIT_BUDGET_EXHAUSTED',
+      'Quest API rate limit budget exhausted', { category: 'TRANSIENT' }), { status: 429 });
+    await moveRunnerToManualReview(job, context, options, exhausted, false);
+    return { outcome: 'MANUAL_REVIEW', error: exhausted };
   }
   if (isRunnerTransient(error) && Number(state.runningJob.attempt_count) < 3) {
     await checkpointRetryJob(state.runningJob, context, options, 'TRANSIENT_RETRY');

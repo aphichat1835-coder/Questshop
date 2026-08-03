@@ -2,7 +2,7 @@ import { expireSessions } from '../domain/checkout/service.js';
 import { createContext } from '../shared/correlation.js';
 import { withTransaction } from '../db/transaction.js';
 import { recordTransition } from '../domain/shared/transition.js';
-import { materializeNextOrderItem } from '../domain/runner/service.js';
+import { materializeNextOrderItem, requeueDueRunnerJobsInTransaction } from '../domain/runner/service.js';
 import { enqueueProjection } from '../domain/outbox/service.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
 import { appendAdminAudit } from '../domain/admin/audit.js';
@@ -70,21 +70,6 @@ async function recoverCrashedRunnerJobs(database, context) {
     if (review) await openReview(database, { subjectType: 'ORDER_ITEM', subjectId: job.order_item_id,
       reason: 'WORKER_CRASH_REQUIRES_VERIFICATION', financial: true, ownerOnly: false,
       context: { ...context, traceId: job.trace_id } });
-  }
-}
-
-async function requeueRetryJobs(database, context) {
-  const retryJobs = await database.query(`UPDATE runner_jobs SET state='QUEUED',state_version=state_version+1,
-      updated_at=clock_timestamp() WHERE state='WAITING_RETRY' AND available_at<=clock_timestamp() RETURNING *`);
-  for (const job of retryJobs.rows) {
-    await recordTransition(database, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
-      fromState: 'WAITING_RETRY', toState: 'QUEUED', stateVersion: job.state_version,
-      reasonCode: 'RETRY_DUE', context });
-    const item = (await database.query(`UPDATE order_items SET state='QUEUED',state_version=state_version+1,
-        updated_at=clock_timestamp() WHERE id=$1 AND state='WAITING_RETRY' RETURNING *`, [job.order_item_id])).rows[0];
-    if (item) await recordTransition(database, { aggregateType: 'ORDER_ITEM', aggregateId: item.id,
-      fromState: 'WAITING_RETRY', toState: 'QUEUED', stateVersion: item.state_version,
-      reasonCode: 'RETRY_DUE', context });
   }
 }
 
@@ -186,7 +171,7 @@ async function runTransactionalMaintenance(pool, context) {
   return withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (database) => {
     await recoverExpiredLeases(database, context);
     await recoverCrashedRunnerJobs(database, context);
-    await requeueRetryJobs(database, context);
+    await requeueDueRunnerJobsInTransaction(database, context, { includeExpired: true });
     await recoverCrashedQuestTests(database, context);
     await recoverCrashedPayments(database, context);
     await maintainMonitorsAndBlocks(database, context);

@@ -50,7 +50,7 @@ async function shutdownOnce(runtime, reason, { leaseLost, error }) {
     await bounded(runtime.heartbeat.catch(() => null), deadline, 'runtime heartbeat');
     if (!leaseLost) {
       await bounded(releaseLease({ resourceType: 'RUNTIME', resourceId: runtime.env.DISCORD_GUILD_ID,
-        holder: runtime.runtimeHolder, fencingToken: runtime.runtimeLease.fencing_token }).catch(() => null),
+        holder: runtime.runtimeHolder, fencingToken: runtime.runtimeLease.fencing_token }, { pool: runtime.pool }).catch(() => null),
       deadline, 'runtime lease release');
     }
   } catch (error) { failure = error; }

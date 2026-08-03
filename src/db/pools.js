@@ -5,8 +5,8 @@ const { Pool } = pg;
 let runtimePool;
 let directPool;
 
-function commonOptions(env) {
-  const databaseUrl = new URL(env.DATABASE_POOL_URL);
+function commonOptions(env, connectionString) {
+  const databaseUrl = new URL(connectionString);
   const ssl = env.NODE_ENV === 'test' && databaseUrl.searchParams.get('sslmode') === 'disable'
     ? false
     : {
@@ -24,7 +24,7 @@ function commonOptions(env) {
 
 export function getRuntimePool(env = loadEnvironment()) {
   runtimePool ??= new Pool({
-    ...commonOptions(env),
+    ...commonOptions(env, env.DATABASE_POOL_URL),
     connectionString: env.DATABASE_POOL_URL,
     max: 8,
     application_name: 'questshop-runtime',
@@ -34,7 +34,7 @@ export function getRuntimePool(env = loadEnvironment()) {
 
 export function getDirectPool(env = loadEnvironment()) {
   directPool ??= new Pool({
-    ...commonOptions(env),
+    ...commonOptions(env, env.DATABASE_DIRECT_URL),
     connectionString: env.DATABASE_DIRECT_URL,
     max: 1,
     application_name: 'questshop-migrator',

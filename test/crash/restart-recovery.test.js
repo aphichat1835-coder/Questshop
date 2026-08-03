@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { v7 as uuidv7 } from 'uuid';
 import { createTestPool } from '../fixtures/postgres.js';
 import { runMaintenance } from '../../src/workers/maintenance-worker.js';
+import { requeueDueRunnerJobs } from '../../src/domain/runner/service.js';
+import { createContext } from '../../src/shared/correlation.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -100,5 +102,39 @@ test('restart recovery requeues an expired Runner lease with Job and Item transi
   assert.deepEqual(transitions, [
     { aggregate_type: 'ORDER_ITEM', from_state: 'LEASED', to_state: 'QUEUED' },
     { aggregate_type: 'RUNNER_JOB', from_state: 'LEASED', to_state: 'QUEUED' },
+  ]);
+});
+
+test('restart recovery requeues a rate-limited Runner job after Retry-After', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const trace = uuidv7(); const rule = uuidv7(); const order = uuidv7(); const item = uuidv7(); const job = uuidv7();
+  await pool.query(`INSERT INTO price_rules(id,rule_type,amount_cents,config_version,actor_id,trace_id)
+    VALUES($1,'DEFAULT',500,1,'owner',$2)`, [rule, trace]);
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,sale_state,name,task_type,task_target,
+    url,expires_at) VALUES('rate-limit-recovery','SUPPORTED','CLOSED','Rate Limit Recovery','WATCH_VIDEO',60,
+      'https://discord.com/quests/rate-limit-recovery',clock_timestamp()+interval '1 day')`);
+  await pool.query(`INSERT INTO orders(id,discord_user_id,account_id,trace_id)
+    VALUES($1,'rate-recovery-user','rate-recovery-account',$2)`, [order, trace]);
+  await pool.query(`INSERT INTO order_items(id,order_id,sequence_number,quest_id,quest_name,task_type,
+    price_cents,price_rule_id,config_version,metadata_revision,engine_version,executor_version,
+    contract_version,runner_state_schema_version,state,deadline_at)
+    VALUES($1,$2,1,'rate-limit-recovery','Rate Limit Recovery','WATCH_VIDEO',500,$3,1,1,'1','1','1',1,
+      'WAITING_RATE_LIMIT',clock_timestamp()+interval '1 day')`, [item, order, rule]);
+  await pool.query(`INSERT INTO runner_jobs(id,order_item_id,discord_user_id,account_id,state,available_at,
+    deadline_at,engine_version,executor_version,contract_version,runner_state_schema_version,trace_id)
+    VALUES($1,$2,'rate-recovery-user','rate-recovery-account','WAITING_RATE_LIMIT',clock_timestamp()-interval '1 second',
+      clock_timestamp()+interval '1 day','1','1','1',1,$3)`, [job, item, trace]);
+  await requeueDueRunnerJobs(createContext({ actorType: 'SYSTEM', actorId: 'runner-test',
+    guildId: '10000000000000002', traceId: trace, idempotencyKey: `rate-requeue:${job}` }), { pool });
+  const guild = { members: { fetchMe: async () => ({ id: 'bot' }) }, roles: { everyone: { id: 'everyone' } } };
+  const client = { questshop: {}, guilds: { fetch: async () => guild } };
+  await runMaintenance({ env: { DISCORD_GUILD_ID: '10000000000000002', RUNNER_CONCURRENCY: 3 },
+    holder: 'rate-limit-recovery-test', client, pool });
+  assert.equal((await pool.query('SELECT state FROM runner_jobs WHERE id=$1', [job])).rows[0].state, 'QUEUED');
+  assert.equal((await pool.query('SELECT state FROM order_items WHERE id=$1', [item])).rows[0].state, 'QUEUED');
+  assert.deepEqual((await pool.query(`SELECT aggregate_type,from_state,to_state FROM state_transitions
+    WHERE aggregate_id=ANY($1::text[]) ORDER BY aggregate_type`, [[job, item]])).rows, [
+    { aggregate_type: 'ORDER_ITEM', from_state: 'WAITING_RATE_LIMIT', to_state: 'QUEUED' },
+    { aggregate_type: 'RUNNER_JOB', from_state: 'WAITING_RATE_LIMIT', to_state: 'QUEUED' },
   ]);
 });
