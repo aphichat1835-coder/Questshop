@@ -4,9 +4,18 @@ import {
 import { customId } from '../components/custom-id.js';
 import { questTypeLabel, topupStateLabel } from './labels.js';
 
-// Decimal avoids static analyzers treating this six-digit RGB literal as a
-// runtime-dependent numeric representation. It is exactly Discord #F0B232.
-const COLOR = Object.freeze({ primary: 0x5865f2, success: 0x23a55a, warning: 15774258, danger: 0xf23f43 });
+function discordColor(hex) {
+  return Number.parseInt(hex, 16);
+}
+
+// Parse RGB text once so all colors remain exact without large numeric
+// literals that cross-language static analyzers can misinterpret.
+const COLOR = Object.freeze({
+  primary: discordColor('5865f2'),
+  success: discordColor('23a55a'),
+  warning: discordColor('f0b232'),
+  danger: discordColor('f23f43'),
+});
 const noMentions = { parse: [] };
 
 export function baht(cents) {

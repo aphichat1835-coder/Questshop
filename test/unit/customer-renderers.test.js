@@ -82,7 +82,7 @@ test('top-up result distinguishes credited, review and failure without guessing'
 
 test('top-up processing preserves the intended Discord warning color', () => {
   const body = renderTopupProcessing('topup');
-  assert.equal(body.embeds[0].data.color, 15774258);
+  assert.equal(body.embeds[0].data.color, Number.parseInt('f0b232', 16));
 });
 
 test('admin navigation always includes category navigation and refresh controls', () => {
