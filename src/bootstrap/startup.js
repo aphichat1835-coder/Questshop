@@ -4,8 +4,9 @@ import { v7 as uuidv7 } from 'uuid';
 import { loadRuntimeEnvironment } from '../config/env.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
 import { closePools, getRuntimePool } from '../db/pools.js';
-import { validateSchemaCompatibility } from '../db/migrations.js';
+import { validateMigrationChecksums, validateSchemaCompatibility } from '../db/migrations.js';
 import { acquireLease, renewLease } from '../db/leases.js';
+import { FencingLostError } from '../shared/errors.js';
 import { createDiscordClient } from '../discord/client.js';
 import { routeInteraction } from '../discord/interactions/router.js';
 import { startWorkers } from '../workers/worker-manager.js';
@@ -13,17 +14,22 @@ import { closeHealthServer, createHealthState, startHealthServer } from './healt
 import { createLogger } from '../shared/logger.js';
 import { runMaintenance } from '../workers/maintenance-worker.js';
 import { validateKeyringCoverage } from './keyring-coverage.js';
+import { validateKeyringSentinels } from './keyring-sentinels.js';
 import { validateRuntimeRole } from '../db/role-contract.js';
 import { processOutbox } from '../workers/outbox-worker.js';
 
-async function openRuntimeDatabase(env, health) {
-  const pool = getRuntimePool(env);
+export async function openRuntimeDatabase(env, health, dependencies = {}) {
+  const pool = (dependencies.getRuntimePool ?? getRuntimePool)(env);
   await pool.query('SELECT 1');
-  await validateSchemaCompatibility(pool);
+  await (dependencies.validateSchemaCompatibility ?? validateSchemaCompatibility)(pool);
+  await (dependencies.validateMigrationChecksums ?? validateMigrationChecksums)(pool);
   health.checks.schema = 'OK';
-  await validateKeyringCoverage(pool, env);
+  await (dependencies.validateKeyringCoverage ?? validateKeyringCoverage)(pool, env);
+  await (dependencies.validateKeyringSentinels ?? validateKeyringSentinels)(pool, env);
   health.checks.keyrings = 'OK';
-  const roleContract = await validateRuntimeRole(pool, { enforce: env.NODE_ENV === 'production' });
+  const roleContract = await (dependencies.validateRuntimeRole ?? validateRuntimeRole)(pool, {
+    enforce: env.NODE_ENV === 'production',
+  });
   health.checks.runtimeRole = roleContract.violations.length ? 'DEGRADED' : 'OK';
   health.checks.database = 'OK';
   return pool;
@@ -37,9 +43,9 @@ async function acquireRuntimeOwnership(pool, env, health) {
   return { holder, runtimeLease };
 }
 
-async function connectDiscord(env, logger, health, pool, config) {
+async function connectDiscord(env, logger, health, runtime) {
   const client = createDiscordClient();
-  client.questshop = { env, logger, health, pool, config };
+  client.questshop = runtime;
   client.on('interactionCreate', routeInteraction);
   client.on('error', (error) => logger.error({ error }, 'discord client error'));
   await client.login(env.DISCORD_BOT_TOKEN);
@@ -55,15 +61,32 @@ async function connectDiscord(env, logger, health, pool, config) {
   return client;
 }
 
-function startRuntimeHeartbeat({ abortController, env, holder, pool, runtimeLease, health, logger, onRuntimeLeaseLost }) {
+export async function renewRuntimeLease({ abortController, env, holder, pool, lease, renew = renewLease, wait = delay }) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await renew({ resourceType: 'RUNTIME', resourceId: env.DISCORD_GUILD_ID,
+        holder, fencingToken: lease.fencing_token, ttlSeconds: 60 }, { pool });
+    } catch (error) {
+      if (error instanceof FencingLostError || error?.code === 'FENCING_LOST') throw error;
+      lastError = error;
+      if (attempt < 2) await wait(1_000 * (2 ** attempt), undefined, {
+        signal: abortController.signal, ref: false,
+      });
+    }
+  }
+  throw lastError;
+}
+
+export function startRuntimeHeartbeat({ abortController, env, holder, pool, runtimeLease, health, logger, onRuntimeLeaseLost,
+  renew = renewLease, wait = delay }) {
   return (async () => {
     let lease = runtimeLease;
     while (!abortController.signal.aborted) {
-      await delay(15_000, undefined, { signal: abortController.signal, ref: false });
+      await wait(15_000, undefined, { signal: abortController.signal, ref: false });
       if (abortController.signal.aborted) break;
       try {
-        lease = await renewLease({ resourceType: 'RUNTIME', resourceId: env.DISCORD_GUILD_ID,
-          holder, fencingToken: lease.fencing_token, ttlSeconds: 60 }, { pool });
+        lease = await renewRuntimeLease({ abortController, env, holder, pool, lease, renew, wait });
       } catch (error) {
         health.ready = false; health.status = 'INCIDENT'; health.lastError = error;
         abortController.abort(error);
@@ -95,6 +118,7 @@ async function startRecoveredWorkers({ abortController, client, env, health, log
 async function markRuntimeReady({ env, health, logger, pool }) {
   const storeOpen = (await pool.query("SELECT enabled FROM feature_gates WHERE gate='STORE_OPEN'"))
     .rows[0]?.enabled === true;
+  health.checks.bootstrap = 'READY';
   health.ready = true;
   health.status = storeOpen ? 'HEALTHY' : 'MAINTENANCE';
   logger.info({ guildId: env.DISCORD_GUILD_ID }, 'Questshop ready');
@@ -109,12 +133,15 @@ async function recordStartupCryptoIncident(pool, error) {
   [uuidv7(), { phase: 'startup' }, uuidv7()]).catch(() => null);
 }
 
-async function cleanupFailedStartup({ abortController, client, error, health, logger, pool, server }) {
+async function cleanupFailedStartup({ abortController, client, error, health, heartbeat, logger, pool, server }) {
   health.lastError = error;
   health.status = 'NOT_READY';
   logger.error({ error }, 'Questshop startup failed');
   await recordStartupCryptoIncident(pool, error);
   abortController.abort(error);
+  await Promise.resolve(heartbeat).catch((heartbeatError) => {
+    logger.error({ error: heartbeatError }, 'runtime heartbeat cleanup after failed startup failed');
+  });
   await Promise.resolve(client?.destroy?.()).catch((destroyError) => {
     logger.error({ error: destroyError }, 'discord cleanup after failed startup failed');
   });
@@ -141,6 +168,7 @@ export async function startup({ health = createHealthState(), server: existingSe
   };
   let client;
   let pool;
+  let runtime;
   try {
     const env = loadRuntimeEnvironment();
     health.checks.config = 'OK';
@@ -150,26 +178,30 @@ export async function startup({ health = createHealthState(), server: existingSe
     const { holder, runtimeLease } = await acquireRuntimeOwnership(pool, env, health);
     assertStarting();
     const config = await loadRuntimeConfig(pool);
-    client = await connectDiscord(env, logger, health, pool, config);
+    health.checks.bootstrap = 'RECOVERING';
+    runtime = { env, logger, health, server, pool, client: null, config, workers: null, abortController,
+      heartbeat: null, runtimeLease, runtimeHolder: holder, acceptingInteractions: false, shutdownPromise: null };
+    // A lease acquired before Discord login must remain owned during recovery.
+    // Components observe this same object and remain closed until Ready.
+    runtime.heartbeat = startRuntimeHeartbeat({ abortController, env, holder, pool, runtimeLease,
+      health, logger, onRuntimeLeaseLost });
+    client = await connectDiscord(env, logger, health, runtime);
+    runtime.client = client;
     assertStarting();
     await runMaintenance({ env, holder: 'startup-recovery', client, pool,
       runnerConcurrency: Number(config.values?.runnerConcurrency ?? env.RUNNER_CONCURRENCY) });
     health.checks.discord = 'OK';
     const workers = await startRecoveredWorkers({ abortController, client, env, health, logger, pool });
     assertStarting();
-    const runtime = { env, logger, health, server, pool, client, config, workers, abortController, heartbeat: null,
-      runtimeLease, runtimeHolder: holder, acceptingInteractions: true, shutdownPromise: null };
-    // Interaction handlers must observe the same runtime object that shutdown
-    // fences. This also gives bounded customer waits the process AbortSignal.
-    client.questshop = runtime;
+    runtime.workers = workers;
     await onRuntimePrepared?.(runtime);
     assertStarting();
-    runtime.heartbeat = startRuntimeHeartbeat({ abortController, env, holder, pool, runtimeLease,
-      health, logger, onRuntimeLeaseLost });
     await markRuntimeReady({ env, health, logger, pool });
+    runtime.acceptingInteractions = true;
     return runtime;
   } catch (error) {
-    await cleanupFailedStartup({ abortController, client, error, health, logger, pool, server });
+    await cleanupFailedStartup({ abortController, client, error, health, heartbeat: runtime?.heartbeat,
+      logger, pool, server });
     throw error;
   }
 }

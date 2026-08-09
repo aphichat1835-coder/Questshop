@@ -1,6 +1,7 @@
 import { decryptSecret } from '../adapters/crypto/keyring.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createQuestApiClient, profileFromEnv } from '../quest-engine/api/client.js';
+import { getPersistentDiscordRateLimitCoordinator } from '../quest-engine/rate-limits/coordinator.js';
 import { createContext } from '../shared/correlation.js';
 import { ingestDiscovery } from '../domain/catalog/service.js';
 
@@ -28,11 +29,12 @@ async function markMonitorFailure(pool, monitor, error, context) {
   [monitor.id, { errorCode: error.code ?? error.name }, context.traceId]);
 }
 
-async function fetchMonitorQuests(monitor, { env, signal }) {
+async function fetchMonitorQuests(monitor, { env, pool, signal }) {
   const token = decryptSecret({ keyVersion: monitor.key_version, nonce: monitor.nonce,
     ciphertext: monitor.ciphertext, authTag: monitor.auth_tag }, env.DATA_ENCRYPTION_KEYS_JSON,
   `monitor:${monitor.id}:${env.DISCORD_GUILD_ID}`);
-  const api = createQuestApiClient({ token, profile: profileFromEnv(env) });
+  const api = createQuestApiClient({ token, profile: profileFromEnv(env),
+    coordinator: getPersistentDiscordRateLimitCoordinator(pool) });
   let last = [];
   // Metadata can lag on one Discord account.  Perform the bounded source
   // retry before moving to a fallback account; network retries are still

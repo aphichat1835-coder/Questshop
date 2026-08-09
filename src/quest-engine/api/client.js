@@ -3,9 +3,12 @@ import { secureJitter } from '../../shared/random.js';
 import { extractQuestArray, QuestCompatibilityError } from '../schema/compatibility.js';
 import { normalizeQuestPayload } from '../schema/normalizer.js';
 import { discordRateLimitCoordinator } from '../rate-limits/coordinator.js';
-import { QUEST_ENDPOINT, QUEST_LIST_PATHS } from './endpoints.js';
+import { FATAL_FORBIDDEN_PATHS, QUEST_ENDPOINT, QUEST_LIST_PATHS } from './endpoints.js';
 
-const API_BASE = new URL('https://discord.com/api/v10');
+export const QUEST_API_VERSION = 9;
+const API_BASE = new URL(`https://discord.com/api/v${QUEST_API_VERSION}`);
+const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export class DiscordApiError extends Error {
   constructor(status, path, data) {
@@ -14,7 +17,7 @@ export class DiscordApiError extends Error {
     this.status = status;
     this.path = path;
     this.data = data;
-    this.fatalAuth = status === 401 || status === 403;
+    this.fatalAuth = status === 401 || (status === 403 && FATAL_FORBIDDEN_PATHS.has(path));
   }
 }
 
@@ -24,6 +27,21 @@ export class DiscordApiTransportError extends Error {
     this.name = 'DiscordApiTransportError';
     this.path = path;
   }
+}
+
+export class DiscordApiTimeoutError extends DiscordApiTransportError {
+  constructor(path, { possiblySent = false } = {}) {
+    super(path, new Error('Discord Quest API request timed out'));
+    this.name = 'DiscordApiTimeoutError';
+    this.code = 'QUEST_API_TIMEOUT';
+    this.retryable = true;
+    this.possiblySent = possiblySent;
+  }
+}
+
+export function isCaptchaChallenge(data) {
+  return Boolean(data?.captcha_sitekey || data?.captcha_service || data?.captcha_rqtoken
+    || data?.captcha_rqdata || data?.captcha_key);
 }
 
 function safePath(path) {
@@ -50,6 +68,7 @@ function headers(token, path, profile) {
     browser_version: profile.chromeVersion, client_build_number: profile.buildNumber,
     native_build_number: profile.nativeBuildNumber, client_event_source: null, design_id: 0,
   })).toString('base64');
+  const chromeMajor = String(profile.chromeVersion).split('.')[0];
   return {
     authorization: token,
     'content-type': 'application/json',
@@ -58,8 +77,17 @@ function headers(token, path, profile) {
     'x-discord-locale': profile.locale,
     'x-discord-timezone': 'Asia/Bangkok',
     accept: '*/*',
+    'accept-language': `${profile.locale},en;q=0.9`,
+    'accept-encoding': 'gzip, deflate, br, zstd',
+    'x-debug-options': 'bugReporterEnabled',
     origin: 'https://discord.com',
     referer: path.startsWith('/quests/') ? 'https://discord.com/quest-home' : 'https://discord.com/channels/@me',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'sec-ch-ua': `"Chromium";v="${chromeMajor}", "Not)A;Brand";v="8"`,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
   };
 }
 
@@ -68,20 +96,51 @@ function retryAfterMs(response, data) {
   return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds * 1000) : 1000;
 }
 
+async function recordRateLimit(coordinator, token, path, response, data) {
+  if (response.status !== 429) return;
+  const wait = retryAfterMs(response, data);
+  if (data?.global || String(response.headers.get('x-ratelimit-global')).toLowerCase() === 'true') {
+    await coordinator.blockGlobally(wait);
+    return;
+  }
+  await coordinator.blockRoute?.(path, wait);
+  await coordinator.blockAccount?.(token, wait);
+}
+
 async function parseResponse(response, path) {
   try {
+    const length = Number(response.headers.get('content-length'));
+    if (Number.isFinite(length) && length > MAX_RESPONSE_BYTES) {
+      throw new DiscordApiTransportError(path, new Error('Discord response exceeds size limit'));
+    }
     const text = response.status === 204 ? '' : await response.text();
+    if (Buffer.byteLength(text) > MAX_RESPONSE_BYTES) {
+      throw new DiscordApiTransportError(path, new Error('Discord response exceeds size limit'));
+    }
     try { return text ? JSON.parse(text) : null; } catch { return text; }
   } catch (error) {
     throw new DiscordApiTransportError(path, error);
   }
 }
 
+function requestSignal(callerSignal, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
+  timer.unref?.();
+  const signals = [controller.signal];
+  if (callerSignal) signals.push(callerSignal);
+  return {
+    signal: AbortSignal.any(signals),
+    timedOut: () => controller.signal.aborted && !callerSignal?.aborted,
+    dispose: () => clearTimeout(timer),
+  };
+}
+
 async function waitForSafeRetry({ response, data, safeRead, attempt, maxAttempts, coordinator, signal }) {
   if (!safeRead || attempt + 1 >= maxAttempts) return false;
   if (response.status === 429) {
     const wait = retryAfterMs(response, data);
-    if (data?.global) coordinator.blockGlobally(wait);
+    if (data?.global || String(response.headers.get('x-ratelimit-global')).toLowerCase() === 'true') await coordinator.blockGlobally(wait);
     await delay(wait, undefined, { signal, ref: false });
     return true;
   }
@@ -96,27 +155,53 @@ async function waitForTransportRetry({ error, safeRead, attempt, maxAttempts, si
   return true;
 }
 
-export function createQuestApiClient({ token, profile, coordinator = discordRateLimitCoordinator }) {
+function markMutationTransportUncertainty(error, { safeRead, dispatched }) {
+  // A rejected fetch or unreadable response after calling fetch gives no proof
+  // that Discord did not receive a mutation.  The Runner uses this marker to
+  // read fresh state before it can ever send the mutation again.
+  if (!safeRead && dispatched && error && typeof error === 'object'
+    && !(error instanceof DiscordApiError)) error.possiblySent = true;
+  else if (!safeRead && error && typeof error === 'object' && !(error instanceof DiscordApiError)) {
+    error.possiblySent ??= false;
+  }
+  return error;
+}
+
+export function createQuestApiClient({ token, profile, coordinator = discordRateLimitCoordinator,
+  timeoutMs = DEFAULT_TIMEOUT_MS }) {
   async function request(path, options = {}, { safeRead = false, maxAttempts = safeRead ? 5 : 1 } = {}) {
     const method = String(options.method ?? 'GET').toUpperCase();
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      let dispatched = false;
       try {
-        const response = await coordinator.schedule({
-          token,
-          signal: options.signal,
-          execute: () => fetch(apiUrl(path), {
-            ...options,
-            headers: { ...headers(token, path, profile), ...options.headers },
-          }),
-        });
+        const bounded = requestSignal(options.signal, timeoutMs);
+        let response;
+        try {
+          response = await coordinator.schedule({
+            token, path, method, signal: bounded.signal,
+            execute: () => {
+              dispatched = true;
+              return fetch(apiUrl(path), {
+                ...options, signal: bounded.signal,
+                headers: { ...headers(token, path, profile), ...options.headers },
+              });
+            },
+          });
+        } catch (error) {
+          if (bounded.timedOut()) throw new DiscordApiTimeoutError(path, { possiblySent: dispatched });
+          throw markMutationTransportUncertainty(error, { safeRead, dispatched });
+        } finally {
+          bounded.dispose();
+        }
         const data = await parseResponse(response, path);
         if (response.ok) return data ?? { ok: true, status: response.status };
+        await recordRateLimit(coordinator, token, path, response, data);
         if (await waitForSafeRetry({ response, data, safeRead, attempt, maxAttempts, coordinator, signal: options.signal })) continue;
         throw new DiscordApiError(response.status, path, data);
       } catch (error) {
         if (error instanceof DiscordApiError || error?.name === 'AbortError') throw error;
         if (await waitForTransportRetry({ error, safeRead, attempt, maxAttempts, signal: options.signal })) continue;
-        throw error;
+        throw markMutationTransportUncertainty(error, { safeRead, dispatched });
       }
     }
     throw new Error(`${method} ${path} retry budget exhausted`);
@@ -158,13 +243,21 @@ export function createQuestApiClient({ token, profile, coordinator = discordRate
     sendVideoProgress: (questId, timestamp, signal) => request(QUEST_ENDPOINT.videoProgress(questId), {
       method: 'POST', body: JSON.stringify({ timestamp: Math.floor(timestamp) }), signal,
     }),
-    sendHeartbeat: (quest, terminal, useApplicationPayload, signal) => request(QUEST_ENDPOINT.heartbeat(quest.id), {
-      method: 'POST',
-      body: JSON.stringify(useApplicationPayload
-        ? { application_id: quest.applicationId, terminal: Boolean(terminal) }
-        : { stream_key: `call:${quest.id}:1`, terminal: Boolean(terminal) }),
-      signal,
-    }),
+    async sendHeartbeat(quest, terminal, useApplicationPayload, signal) {
+      const path = QUEST_ENDPOINT.heartbeat(quest.id);
+      const applicationPayload = () => request(path, {
+        method: 'POST', body: JSON.stringify({ application_id: quest.applicationId, terminal: Boolean(terminal) }), signal,
+      });
+      if (useApplicationPayload) return applicationPayload();
+      try {
+        return await request(path, {
+          method: 'POST', body: JSON.stringify({ stream_key: `call:${quest.id}:1`, terminal: Boolean(terminal) }), signal,
+        });
+      } catch (error) {
+        if (error?.status !== 400 || !quest?.applicationId || isCaptchaChallenge(error.data)) throw error;
+        return applicationPayload();
+      }
+    },
   });
 }
 

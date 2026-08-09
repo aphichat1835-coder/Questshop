@@ -69,7 +69,7 @@ const environmentFields = {
   DISCORD_LOCALE: z.string().min(2).max(20).default('en-US'),
 };
 
-function refineEnvironment(value, ctx, { requireDirect }) {
+function refineEnvironment(value, ctx, { requireDirect, requireRestore }) {
   if (requireDirect && !value.DATABASE_DIRECT_URL) {
     ctx.addIssue({ code: 'custom', path: ['DATABASE_DIRECT_URL'], message: 'DATABASE_DIRECT_URL is required' });
   }
@@ -79,14 +79,18 @@ function refineEnvironment(value, ctx, { requireDirect }) {
   if (value.NODE_ENV === 'production' && !/^[0-9a-f]{40}$/i.test(value.GIT_SHA)) {
     ctx.addIssue({ code: 'custom', message: 'GIT_SHA must be the 40-character deployment commit SHA in production' });
   }
-  const backupKeys = ['DATABASE_BACKUP_URL', 'DATABASE_RESTORE_URL', 'S3_ENDPOINT', 'S3_BUCKET',
+  const backupKeys = ['DATABASE_BACKUP_URL', 'S3_ENDPOINT', 'S3_BUCKET',
     'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'BACKUP_ENCRYPTION_KEYS_JSON'];
   const backupEnabled = value.BACKUP_ENABLED ?? value.NODE_ENV === 'production';
   if (backupEnabled && backupKeys.some((key) => value[key] == null || value[key] === '')) {
     ctx.addIssue({ code: 'custom', message: 'BACKUP_ENABLED=true requires backup database, S3 and encryption settings' });
   }
+  if (requireRestore && backupEnabled && !value.DATABASE_RESTORE_URL) {
+    ctx.addIssue({ code: 'custom', path: ['DATABASE_RESTORE_URL'],
+      message: 'DATABASE_RESTORE_URL is required for deployment and restore-drill tooling when backups are enabled' });
+  }
   for (const key of ['DATABASE_POOL_URL', ...(requireDirect ? ['DATABASE_DIRECT_URL'] : []), ...(backupEnabled
-    ? ['DATABASE_BACKUP_URL', 'DATABASE_RESTORE_URL'] : [])]) {
+    ? ['DATABASE_BACKUP_URL', ...(requireRestore ? ['DATABASE_RESTORE_URL'] : [])] : [])]) {
     if (!value[key]) continue;
     const url = new URL(value[key]);
     if (value.NODE_ENV === 'production' && url.searchParams.get('sslmode') !== 'verify-full') {
@@ -95,10 +99,15 @@ function refineEnvironment(value, ctx, { requireDirect }) {
   }
 }
 
-const schema = z.object(environmentFields).superRefine((value, ctx) => refineEnvironment(value, ctx, { requireDirect: true }));
-const { DATABASE_DIRECT_URL: _deploymentOnlyDatabaseUrl, ...runtimeEnvironmentFields } = environmentFields;
+const schema = z.object(environmentFields)
+  .superRefine((value, ctx) => refineEnvironment(value, ctx, { requireDirect: true, requireRestore: true }));
+const {
+  DATABASE_DIRECT_URL: _deploymentOnlyDatabaseUrl,
+  DATABASE_RESTORE_URL: _disasterRecoveryOnlyDatabaseUrl,
+  ...runtimeEnvironmentFields
+} = environmentFields;
 const runtimeSchema = z.object(runtimeEnvironmentFields)
-  .superRefine((value, ctx) => refineEnvironment(value, ctx, { requireDirect: false }));
+  .superRefine((value, ctx) => refineEnvironment(value, ctx, { requireDirect: false, requireRestore: false }));
 
 let cached;
 let runtimeCached;

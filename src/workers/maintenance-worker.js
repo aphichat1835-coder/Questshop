@@ -2,7 +2,12 @@ import { expireSessions } from '../domain/checkout/service.js';
 import { createContext } from '../shared/correlation.js';
 import { withTransaction } from '../db/transaction.js';
 import { assertTransition, recordTransition } from '../domain/shared/transition.js';
-import { containRunnerQueueMismatch, materializeNextOrderItem, requeueDueRunnerJobsInTransaction } from '../domain/runner/service.js';
+import {
+  containRunnerQueueMismatch,
+  materializeNextOrderItem,
+  releaseExpiredOrderItem,
+  requeueDueRunnerJobsInTransaction,
+} from '../domain/runner/service.js';
 import { RUNNER_JOB_TRANSITIONS } from '../domain/runner/states.js';
 import { ORDER_ITEM_TRANSITIONS } from '../domain/orders/states.js';
 import { TOPUP_TRANSITIONS } from '../domain/payments/states.js';
@@ -10,7 +15,6 @@ import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS, TEST_TRANSITIONS } from '../dom
 import { enqueueProjection } from '../domain/outbox/service.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
 import { appendAdminAudit } from '../domain/admin/audit.js';
-import { releaseReservation } from '../domain/wallet/service.js';
 import { evaluateExpiryAdmission } from '../domain/catalog/expiry.js';
 import { resolvePrice } from '../domain/pricing/resolver.js';
 import { pauseQuestForRetest } from '../domain/catalog/service.js';
@@ -26,6 +30,7 @@ import { acquireLease, releaseLease, renewLease } from '../db/leases.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { v7 as uuidv7 } from 'uuid';
 import { QuestshopError } from '../shared/errors.js';
+import { prunePersistentRateLimitBlocks } from '../quest-engine/rate-limits/coordinator.js';
 
 function assertRunnerPairTransition(jobState, itemState, nextState) {
   assertTransition(RUNNER_JOB_TRANSITIONS, jobState, nextState);
@@ -105,7 +110,12 @@ async function recoverCrashedRunnerJobs(database, context) {
       WHERE j.state IN ('RUNNING','VERIFYING','SETTLING')
         AND j.lease_expires_at<=clock_timestamp() FOR UPDATE OF j,i SKIP LOCKED`);
   for (const job of crashed.rows) {
-    const review = job.uncertain || job.state === 'SETTLING';
+    // An expired runner with a possibly-sent mutation must be reacquired and
+    // verified against Discord first. Moving it directly to Manual Review
+    // loses the only safe automated recovery path and leaves money reserved.
+    // SETTLING is different: wallet settlement cannot be inferred from Quest
+    // state alone and remains a financial review case.
+    const review = job.state === 'SETTLING';
     const next = review ? 'MANUAL_REVIEW' : 'WAITING_RETRY';
     if (job.item_state !== job.state) {
       await containRunnerQueueMismatch(database, job, context, 'CRASH_RECOVERY_STATE_MISMATCH');
@@ -129,7 +139,26 @@ async function recoverCrashedQuestTests(database, context) {
       FROM quest_test_runs tr WHERE tr.state='TESTING'
         AND tr.lease_expires_at<=clock_timestamp() FOR UPDATE`);
   for (const testRun of crashedTests.rows) {
-    const next = testRun.uncertain ? 'MANUAL_REVIEW' : 'TEST_FAILED';
+    // A durable mutation checkpoint means the old worker may have changed
+    // Discord after its last database write.  Do not turn that uncertainty
+    // into a review before a replacement worker has fetched the Quest once.
+    // The replacement claims TESTING with a new fence and verifies first.
+    if (testRun.uncertain) {
+      const recovered = (await database.query(`UPDATE quest_test_runs
+          SET lease_owner=NULL,lease_expires_at=clock_timestamp(),error_class='TEST_WORKER_CRASH',
+              evidence=evidence||$2::jsonb,updated_at=clock_timestamp()
+          WHERE id=$1 AND state='TESTING' AND state_version=$3 RETURNING *`, [
+        testRun.id,
+        { recovery: 'VERIFY_PENDING_AFTER_CRASH', traceId: testRun.trace_id },
+        testRun.state_version,
+      ])).rows[0];
+      if (recovered) await enqueueProjection(database, { projectionType: 'QUEST_OPERATION',
+        aggregateType: 'QUEST', aggregateId: testRun.quest_id,
+        aggregateVersion: recovered.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS',
+        context: { ...context, traceId: testRun.trace_id } });
+      continue;
+    }
+    const next = 'TEST_FAILED';
     assertTransition(TEST_TRANSITIONS, testRun.state, next);
     const updated = (await database.query(`UPDATE quest_test_runs SET state=$2,
         state_version=state_version+1,lease_owner=NULL,lease_expires_at=NULL,
@@ -141,22 +170,45 @@ async function recoverCrashedQuestTests(database, context) {
     await recordTransition(database, { aggregateType: 'QUEST_TEST', aggregateId: testRun.id,
       fromState: 'TESTING', toState: next, stateVersion: updated.state_version,
       reasonCode: 'TEST_WORKER_CRASH', context: tracedContext });
-    if (testRun.uncertain) await openReview(database, { subjectType: 'QUEST',
-      subjectId: testRun.quest_id, reason: 'QUEST_TEST_CRASH_WITH_UNCERTAIN_MUTATION',
-      financial: false, ownerOnly: false, context: tracedContext });
-    else if (updated.batch_id) {
+    if (updated.batch_id) {
       const quest = (await database.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
         [updated.quest_id])).rows[0];
       await advanceMonitorTestBatch(database, { run: updated, quest,
         error: { code: 'TEST_WORKER_CRASH', message: 'Quest test worker stopped before completion' },
         context: tracedContext });
     } else await database.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,
-        executor_version,contract_version,trace_id) VALUES(gen_random_uuid(),$1,'TEST_QUEUED',$2,$3,$4,$5)`,
+        executor_version,contract_version,contract_hash,deadline_at,trace_id)
+        SELECT gen_random_uuid(),quest_id,'TEST_QUEUED',$2,$3,$4,current_contract_hash,expires_at,$5
+        FROM quests WHERE quest_id=$1`,
       [testRun.quest_id, testRun.engine_version, testRun.executor_version,
         testRun.contract_version, testRun.trace_id]);
     await enqueueProjection(database, { projectionType: 'QUEST_OPERATION', aggregateType: 'QUEST',
       aggregateId: testRun.quest_id, aggregateVersion: updated.state_version,
       surfaceKey: 'LOG_QUEST_OPERATIONS', context: tracedContext });
+  }
+}
+
+async function expireQueuedQuestTests(database, context) {
+  const due = (await database.query(`SELECT * FROM quest_test_runs
+    WHERE state='TEST_QUEUED' AND deadline_at IS NOT NULL AND deadline_at<=clock_timestamp()
+    FOR UPDATE SKIP LOCKED`)).rows;
+  for (const run of due) {
+    assertTransition(TEST_TRANSITIONS, 'TEST_QUEUED', 'TEST_FAILED');
+    const failed = (await database.query(`UPDATE quest_test_runs SET state='TEST_FAILED',
+      state_version=state_version+1,error_class='TEST_QUEST_EXPIRED',
+      completed_at=clock_timestamp(),updated_at=clock_timestamp()
+      WHERE id=$1 AND state='TEST_QUEUED' AND state_version=$2 RETURNING *`,
+    [run.id, run.state_version])).rows[0];
+    if (!failed) continue;
+    const traced = { ...context, traceId: run.trace_id };
+    await recordTransition(database, { aggregateType: 'QUEST_TEST', aggregateId: run.id,
+      fromState: 'TEST_QUEUED', toState: 'TEST_FAILED', stateVersion: failed.state_version,
+      reasonCode: 'TEST_QUEST_EXPIRED', context: traced });
+    if (!failed.batch_id) continue;
+    const quest = (await database.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
+      [failed.quest_id])).rows[0];
+    if (quest) await advanceMonitorTestBatch(database, { run: failed, quest,
+      error: { code: 'TEST_QUEST_EXPIRED', message: 'Quest หมดอายุก่อนเริ่ม Monitor test' }, context: traced });
   }
 }
 
@@ -233,6 +285,7 @@ async function runTransactionalMaintenance(pool, context) {
     await recoverCrashedRunnerJobs(database, context);
     await requeueDueRunnerJobsInTransaction(database, context, { includeExpired: true });
     await recoverCrashedQuestTests(database, context);
+    await expireQueuedQuestTests(database, context);
     await reconcilePassedMonitorTestBatches(database, context);
     await reconcileFailedMonitorTestBatches(database, context);
     await recoverCrashedPayments(database, context);
@@ -242,28 +295,12 @@ async function runTransactionalMaintenance(pool, context) {
 }
 
 async function releaseExpiredOrderItems(pool, context) {
-  const expiredItems = (await pool.query(`SELECT i.id,j.id AS job_id FROM order_items i
-    LEFT JOIN runner_jobs j ON j.order_item_id=i.id
+  const expiredItems = (await pool.query(`SELECT i.id FROM order_items i
     WHERE i.state IN ('RESERVED','QUEUED') AND i.deadline_at<=clock_timestamp() LIMIT 100`)).rows;
   for (const item of expiredItems) {
-    await releaseReservation({ orderItemId: item.id, terminalState: 'EXPIRED_RELEASED',
+    await releaseExpiredOrderItem({ orderItemId: item.id,
       reason: 'QUEST_EXPIRED_BEFORE_START' }, { ...context,
       idempotencyKey: `${context.idempotencyKey}:expiry:${item.id}` }, { pool });
-    if (item.job_id) {
-      await withTransaction({ pool, isolation: 'READ COMMITTED' }, async (database) => {
-        const job = (await database.query('SELECT * FROM runner_jobs WHERE id=$1 FOR UPDATE', [item.job_id])).rows[0];
-        if (!job || ['COMPLETED', 'FAILED'].includes(job.state)) return;
-        assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'FAILED');
-        const failedJob = (await database.query(`UPDATE runner_jobs SET state='FAILED',state_version=state_version+1,
-          lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-          WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
-        [job.id, job.state, job.state_version])).rows[0];
-        if (!failedJob) throw new QuestshopError('STALE_RUNNER_STATE', `Runner job ${job.id} changed during expiry`);
-        await recordTransition(database, { aggregateType: 'RUNNER_JOB', aggregateId: failedJob.id,
-          fromState: job.state, toState: 'FAILED', stateVersion: failedJob.state_version,
-          reasonCode: 'QUEST_EXPIRED_BEFORE_START', context });
-      });
-    }
   }
 }
 
@@ -394,6 +431,7 @@ export async function runMaintenance({ env, holder, client, pool, runnerConcurre
     await runMaintainedStep(heartbeat, () => releaseExpiredOrderItems(pool, context));
     await runMaintainedStep(heartbeat, () => reconcileSellableQuests(pool, context, runnerConcurrency));
     await runMaintainedStep(heartbeat, () => materializeAvailableOrders(pool, context));
+    await runMaintainedStep(heartbeat, () => prunePersistentRateLimitBlocks({ pool }));
     client.questshop.config = await runMaintainedStep(heartbeat, () => loadRuntimeConfig(pool));
     await runMaintainedStep(heartbeat, () => reconcileSurfaceAnchors({ client, pool, env,
       config: client.questshop.config }, context));

@@ -20,12 +20,23 @@ test('backup settings can be explicitly disabled without requiring S3 and backup
   assert.equal(env.DATABASE_BACKUP_URL, undefined);
 });
 
-test('runtime configuration neither requires nor retains the migration URL and defaults concurrency to two', () => {
-  const { DATABASE_DIRECT_URL: _migrationUrl, ...runtimeBase } = base;
+test('runtime configuration neither requires nor retains deployment/restore credentials and defaults concurrency to two', () => {
+  const { DATABASE_DIRECT_URL: _migrationUrl, DATABASE_RESTORE_URL: _restoreUrl, ...runtimeBase } = base;
   const env = loadRuntimeEnvironment({ ...runtimeBase, BACKUP_ENABLED: 'false' });
   assert.equal(env.DATABASE_DIRECT_URL, undefined);
+  assert.equal(env.DATABASE_RESTORE_URL, undefined);
   assert.equal(env.RUNNER_CONCURRENCY, 2);
   assert.equal(loadRuntimeEnvironment({ ...base, BACKUP_ENABLED: 'false' }).DATABASE_DIRECT_URL, undefined);
+});
+
+test('runtime backup needs no restore credential while deployment tooling does', () => {
+  const backup = {
+    BACKUP_ENABLED: 'true', DATABASE_BACKUP_URL: 'postgresql://backup:password@host/db?sslmode=verify-full',
+    S3_ENDPOINT: 'https://s3.example.test', S3_BUCKET: 'questshop-backups', S3_ACCESS_KEY_ID: 'key',
+    S3_SECRET_ACCESS_KEY: 'secret', BACKUP_ENCRYPTION_KEYS_JSON: JSON.stringify({ current: 1, keys: { 1: key } }),
+  };
+  assert.equal(loadRuntimeEnvironment({ ...base, ...backup }).DATABASE_RESTORE_URL, undefined);
+  assert.throws(() => loadEnvironment({ ...base, ...backup }), /DATABASE_RESTORE_URL/);
 });
 
 test('non-production defaults backups off when no backup settings are supplied', () => {

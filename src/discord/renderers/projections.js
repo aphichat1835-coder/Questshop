@@ -25,6 +25,17 @@ function safeHttpsUrl(value) {
     return normalized && normalized.length <= 512 ? normalized : null;
   } catch { return null; }
 }
+function setSafeThumbnail(embed, value) {
+  const url = safeHttpsUrl(value);
+  if (url) embed.setThumbnail(url);
+}
+function setSafeImage(embed, value) {
+  const url = safeHttpsUrl(value);
+  if (url) embed.setImage(url);
+}
+function missingProjection(title) {
+  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle(title)], allowedMentions: noMentions };
+}
 
 async function renderRefund(pool, projection, { client }) {
   const refund = (await pool.query(`SELECT f.*,i.order_id,i.quest_id,i.quest_name,
@@ -45,7 +56,7 @@ async function renderRefund(pool, projection, { client }) {
   ];
   const embed = new EmbedBuilder().setColor(color.success).setTitle('↩️ คืนเงิน Order Item')
     .setDescription(lines.join('\n')).setTimestamp(refund.created_at);
-  if (user) embed.setThumbnail(user.displayAvatarURL({ size: 128 }));
+  if (user) setSafeThumbnail(embed, user.displayAvatarURL({ size: 128 }));
   const users = /^\d{17,20}$/.test(refund.actor_id)
     ? [refund.discord_user_id, refund.actor_id] : [refund.discord_user_id];
   return { embeds: [embed], allowedMentions: { users, parse: [] } };
@@ -151,7 +162,7 @@ async function renderPaymentLog(pool, projection, { env, client }) {
   ].join('\n');
   const embed = new EmbedBuilder().setColor(topup.status === 'CREDITED' ? color.success : color.failure)
     .setTitle(logTitle).setDescription(description).setTimestamp(topup.updated_at);
-  if (user) embed.setThumbnail(user.displayAvatarURL({ size: 128 }));
+  if (user) setSafeThumbnail(embed, user.displayAvatarURL({ size: 128 }));
   return { embeds: [embed], allowedMentions: { users: [topup.discord_user_id], parse: [] } };
 }
 
@@ -179,7 +190,7 @@ async function renderQuestNew(pool, projection) {
   const embed = new EmbedBuilder().setColor(color.info).setTitle(title)
     .setDescription(description).setTimestamp(quest.updated_at);
   if (questUrl) embed.setURL(questUrl);
-  if (quest.artwork_url) embed.setImage(quest.artwork_url);
+  setSafeImage(embed, quest.artwork_url);
   return { embeds: [embed], allowedMentions: noMentions };
 }
 
@@ -187,6 +198,7 @@ async function renderQuestOperation(pool, projection) {
   const quest = (await pool.query(`SELECT q.*,(SELECT count(*)::integer FROM quest_test_runs t WHERE t.quest_id=q.quest_id) AS test_attempts,
     (SELECT state FROM quest_test_runs t WHERE t.quest_id=q.quest_id ORDER BY created_at DESC LIMIT 1) AS latest_test_state
     FROM quests q WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
+  if (!quest) return missingProjection('ไม่พบ Quest Operation');
   const description = [
     `**Quest:** ${escape(quest.name)} (\`${escape(quest.quest_id)}\`)`, `**Analysis:** ${escape(quest.analysis_state)} v${quest.analysis_version}`,
     `**Sale:** ${escape(quest.sale_state)} v${quest.sale_version}`, `**Announcement:** ${escape(quest.announcement_state)}`,
@@ -202,6 +214,7 @@ async function renderCheckoutAudit(pool, projection) {
     (SELECT count(*)::integer FROM checkout_quest_options o WHERE o.session_id=s.id) AS option_count,
     (SELECT count(*)::integer FROM checkout_quest_options o WHERE o.session_id=s.id AND o.selected) AS selected_count
     FROM interaction_sessions s WHERE s.id=$1`, [projection.aggregate_id])).rows[0];
+  if (!session) return missingProjection('ไม่พบ Checkout Audit');
   const profile = session.payload ?? {};
   const description = [
     '**Token check:** ผ่าน — Token ถูกเข้ารหัสและไม่บันทึก/แสดงใน Log',
@@ -212,7 +225,7 @@ async function renderCheckoutAudit(pool, projection) {
   ].join('\n');
   const embed = new EmbedBuilder().setColor(color.info).setTitle('Checkout • ตรวจ Token')
     .setDescription(description).setTimestamp(session.created_at);
-  if (profile.avatarUrl) embed.setThumbnail(profile.avatarUrl);
+  setSafeThumbnail(embed, profile.avatarUrl);
   return { embeds: [embed], allowedMentions: noMentions };
 }
 
@@ -220,6 +233,7 @@ async function renderCustomerQuestDiscovery(pool, projection) {
   const found = (await pool.query(`SELECT d.*,q.name,q.task_type,q.executor_id,q.sale_state
     FROM customer_quest_discoveries d JOIN quests q ON q.quest_id=d.quest_id WHERE d.id=$1`,
   [projection.aggregate_id])).rows[0];
+  if (!found) return missingProjection('ไม่พบ Customer Quest Discovery');
   const description = [
     `**ผู้พบ Quest:** <@${found.discord_user_id}> (\`${found.discord_user_id}\`)`,
     `**บัญชี Quest:** ${escape(found.account_username)} (\`${escape(found.account_id)}\`)`,
@@ -231,7 +245,7 @@ async function renderCustomerQuestDiscovery(pool, projection) {
   ].join('\n');
   const embed = new EmbedBuilder().setColor(color.pending).setTitle('🔎 พบ Quest ใหม่จาก Checkout ลูกค้า')
     .setDescription(description).setTimestamp(found.created_at);
-  if (found.account_avatar_url) embed.setThumbnail(found.account_avatar_url);
+  setSafeThumbnail(embed, found.account_avatar_url);
   return { embeds: [embed], allowedMentions: { users: [found.discord_user_id], parse: [] } };
 }
 
@@ -242,6 +256,7 @@ async function renderQuestTestFailure(pool, projection) {
     (SELECT count(DISTINCT r.target_monitor_id)::integer FROM quest_test_runs r WHERE r.batch_id=a.batch_id) AS monitor_count
     FROM quest_test_failure_alerts a JOIN quests q ON q.quest_id=a.quest_id
     JOIN quest_test_batches b ON b.id=a.batch_id WHERE a.id=$1`, [projection.aggregate_id])).rows[0];
+  if (!alert) return missingProjection('ไม่พบ Quest Test Failure');
   const failure = alert.last_error?.message ?? alert.latest_error?.message ?? 'ไม่พบรายละเอียดข้อผิดพลาด';
   const description = [
     `**Quest:** ${escape(alert.name)} (\`${escape(alert.quest_id)}\`)`,
@@ -280,6 +295,7 @@ async function renderManualReview(pool, projection) {
       FROM runner_attempts a JOIN runner_jobs j ON j.id=a.job_id
       WHERE j.order_item_id::text=r.subject_id AND r.subject_type='ORDER_ITEM') runner_attempts ON true
     WHERE r.id=$1`, [projection.aggregate_id])).rows[0];
+  if (!review) return missingProjection('ไม่พบ Manual Review');
   const wallet = review.available_cents == null ? 'ไม่พบ Wallet' : `${baht(review.available_cents)} / จอง ${baht(review.reserved_cents)}`;
   const description = [
     `**Review ID:** \`${review.id}\``, `**Subject:** ${escape(review.subject_type)} / \`${escape(review.subject_id)}\``,
@@ -297,6 +313,7 @@ async function renderRunnerSummary(pool, projection) {
   const job = (await pool.query(`SELECT j.*,i.quest_name,i.state AS item_state,i.progress_actual,i.progress_bucket,i.price_cents,
     o.account_id,o.account_username FROM runner_jobs j JOIN order_items i ON i.id=j.order_item_id JOIN orders o ON o.id=i.order_id
     WHERE j.id=$1`, [projection.aggregate_id])).rows[0];
+  if (!job) return missingProjection('ไม่พบ Runner Summary');
   let runnerColor = color.info;
   if (job.state === 'COMPLETED') runnerColor = color.success;
   else if (job.state === 'FAILED') runnerColor = color.failure;
@@ -311,6 +328,7 @@ async function renderRunnerSummary(pool, projection) {
 
 async function renderIncident(pool, projection) {
   const incident = (await pool.query('SELECT * FROM incidents WHERE id=$1', [projection.aggregate_id])).rows[0];
+  if (!incident) return missingProjection('ไม่พบ System Incident');
   const incidentColor = incident.severity === 'CRITICAL' ? color.failure : color.pending;
   const description = [
     `**สถานะ:** ${escape(incident.state)}`, `**Severity:** ${escape(incident.severity)}`,
@@ -322,6 +340,7 @@ async function renderIncident(pool, projection) {
 
 async function renderAdminAudit(pool, projection) {
   const audit = (await pool.query('SELECT * FROM admin_audit_logs WHERE id=$1', [projection.aggregate_id])).rows[0];
+  if (!audit) return missingProjection('ไม่พบ Admin Audit');
   const actorIsUser = /^\d{17,20}$/.test(audit.actor_id);
   const actor = actorIsUser ? `<@${audit.actor_id}>` : escape(audit.actor_id);
   const description = [
@@ -352,7 +371,7 @@ async function renderQuestHistory(pool, projection) {
     item.terminal_reason ? `**เหตุผล:** ${terminalReasonLabel(item.terminal_reason)}` : null,
   ].filter(Boolean).join('\n');
   const embed = new EmbedBuilder().setColor(status.tone).setTitle(status.title).setDescription(description).setTimestamp(item.updated_at);
-  if (item.account_avatar_url) embed.setThumbnail(item.account_avatar_url);
+  setSafeThumbnail(embed, item.account_avatar_url);
   const components = item.state === 'READY_TO_CLAIM' && claimUrl
     ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(claimUrl).setLabel('รับรางวัล Quest นี้'))]
     : [];

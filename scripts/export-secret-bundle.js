@@ -12,7 +12,10 @@ if (!['runtime', 'deployment'].includes(scope)) {
 const source = fileURLToPath(new URL('../.env', import.meta.url));
 const values = parseEnvironmentText(await readFile(source, 'utf8'));
 delete values.QUESTSHOP_SECRET_BUNDLE;
-if (scope === 'runtime') delete values.DATABASE_DIRECT_URL;
+if (scope === 'runtime') {
+  delete values.DATABASE_DIRECT_URL;
+  delete values.DATABASE_RESTORE_URL;
+}
 const encoded = Buffer.from(JSON.stringify(values), 'utf8').toString('base64url');
 const target = path.resolve(output);
 const temporary = `${target}.${process.pid}.tmp`;

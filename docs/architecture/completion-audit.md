@@ -22,6 +22,21 @@ Implementation: migration `0017_monitor_test_sale_gate.sql`, `domain/catalog/tes
 checkout, test worker, admin override and Discord projection/router changes. Automated evidence:
 `test/integration/monitor-test-gate.test.js` and `checkout-lazy.test.js`.
 
+## Later implementation decision — Execution-contract pinning
+
+Monitor test evidence is valid only for the exact normalized Quest execution contract: Quest ID, application,
+event/progress key, target, executor, contract/engine/executor/verification versions.  The SHA-256 fingerprint is
+stored with every metadata revision, test batch/run, checkout option, Order Item and Runner Job.  Any difference
+invalidates an earlier pass and an earlier Admin override; it cannot silently reopen sale or run an old quote.
+
+The test worker uses PostgreSQL time to defer until the Quest start or enrollment block ends and rejects a test
+when expiry admission is no longer safe.  If a worker dies after a durable mutation intent, its replacement first
+fetches fresh Quest state; only a proven progress mutation can recover a pass, otherwise at most one child
+controlled-retry intent is allowed.  This is source/test evidence only; live Monitor and Quest UAT remains required.
+
+Implementation: migration `0024_quest_contract_pinning.sql`, `quest-engine/schema/contract.js`, catalog/checkout/
+runner/test-worker services and `test/unit/quest-contract-pinning.test.js`.
+
 ## Later Owner usability decision — Monitor Token panel
 
 Every Monitor is created with both `SCAN` and `TEST`; the Admin flow no longer asks the Owner to
@@ -81,7 +96,7 @@ contracts, not evidence for a managed production service.
 | 10. Wallet, price and promotion | wallet/ledger/pricing/promotion domains and settlement tests | Source-confirmed. Owner financial pre-launch compensation sign-off remains. |
 | 11. Interaction security and Discord rate limits | opaque component IDs, server sessions, outbox and security tests | Source-confirmed. Actual Discord REST/Gateway behaviour remains. |
 | 12. Correlation and PostgreSQL time | correlation, transition, transaction, PostgreSQL time modules and durable interaction-session traces | Source-confirmed. Managed database clock/role observation remains. |
-| 13. PostgreSQL production contract | pools, transaction wrapper, migrations, `postgresql-roles.md` | Source-confirmed. Managed PostgreSQL TLS, role grants and backup roles remain. |
+| 13. PostgreSQL production contract | pools, transaction wrapper, migrations, `postgresql-roles.md` | Source-confirmed. Deployment grants and Startup validates split Runtime-role access to durable Quest API cooldown state; managed PostgreSQL TLS and backup roles remain live evidence. |
 | 14. Startup, shutdown and health | bootstrap, shutdown, health server and worker manager | Source-confirmed. `/statusz` uses fixed-size digest comparison for its Bearer token and never returns operational detail to unauthorized requests. Deployment/restart drill remains. |
 | 15. Surface setup permissions | `src/bootstrap/startup.js`, `src/discord/surfaces/{setup,privacy}.js`, outbox worker and surface policy tests | Startup requires Bot Administrator once. Runtime Permission Drift detector/repair remains removed; private human-visibility checks remain at setup and `LOG_PAYMENTS` checks again before decrypt/render, with incident/DLQ/manual repair on exposure. |
 | 16. Engine/config versioning | versions, config service, runner pinning and compatibility test | Source-confirmed. N/N-1 deployment drain remains. |

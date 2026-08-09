@@ -7,6 +7,7 @@ import { assertTransition, recordTransition } from '../shared/transition.js';
 import { evaluateExpiryAdmission } from './expiry.js';
 import { createMonitorTestBatch, hasCurrentTestPass } from './test-gate.js';
 import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS } from './states.js';
+import { questContractHash } from '../../quest-engine/schema/contract.js';
 
 async function transitionAnalysis(client, quest, next, context) {
   if (quest.analysis_state === next) return quest;
@@ -30,7 +31,7 @@ async function reconcileSale(client, quest, normalized, context, runnerConcurren
   const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency });
   const testPassed = await hasCurrentTestPass(client, quest);
   const canSell = quest.analysis_state === 'SUPPORTED'
-    && normalized.coreComplete && Boolean(price) && expiry.eligible && testPassed;
+    && normalized.coreComplete && normalized.contractComplete && Boolean(price) && expiry.eligible && testPassed;
   let next = quest.sale_state;
   const expired = (await client.query(
     'SELECT $1::timestamptz <= clock_timestamp() AS value',
@@ -57,9 +58,7 @@ async function reconcileSale(client, quest, normalized, context, runnerConcurren
 
 function requiresRetest(previousQuest, normalized) {
   if (!previousQuest) return false;
-  return previousQuest.executor_id !== normalized.executorId
-    || previousQuest.contract_version !== QUEST_CONTRACT_VERSION
-    || Number(previousQuest.task_target) !== Number(normalized.secondsNeeded);
+  return previousQuest.current_contract_hash !== normalized.contractHash;
 }
 
 // A Monitor can see a partial Quest payload while another active account sees
@@ -82,10 +81,20 @@ function mergeDiscoveryMetadata(previousQuest, normalized) {
   };
   merged.coreComplete = Boolean(merged.id && merged.eventName && Number(merged.secondsNeeded) > 0
     && merged.startsAt && merged.expiresAt && merged.url);
-  if (merged.coreComplete && previousQuest.analysis_state === 'SUPPORTED') {
+  // A partial payload may borrow cosmetic/absent metadata, but explicit new
+  // incompatibility evidence must never be hidden by a previously supported
+  // contract.
+  if (merged.coreComplete && previousQuest.analysis_state === 'SUPPORTED'
+    && !normalized.compatibilityIssues?.length && normalized.contractHash) {
     merged.autoSupported = true;
   }
-  return merged;
+  const contract = questContractHash(merged, {
+    engineVersion: ENGINE_VERSION,
+    executorVersion: EXECUTOR_VERSION,
+    contractVersion: QUEST_CONTRACT_VERSION,
+  });
+  return { ...merged, contractHash: contract.hash, contractCanonical: contract.canonical,
+    contractComplete: contract.complete && Boolean(merged.autoSupported) };
 }
 
 async function upsertQuest(client, normalized) {
@@ -93,8 +102,8 @@ async function upsertQuest(client, normalized) {
       INSERT INTO quests(
         quest_id, analysis_state, name, task_type, task_target, url, artwork_url,
         orbs, starts_at, expires_at, executor_id, engine_version,
-        executor_version, contract_version
-      ) VALUES ($1,'DETECTED',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        executor_version, contract_version,current_contract_hash
+      ) VALUES ($1,'DETECTED',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       ON CONFLICT (quest_id) DO UPDATE SET
         name = EXCLUDED.name, task_type = EXCLUDED.task_type,
         task_target = EXCLUDED.task_target, url = EXCLUDED.url,
@@ -102,13 +111,14 @@ async function upsertQuest(client, normalized) {
         starts_at = EXCLUDED.starts_at, expires_at = EXCLUDED.expires_at,
         executor_id = EXCLUDED.executor_id, engine_version = EXCLUDED.engine_version,
         executor_version = EXCLUDED.executor_version, contract_version = EXCLUDED.contract_version,
+        current_contract_hash = EXCLUDED.current_contract_hash,
         updated_at = transaction_timestamp()
       RETURNING *
     `, [
       normalized.id, normalized.name, normalized.eventName, normalized.secondsNeeded,
       normalized.url, normalized.artworkUrl, normalized.orbs, normalized.startsAt,
       normalized.expiresAt, normalized.executorId, ENGINE_VERSION, EXECUTOR_VERSION,
-      QUEST_CONTRACT_VERSION,
+      QUEST_CONTRACT_VERSION, normalized.contractHash,
     ])).rows[0];
 }
 
@@ -117,11 +127,12 @@ async function recordMetadataRevision(client, quest, normalized, source, redacte
     await client.query(`
       INSERT INTO quest_metadata_revisions(
         id, quest_id, revision, normalized, redacted_raw, source,
-        core_complete, schema_issues, trace_id
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        core_complete, schema_issues, contract_hash, contract_complete, trace_id
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     `, [
       uuidv7(), quest.quest_id, revision, normalized, redactedRaw ?? normalized,
-      source, normalized.coreComplete, normalized.compatibilityIssues, context.traceId,
+      source, normalized.coreComplete, normalized.compatibilityIssues, normalized.contractHash,
+      normalized.contractComplete, context.traceId,
     ]);
   const updatedQuest = (await client.query(`
       UPDATE quests SET current_metadata_revision = $2 WHERE quest_id = $1 RETURNING *
@@ -202,7 +213,8 @@ export async function ingestDiscovery({
 
 function coreMetadataPresent(quest) {
   return Boolean(quest?.name && quest.task_type && Number(quest.task_target) > 0
-    && quest.url && quest.starts_at && quest.expires_at && quest.executor_id);
+    && quest.url && quest.starts_at && quest.expires_at && quest.executor_id
+    && quest.current_contract_hash);
 }
 
 export async function resolveSaleEligibility({

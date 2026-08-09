@@ -39,9 +39,21 @@ verification queries and reopening approval. Never paste tokens, cookies, databa
 ## Special decision rules
 
 - Ambiguous TrueMoney remains reserved for Owner decision until the TrueMoney application provides evidence.
-- A worker crash with an `IN_FLIGHT`, `ACCEPTED` or `UNCERTAIN` mutation enters Manual Review; fresh provider state is mandatory.
+- A worker crash with an `IN_FLIGHT`, `ACCEPTED` or `UNCERTAIN` mutation is first reacquired for one fresh
+  Quest-state verification. A proven completed result from the runner's own mutation is captured and moved to
+  `READY_TO_CLAIM`; a completed Quest whose Item never started and has no runner proof is released as external
+  completion. A proven absent `UNCERTAIN` mutation may receive one controlled retry. If the Item had already started
+  but durable completion provenance is missing or contradictory, it enters Manual Review with money still Reserved
+  instead of guessing Capture or Refund.
+- A Monitor test whose Quest execution contract changed must not be force-published from an old alert.  Let the
+  scanner create a current-contract batch, or investigate the new private alert; **ส่งเลย** is valid only for the
+  same fingerprint.  A crash-recovered Monitor test verifies fresh state first and never treats enrollment alone as
+  proof of test completion.
 - Financial/Audit DLQ can be replayed but never discarded. Replay creates a new Outbox event and parent trace.
 - Surface permissions are configured and checked as a one-time precondition during setup. Runtime delivery failures are recorded as incidents; the bot never changes channel overwrites automatically.
 - Database restore is disaster-only for production. Stop the store, preserve the failed database and reconcile every credit.
+- If a migration fails after its pre-migration backup reached S3 but before `backup_runs` was written, do **not**
+  re-run DDL first. Use `npm run backup:reconcile` with deployment/backup credentials to verify the manifest and
+  object size, record the artifact, then select it for a restore drill or the forward-fix decision.
 - Full voucher-link exposure requires disabling `LOG_PAYMENTS`, correcting access, preserving audit and reviewing viewers.
 - A user block never confiscates Wallet credit and never changes an active job unless Admin performs a separate audited action.

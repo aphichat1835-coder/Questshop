@@ -37,6 +37,10 @@ const files = (await Promise.all(selectedRoots.map(filesUnder))).flat().sort();
 if (!files.length) throw new Error('No test files found');
 if (coverage) {
   await mkdir(resolve('coverage'), { recursive: true });
+  // Reporter destinations are paired in declaration order by Node. Keep each
+  // reporter next to its destination; grouping reporters first produced an
+  // empty LCOV artifact on supported Node versions while the textual report
+  // still looked successful.
   await run(['--test', '--test-concurrency=1', '--experimental-test-coverage',
     '--test-reporter=spec', '--test-reporter-destination=stdout',
     '--test-reporter=lcov', '--test-reporter-destination=coverage/lcov.info', ...files]);

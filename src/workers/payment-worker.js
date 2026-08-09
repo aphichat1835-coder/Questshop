@@ -77,7 +77,10 @@ async function openCircuit(pool, error, context, breaker) {
     version=version+1,actor_type='SYSTEM',actor_id='payment-worker',trace_id=$1,
     updated_at=clock_timestamp() WHERE gate='AUTO_CREDIT_ENABLED'`, [context.traceId]);
   await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-    VALUES(gen_random_uuid(),'PROVIDER_SCHEMA_CHANGED','TRUEMONEY_DIRECT','OPEN','CRITICAL',$1,$2)`,
+    VALUES(gen_random_uuid(),'PROVIDER_SCHEMA_CHANGED','TRUEMONEY_DIRECT','OPEN','CRITICAL',$1,$2)
+    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
+      severity=EXCLUDED.severity,evidence=EXCLUDED.evidence,trace_id=EXCLUDED.trace_id,
+      updated_at=clock_timestamp()`,
   [{ errorCode: error.code ?? error.name }, context.traceId]);
 }
 
@@ -102,9 +105,11 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
     await closeSuccessfulProbe(pool, breaker, context);
     if (updated.status === 'REDEEMED' && autoCredit) await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
   } catch (error) {
+    // The provider outcome is authoritative financial state. Incident and gate
+    // updates are operational side effects and must never prevent it from
+    // becoming durable (especially while an identical incident is already open).
+    await recordProviderResult({ topup, attemptId: attempt.id, result: failureResult(error, topup) }, context, { pool });
     await openCircuit(pool, error, context, breaker);
-    await recordProviderResult({ topup, attemptId: attempt.id, result: failureResult(error, topup) }, context, { pool })
-      .catch(() => {});
   } finally {
     await heartbeat.stop();
   }

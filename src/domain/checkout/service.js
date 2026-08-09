@@ -5,6 +5,7 @@ import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError, AuthorizationError } from '../../shared/errors.js';
 import { sumCents } from '../../shared/money.js';
 import { createQuestApiClient, profileFromEnv } from '../../quest-engine/api/client.js';
+import { getPersistentDiscordRateLimitCoordinator } from '../../quest-engine/rate-limits/coordinator.js';
 import { ingestDiscovery, resolveSaleEligibility } from '../catalog/service.js';
 import { resolvePrice } from '../pricing/resolver.js';
 import { evaluateExpiryAdmission } from '../catalog/expiry.js';
@@ -25,7 +26,7 @@ function lineId() {
   return randomBytes(9).toString('base64url');
 }
 function selectionHash(items, configVersion) {
-  const canonical = items.map((item) => `${item.line_id}:${item.quest_id}:${item.price_cents}:${item.price_rule_id}`)
+  const canonical = items.map((item) => `${item.line_id}:${item.quest_id}:${item.price_cents}:${item.price_rule_id}:${item.contract_hash ?? ''}`)
     .sort().join('|');
   return createHash('sha256').update(`${configVersion}|${canonical}`).digest('hex');
 }
@@ -41,7 +42,8 @@ function preflightPayload({ session, credential, items, profile, quests, dbNow }
     profileId: String(profile.id),
     checkedAt: new Date(dbNow).toISOString(),
     selection: items.map((item) => ({ lineId: item.line_id, questId: item.quest_id,
-      priceCents: String(item.price_cents), metadataRevision: String(item.metadata_revision) })),
+      priceCents: String(item.price_cents), metadataRevision: String(item.metadata_revision),
+      contractHash: item.contract_hash ?? null })),
     quests: items.map((item) => {
       const quest = fresh.get(item.quest_id);
       return { id: item.quest_id, completed: Boolean(quest?.completed),
@@ -92,7 +94,8 @@ export async function createSession({
   runnerConcurrency = env.RUNNER_CONCURRENCY,
 }, context, options = {}) {
   const apiFactory = options.questApiFactory ?? createQuestApiClient;
-  const api = apiFactory({ token, profile: profileFromEnv(env) });
+  const api = apiFactory({ token, profile: profileFromEnv(env),
+    coordinator: options.coordinator ?? getPersistentDiscordRateLimitCoordinator(options.pool) });
   const [profile, quests] = await Promise.all([
     api.fetchCurrentUser(),
     api.fetchQuests(),
@@ -145,12 +148,13 @@ export async function createSession({
       await client.query(`
       INSERT INTO checkout_quest_options(
         id, session_id, line_id, quest_id, quest_name, task_type,
-          price_cents, price_rule_id, metadata_revision, deadline_at, progress_actual,admission_scope
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          price_cents, price_rule_id, metadata_revision, contract_hash, deadline_at, progress_actual,admission_scope
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       `, [
         uuidv7(), sessionId, lineId(), quest.id, quest.name, quest.eventName,
         eligibility.price.amount_cents, eligibility.price.id,
-        eligibility.quest.current_metadata_revision, eligibility.quest.expires_at, quest.progress,
+        eligibility.quest.current_metadata_revision, eligibility.quest.current_contract_hash,
+        eligibility.quest.expires_at, quest.progress,
         eligibility.admissionScope,
       ]);
     }
@@ -340,6 +344,9 @@ export async function buildQuote({ sessionId, actorId, guildId, channelId = null
     if (!items.length) throw new QuestshopError('NO_QUEST_SELECTED', 'กรุณาเลือก Quest อย่างน้อยหนึ่งรายการ');
     for (const item of items) {
       const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR SHARE', [item.quest_id])).rows[0];
+      if (!quest || !item.contract_hash || item.contract_hash !== quest.current_contract_hash) {
+        throw new QuestshopError('QUEST_CONTRACT_CHANGED', 'รูปแบบ Quest เปลี่ยนไป กรุณาเริ่มเลือกใหม่');
+      }
       await validateOptionAdmission(client, item, quest);
       const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
       if (!price || price.id !== item.price_rule_id || BigInt(price.amount_cents) !== BigInt(item.price_cents)) {
@@ -390,7 +397,8 @@ async function loadPreflight({ sessionId, actorId, guildId, channelId, messageId
     authTag: snapshot.credential.auth_tag,
   }, env.DATA_ENCRYPTION_KEYS_JSON, `checkout:${sessionId}:${guildId}`);
   const apiFactory = options.questApiFactory ?? createQuestApiClient;
-  const api = apiFactory({ token, profile: profileFromEnv(env) });
+  const api = apiFactory({ token, profile: profileFromEnv(env),
+    coordinator: options.coordinator ?? getPersistentDiscordRateLimitCoordinator(options.pool) });
   const [profile, quests] = await Promise.all([api.fetchCurrentUser(), api.fetchQuests()]);
   if (String(profile.id) !== snapshot.credential.account_id) {
     throw new QuestshopError('TOKEN_ACCOUNT_CHANGED', 'Token ไม่ตรงกับบัญชีที่ตรวจครั้งแรก');
@@ -458,6 +466,10 @@ async function validateSelectedOptions(client, selected, freshById, runnerConcur
       const quest = (await client.query(
         'SELECT * FROM quests WHERE quest_id = $1 FOR SHARE', [option.quest_id],
       )).rows[0];
+      if (!quest || !option.contract_hash || option.contract_hash !== quest.current_contract_hash
+        || option.contract_hash !== fresh.contractHash) {
+        throw new QuestshopError('QUEST_CONTRACT_CHANGED', 'รูปแบบ Quest เปลี่ยนไป กรุณาตรวจรายการใหม่');
+      }
       await validateOptionAdmission(client, option, quest);
       const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
       if (!price || BigInt(price.amount_cents) !== BigInt(option.price_cents) || price.id !== option.price_rule_id) {
@@ -524,6 +536,7 @@ async function createOrderItems(client, orderId, session, validated) {
     price_cents: String(option.price_cents),
     price_rule_id: option.price_rule_id,
     metadata_revision: String(quest.current_metadata_revision),
+    contract_hash: option.contract_hash,
     progress_actual: Number(fresh.progress),
     progress_bucket: Math.floor(Math.min(99.999, Number(fresh.progress)) / 25) * 25,
     deadline_at: option.deadline_at,
@@ -533,12 +546,12 @@ async function createOrderItems(client, orderId, session, validated) {
     INSERT INTO order_items(
       id, order_id, sequence_number, quest_id, quest_name, task_type,
       price_cents, price_rule_id, config_version, metadata_revision,
-      engine_version, executor_version, contract_version,
+      engine_version, executor_version, contract_version, contract_hash,
       runner_state_schema_version, state, progress_actual, progress_bucket, deadline_at, admission_scope
     )
     SELECT rows.id, $2, rows.sequence_number, rows.quest_id, rows.quest_name, rows.task_type,
       rows.price_cents, rows.price_rule_id, $3, rows.metadata_revision,
-      $4, $5, $6, $7, 'SELECTED', rows.progress_actual, rows.progress_bucket, rows.deadline_at, rows.admission_scope
+      $4, $5, $6, rows.contract_hash, $7, 'SELECTED', rows.progress_actual, rows.progress_bucket, rows.deadline_at, rows.admission_scope
     FROM jsonb_to_recordset($1::jsonb) AS rows(
       id uuid,
       sequence_number integer,
@@ -548,6 +561,7 @@ async function createOrderItems(client, orderId, session, validated) {
       price_cents bigint,
       price_rule_id uuid,
       metadata_revision bigint,
+      contract_hash text,
       progress_actual numeric(7,3),
       progress_bucket smallint,
       deadline_at timestamptz,
@@ -573,12 +587,12 @@ async function queueFirstOrderItem(client, itemRows, actorId, preflight, context
   await client.query(`
       INSERT INTO runner_jobs(
         id, order_item_id, discord_user_id, account_id, state, deadline_at,
-        engine_version, executor_version, contract_version,
+        engine_version, executor_version, contract_version, contract_hash,
         runner_state_schema_version, trace_id
-      ) VALUES ($1,$2,$3,$4,'QUEUED',$5,$6,$7,$8,$9,$10)
+      ) VALUES ($1,$2,$3,$4,'QUEUED',$5,$6,$7,$8,$9,$10,$11)
   `, [
       uuidv7(), first.id, actorId, String(preflight.profile.id), first.deadline_at,
-      ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION,
+      ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION, first.contract_hash,
       RUNNER_STATE_SCHEMA_VERSION, context.traceId,
   ]);
   await client.query(`

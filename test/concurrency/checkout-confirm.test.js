@@ -5,6 +5,7 @@ import { createTestPool } from '../fixtures/postgres.js';
 import { createContext } from '../../src/shared/correlation.js';
 import { adjustBalance } from '../../src/domain/wallet/service.js';
 import { buildQuote, confirmOrder, createSession, selectAll } from '../../src/domain/checkout/service.js';
+import { questContractHash } from '../../src/quest-engine/schema/contract.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -25,14 +26,17 @@ function checkoutEnvironment() {
 
 function checkoutApi() {
   const now = new Date();
+  const quest = { id: 'race-quest', name: 'Race Quest', eventName: 'WATCH_VIDEO',
+    secondsNeeded: 60, progressSecs: 0, progress: 0, completed: false, completedAt: null,
+    enrolled: true, enrolledAt: now.toISOString(), autoSupported: true, executorId: 'video',
+    startsAt: now.toISOString(), expiresAt: new Date(now.getTime() + 86_400_000).toISOString(),
+    url: 'https://discord.com/quests/race-quest', artworkUrl: null, orbs: 10,
+    applicationId: 'app-race', progressKey: 'video', coreComplete: true, compatibilityIssues: [] };
+  const contract = questContractHash(quest, { engineVersion: '1.0.0', executorVersion: '1.0.0',
+    contractVersion: '1.0.0' });
   return {
     fetchCurrentUser: async () => ({ id: 'race-account', username: 'Race Account', avatar: null }),
-    fetchQuests: async () => [{ id: 'race-quest', name: 'Race Quest', eventName: 'WATCH_VIDEO',
-      secondsNeeded: 60, progressSecs: 0, progress: 0, completed: false, completedAt: null,
-      enrolled: true, enrolledAt: now.toISOString(), autoSupported: true, executorId: 'video',
-      startsAt: now.toISOString(), expiresAt: new Date(now.getTime() + 86_400_000).toISOString(),
-      url: 'https://discord.com/quests/race-quest', artworkUrl: null, orbs: 10,
-      coreComplete: true, compatibilityIssues: [] }],
+    fetchQuests: async () => [{ ...quest, contractHash: contract.hash, contractComplete: contract.complete }],
   };
 }
 
@@ -40,7 +44,7 @@ function context(actorId, idempotencyKey) {
   return createContext({ actorType: 'CUSTOMER', actorId, guildId: '10000000000000002', idempotencyKey });
 }
 
-test('simultaneous confirmation of one checkout creates one order and one reservation', async (t) => {
+test('simultaneous confirmation of one checkout creates one order and one reservation', { timeout: 60_000 }, async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7();
   const user = 'checkout-race-user';

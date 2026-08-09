@@ -68,6 +68,12 @@ export async function forcePublishFailedMonitorTest({ alertId, reason }, context
     if (alert.state === 'OVERRIDDEN') return { alert, idempotent: true };
     if (alert.state !== 'OPEN') throw new QuestshopError('QUEST_TEST_ALERT_NOT_OPEN', 'รายการนี้ไม่ได้รอการตัดสินใจ');
     const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [alert.quest_id])).rows[0];
+    const batch = (await client.query('SELECT contract_hash FROM quest_test_batches WHERE id=$1 FOR SHARE',
+      [alert.batch_id])).rows[0];
+    if (!batch || batch.contract_hash !== quest.current_contract_hash) {
+      throw new QuestshopError('QUEST_TEST_ALERT_STALE_CONTRACT',
+        'ผลทดสอบนี้เป็นของรูปแบบ Quest เก่า จึงใช้เปิดขายรูปแบบปัจจุบันไม่ได้');
+    }
     const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
     const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency: 2 });
     if (quest.analysis_state !== 'SUPPORTED' || !quest.executor_id || !price || !expiry.eligible) {
@@ -76,7 +82,9 @@ export async function forcePublishFailedMonitorTest({ alertId, reason }, context
     if (quest.sale_state !== 'OPEN') assertTransition(SALE_TRANSITIONS, quest.sale_state, 'OPEN');
     const updatedQuest = (await client.query(`UPDATE quests SET public_test_gate_override=true,
       public_test_gate_override_by=$2,public_test_gate_override_at=clock_timestamp(),
-      public_test_gate_override_reason=$3,sale_state='OPEN',sale_version=sale_version+1,
+      public_test_gate_override_reason=$3,
+      public_test_gate_override_contract_hash=current_contract_hash,
+      sale_state='OPEN',sale_version=sale_version+1,
       updated_at=clock_timestamp() WHERE quest_id=$1 AND sale_version=$4 RETURNING *`, [
       quest.quest_id, context.actorId, reason.trim(), quest.sale_version,
     ])).rows[0];

@@ -36,11 +36,18 @@ export async function evaluateExpiryAdmission(client, {
   runnerConcurrency = 2,
   now = null,
 }) {
+  const startsAt = Date.parse(quest.starts_at ?? quest.startsAt);
   const expiresAt = Date.parse(quest.expires_at ?? quest.expiresAt);
   const databaseNow = now ?? (await client.query(
     'SELECT clock_timestamp() AS value',
   )).rows[0].value;
   const current = Date.parse(databaseNow);
+  // New catalog/checkout admission requires starts_at. Older prelaunch jobs
+  // may legitimately lack it, so do not strand an already-reserved N-1 job.
+  if (Number.isFinite(startsAt) && startsAt > current) {
+    return { eligible: false, reason: 'QUEST_NOT_STARTED', remainingMs: null,
+      availableAt: new Date(startsAt).toISOString() };
+  }
   if (!Number.isFinite(expiresAt)) return { eligible: false, reason: 'EXPIRY_MISSING' };
   const [runtimeMs, queueWaitMs] = await Promise.all([
     runtimeEstimateMs(client, quest),

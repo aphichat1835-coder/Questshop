@@ -145,6 +145,10 @@ test('Discord 404 reconciles only the affected surface and 429 honors Retry-Afte
     FROM outbox_events WHERE id=$1`, [throttledEvent])).rows[0];
   assert.equal(throttled.state, 'RETRY_WAIT');
   assert.ok(Number(throttled.delay) >= 59);
+  // The test intentionally leaves both retry paths queued. Mark them done
+  // after asserting their state so later cases always acquire their own event.
+  await pool.query("UPDATE outbox_events SET state='DELIVERED',lease_owner=NULL,lease_expires_at=NULL WHERE id = ANY($1::uuid[])",
+    [[missingEvent, throttledEvent]]);
 });
 
 test('delivery coalesces obsolete outbox events for the same Discord message', async (t) => {

@@ -1,5 +1,6 @@
 import { v7 as uuidv7 } from 'uuid';
-import { withTransaction } from '../../db/transaction.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { isRetryableTransactionError, withTransaction } from '../../db/transaction.js';
 import { allVoucherHmacs, encryptSecret } from '../../adapters/crypto/keyring.js';
 import { normalizeVoucherUrl } from '../../adapters/truemoney/voucher.js';
 import { QuestshopError, FencingLostError } from '../../shared/errors.js';
@@ -14,6 +15,20 @@ async function findVoucher(client, hashes) {
       SELECT * FROM topups WHERE voucher_hmac_version = $1 AND voucher_hmac = $2
     `, [candidate.version, candidate.digest])).rows[0];
     if (row) return row;
+  }
+  return null;
+}
+
+async function findCommittedVoucher(pool, hashes) {
+  // PostgreSQL may report a serialization failure while the concurrent owner
+  // is still committing.  This is a read-only bounded reconciliation; it
+  // never attempts to redeem or recreate a voucher.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const existing = await withTransaction({ pool, isolation: 'READ COMMITTED', maxAttempts: 1 }, (client) => (
+      findVoucher(client, hashes)
+    ));
+    if (existing) return existing;
+    if (attempt < 4) await delay(25 * (attempt + 1));
   }
   return null;
 }
@@ -82,12 +97,13 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
     return { topup, idempotent: false };
     });
   } catch (error) {
-    if (error.code !== '23505') throw error;
-    return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {
-      const existing = await findVoucher(client, hashes);
-      if (!existing) throw error;
-      return { topup: existing, idempotent: true };
-    });
+    // Concurrent submissions of the same voucher may exhaust SERIALIZABLE
+    // retries after the competing transaction has become its durable owner.
+    // Re-read only the HMAC identity; never re-run creation or encryption.
+    if (error.code !== '23505' && !isRetryableTransactionError(error)) throw error;
+    const existing = await findCommittedVoucher(options.pool, hashes);
+    if (!existing) throw error;
+    return { topup: existing, idempotent: true };
   }
 }
 

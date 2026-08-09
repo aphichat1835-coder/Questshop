@@ -45,6 +45,35 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Changed
 
+- Monitor test passes, Admin **ส่งเลย** overrides, checkout selections, Order Items and Runner Jobs are now
+  pinned to one SHA-256 execution-contract fingerprint.  A changed task target/event/progress key cannot reuse a
+  prior pass or silently run under an old quoted contract; it pauses public sale and is retained for safe review.
+- Monitor tests now defer through PostgreSQL time until the Quest start/enrollment window is available, reject
+  unsafe expiry admission before mutation, and recover a crashed durable mutation by fetching fresh Quest state
+  before one linked controlled retry can be considered.
+- Quest Engine ยึด Discord Quest adapter ที่พิสูจน์จาก baseline: API v9, bounded 15-second request timeout,
+  response-size guard, endpoint-specific 403 classification, CAPTCHA-aware heartbeat และ fallback
+  `stream_key → application_id` โดยไม่มี Automatic Claim
+- Runner recovery เปลี่ยนจากการส่งงานที่มี Mutation ค้างเข้า Manual Review ทันที เป็นการ Fetch Quest ใหม่
+  เพื่อ Verify ผลก่อน; retry ได้เฉพาะ `UNCERTAIN` ที่พิสูจน์ว่าไม่เกิดผลและได้เพียงหนึ่งครั้ง
+- Capture/Release, terminal Runner job และ lazy materialization ของ Item ถัดไปอยู่ใน Serializable transaction
+  เดียวกัน; expiry maintenance ใช้เส้นทางเดียวกันเพื่อไม่ให้ออเดอร์ค้างหลัง Crash
+- Quest admission ชะลองานจนถึงเวลาเริ่ม Quest/เวลาปลด enrollment ของบัญชีนั้น และยังคงตรวจ expiry ด้วย
+  PostgreSQL time
+- Quest API 429 มี cooldown ระดับ Global/Route/Account และเก็บ Global/Route/Account cooldown ใน PostgreSQL
+  เพื่อกู้ต่อหลัง Restart โดยไม่เก็บ Token ดิบ; ทุก Checkout, Monitor, Scanner, Test และ Runner ใช้
+  coordinator ร่วมกันต่อ Runtime pool, Deployment มอบ `USAGE` เฉพาะ Schema และสิทธิ์ตารางให้ split Runtime
+  role โดยตรงโดยไม่มอบ DDL และลบ cooldown ที่หมดอายุเป็น batch จำกัดขนาด
+- Runner attempts บันทึก stage/evidence แบบ Redacted สำหรับ preflight, recovery verification, execution และ terminal outcome
+- Timeout/transport failure ของ Quest mutation ที่เกิดหลังเริ่มส่ง Request ถูกทำเครื่องหมายว่าอาจส่งถึง Discord
+  เสมอ: Runner ต้องอ่านสถานะสดก่อน retry และหากยืนยันว่าการทำงานเดิมเสร็จ จะ Capture ยอดจองและไป
+  `READY_TO_CLAIM` แทนการคืนเงินแบบ external completion
+- Controlled retry มี Mutation checkpoint และ Parent evidence แยกจากรอบแรก; Completion verification ถูกเก็บ
+  แบบ durable ก่อน Settlement และงานที่เริ่มแล้วแต่หาหลักฐานผู้ทำให้สำเร็จไม่ได้จะคง Reserved ใน Manual Review
+- Runtime ปฏิเสธ Schema ที่ยังไม่ถึง migration ปัจจุบันตั้งแต่ Readiness แทนการยอมเริ่มแล้วล้มภายหลังใน Worker
+- การส่งซองเดียวกันพร้อมกันที่ชน SERIALIZABLE retry จะ reconcile แบบ read-only กับ Top-up เจ้าของเดิม
+  ก่อนตอบผล idempotent จึงไม่สร้าง/เข้ารหัสรายการซ้ำและไม่ปล่อยคำขอที่ชนกันล้มโดยไม่จำเป็น
+
 - แยก Deployment migration ออกจาก Runtime: `npm run deploy` ตรวจและสร้าง Pre-migration backup ก่อนเขียน
   Production schema ขณะที่ `npm start` ใช้เฉพาะ pooled Runtime configuration และตรวจ schema แบบ read-only
 - Monitor enable/disable ใช้คำสั่งเจาะจงพร้อม expected state/version; Health check และ worker ไม่เขียนทับ
@@ -79,6 +108,18 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 - Runtime interaction handlers และ Shutdown ใช้ Runtime object เดียวกันเพื่อให้ ingress fencing ถูกต้อง
 - Setup command ที่เรียกซ้ำ Update/Move surface เดิมและเก็บ Guild/Channel/Message identity
 - Financial and runner recovery paths เพิ่ม durable transition evidence และ stale-fencing protection
+- Runtime startup ตรวจ migration checksum และ cryptographic keyring sentinel ก่อนยึด lease หรือรับ Interaction;
+  ระหว่าง recovery จะปิด ingress อย่างชัดเจน และต่ออายุ Runtime lease ตั้งแต่ต้น startup โดย retry เฉพาะ
+  DB transient แบบจำกัดครั้งก่อน self-fence
+- Monitor fatal-auth failure จะ Quarantine บัญชีใน Transaction เดียวก่อนเลือก token ทดสอบตัวถัดไป จึงไม่ทิ้ง
+  Quest-test batch ที่คิวอยู่กับบัญชีถูกกักกัน
+- Runtime secret bundle และ runtime loader ไม่ถือ `DATABASE_RESTORE_URL`; Backup/Restore รองรับทั้ง private CA
+  และ public trusted root, และมี `npm run backup:reconcile` สำหรับนำ pre-migration backup ที่อัปโหลดแล้วแต่
+  migration ล้มเหลวกลับเข้าสู่ durable record
+- Payment schema incident เป็น upsert และบันทึก Payment outcome ก่อนเปิด incident เพื่อไม่ให้ observability
+  ขวาง authoritative financial recovery; Projection มี fallback เมื่อ aggregate หายและตรวจ media URL ก่อน render
+- CI สร้าง LCOV ที่ตรวจว่าไม่ว่าง พร้อม gate coverage ขั้นต่ำสำหรับ lines/branches/functions เพื่อกันตัวเลขถอย
+  แบบเงียบ ๆ
 
 ### Removed
 

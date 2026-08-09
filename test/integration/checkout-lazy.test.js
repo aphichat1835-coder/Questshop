@@ -9,6 +9,7 @@ import {
 } from '../../src/domain/checkout/service.js';
 import { openOrderItemReview, setQuestSaleState } from '../../src/domain/admin/operations-service.js';
 import { resolveSubjectReview } from '../../src/domain/reviews/service.js';
+import { questContractHash } from '../../src/quest-engine/schema/contract.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -24,7 +25,12 @@ test('large checkout reserves all items but materializes one account job', async
     completedAt: null, enrolled: true, enrolledAt: new Date().toISOString(), autoSupported: true,
     executorId: 'video', startsAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 86_400_000).toISOString(), url: `https://discord.com/quests/checkout-${index}`,
-    artworkUrl: null, orbs: 100, coreComplete: true, compatibilityIssues: [] }));
+    artworkUrl: null, orbs: 100, applicationId: `app-${index}`, progressKey: 'video',
+    coreComplete: true, compatibilityIssues: [] })).map((quest) => {
+    const contract = questContractHash(quest, { engineVersion: '1.0.0', executorVersion: '1.0.0',
+      contractVersion: '1.0.0' });
+    return { ...quest, contractHash: contract.hash, contractComplete: contract.complete };
+  });
   const api = { fetchCurrentUser: async () => ({ id: 'quest-account', username: 'Quest Account', avatar: null }),
     fetchQuests: async () => quests };
   const key = Buffer.alloc(32, 9).toString('base64');
@@ -125,7 +131,8 @@ test('large checkout reserves all items but materializes one account job', async
     createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
       guildId: '10000000000000002', idempotencyKey: 'quest-pause' }), { pool });
   assert.equal(paused.sale_state, 'PAUSED');
-  await pool.query(`UPDATE quests SET public_test_gate_override=true WHERE quest_id=$1`, [questId]);
+  await pool.query(`UPDATE quests SET public_test_gate_override=true,
+    public_test_gate_override_contract_hash=current_contract_hash WHERE quest_id=$1`, [questId]);
   const reopened = await setQuestSaleState({ questId, nextState: 'OPEN', reason: 'validation passed',
     runnerConcurrency: 3 }, createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
     guildId: '10000000000000002', idempotencyKey: 'quest-open' }), { pool });

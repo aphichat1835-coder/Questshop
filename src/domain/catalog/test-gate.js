@@ -5,11 +5,13 @@ import { recordTransition } from '../shared/transition.js';
 const ACTIVE_BATCH_STATES = new Set(['QUEUED', 'RUNNING']);
 
 export async function hasCurrentTestPass(client, quest) {
-  if (quest.public_test_gate_override) return true;
+  if (quest.public_test_gate_override
+    && quest.public_test_gate_override_contract_hash === quest.current_contract_hash) return true;
   const result = await client.query(`SELECT 1 FROM quest_test_runs
     WHERE quest_id=$1 AND state='TEST_PASSED' AND engine_version=$2
-      AND executor_version=$3 AND contract_version=$4 LIMIT 1`, [
+      AND executor_version=$3 AND contract_version=$4 AND contract_hash=$5 LIMIT 1`, [
     quest.quest_id, quest.engine_version, quest.executor_version, quest.contract_version,
+    quest.current_contract_hash,
   ]);
   return result.rowCount > 0;
 }
@@ -24,10 +26,11 @@ async function activeTestMonitorIds(client) {
 async function queueAttempt(client, batch, quest, monitorId, attempt, context) {
   return (await client.query(`INSERT INTO quest_test_runs(
       id,quest_id,batch_id,target_monitor_id,state,engine_version,executor_version,
-      contract_version,attempt_in_monitor,trace_id
-    ) VALUES($1,$2,$3,$4,'TEST_QUEUED',$5,$6,$7,$8,$9) RETURNING *`, [
+      contract_version,contract_hash,attempt_in_monitor,deadline_at,trace_id
+    ) VALUES($1,$2,$3,$4,'TEST_QUEUED',$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [
     uuidv7(), quest.quest_id, batch.id, monitorId, quest.engine_version,
-    quest.executor_version, quest.contract_version, attempt, context.traceId,
+    quest.executor_version, quest.contract_version, quest.current_contract_hash, attempt,
+    quest.expires_at, context.traceId,
   ])).rows[0];
 }
 
@@ -81,15 +84,16 @@ async function failBatch(client, batch, quest, error, context) {
 
 export async function createMonitorTestBatch(client, { quest, context, requestedBy = 'SYSTEM', force = false }) {
   const existing = (await client.query(`SELECT * FROM quest_test_batches
-    WHERE quest_id=$1 ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id])).rows[0];
+    WHERE quest_id=$1 AND contract_hash IS NOT DISTINCT FROM $2
+    ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id, quest.current_contract_hash])).rows[0];
   if (existing && (ACTIVE_BATCH_STATES.has(existing.state) || !force)) {
     return { batch: existing, queued: null, reused: true };
   }
   const monitorOrder = await activeTestMonitorIds(client);
   const batch = (await client.query(`INSERT INTO quest_test_batches(
-    id,quest_id,state,monitor_order,trace_id,requested_by
-  ) VALUES($1,$2,'QUEUED',$3,$4,$5) RETURNING *`, [
-    uuidv7(), quest.quest_id, monitorOrder, context.traceId, requestedBy,
+        id,quest_id,state,monitor_order,contract_hash,trace_id,requested_by
+  ) VALUES($1,$2,'QUEUED',$3,$4,$5,$6) RETURNING *`, [
+    uuidv7(), quest.quest_id, monitorOrder, quest.current_contract_hash, context.traceId, requestedBy,
   ])).rows[0];
   const target = await activeMonitorAt(client, monitorOrder, 0);
   if (!target) return failBatch(client, batch, quest,
@@ -198,9 +202,9 @@ export async function retryFailedTestAlert(client, { alertId, context }) {
     WHERE id=$1 AND state_version=$3 RETURNING *`, [alert.id, context.traceId, alert.state_version])).rows[0];
   const monitorOrder = await activeTestMonitorIds(client);
   const batch = (await client.query(`INSERT INTO quest_test_batches(
-    id,quest_id,state,monitor_order,trace_id,requested_by
-  ) VALUES($1,$2,'QUEUED',$3,$4,$5) RETURNING *`, [
-    uuidv7(), quest.quest_id, monitorOrder, context.traceId, context.actorId,
+        id,quest_id,state,monitor_order,contract_hash,trace_id,requested_by
+  ) VALUES($1,$2,'QUEUED',$3,$4,$5,$6) RETURNING *`, [
+    uuidv7(), quest.quest_id, monitorOrder, quest.current_contract_hash, context.traceId, context.actorId,
   ])).rows[0];
   const target = await activeMonitorAt(client, monitorOrder, 0);
   if (!target) {

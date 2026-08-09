@@ -6,7 +6,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { loadEnvironment } from '../src/config/env.js';
 import { downloadAndDecryptBackup } from '../src/adapters/s3/backup.js';
 import { withPostgresRootCertificate } from '../src/adapters/s3/postgres-tls.js';
-import { getRuntimePool, closePools } from '../src/db/pools.js';
+import { getRuntimePool, closePools, postgresSslOptions } from '../src/db/pools.js';
 import { decryptSecret } from '../src/adapters/crypto/keyring.js';
 
 const { Pool } = pg;
@@ -24,7 +24,8 @@ const direct = new URL(env.DATABASE_RESTORE_URL);
 const password = decodeURIComponent(direct.password);
 direct.password = '';
 direct.pathname = '/postgres';
-const admin = new Pool({ connectionString: direct.toString(), password, ssl: { ca: Buffer.from(env.DATABASE_SSL_CA_BASE64, 'base64').toString('utf8'), rejectUnauthorized: true }, max: 1 });
+const admin = new Pool({ connectionString: direct.toString(), password,
+  ssl: postgresSslOptions(env, direct.toString()), max: 1 });
 let target;
 try {
   await admin.query(`CREATE DATABASE ${databaseName}`);
@@ -32,8 +33,10 @@ try {
     expectedChecksum: backup.checksum });
   const targetUrl = new URL(direct); targetUrl.pathname = `/${databaseName}`;
   await withPostgresRootCertificate(env, async (rootCertificatePath) => {
+    const processEnv = { ...process.env, PGPASSWORD: password };
+    if (rootCertificatePath) processEnv.PGSSLROOTCERT = rootCertificatePath;
     const child = spawn(env.PG_RESTORE_PATH ?? 'pg_restore', ['--no-owner', '--no-acl', `--dbname=${targetUrl}`], {
-      env: { ...process.env, PGPASSWORD: password, PGSSLROOTCERT: rootCertificatePath },
+      env: processEnv,
       stdio: ['pipe', 'ignore', 'pipe'],
     });
     let stderr = '';
@@ -46,7 +49,8 @@ try {
     const [code] = await Promise.all([waitForRestore, restoreInput]);
     if (code !== 0) throw new Error(`pg_restore failed (${code}): ${stderr}`);
   });
-  target = new Pool({ connectionString: targetUrl.toString(), password, ssl: { ca: Buffer.from(env.DATABASE_SSL_CA_BASE64, 'base64').toString('utf8'), rejectUnauthorized: true }, max: 1 });
+  target = new Pool({ connectionString: targetUrl.toString(), password,
+    ssl: postgresSslOptions(env, targetUrl.toString()), max: 1 });
   const receiver = (await target.query(`SELECT * FROM receiver_versions
     ORDER BY version DESC LIMIT 1`)).rows[0];
   if (receiver) decryptSecret({ keyVersion: receiver.encryption_key_version,

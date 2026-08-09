@@ -5,15 +5,19 @@ const { Pool } = pg;
 let runtimePool;
 let directPool;
 
-function commonOptions(env, connectionString) {
+export function postgresSslOptions(env, connectionString) {
   const databaseUrl = new URL(connectionString);
   const sslDisabledForTest = env.NODE_ENV === 'test' && databaseUrl.searchParams.get('sslmode') === 'disable';
-  const ssl = sslDisabledForTest ? false : {
+  return sslDisabledForTest ? false : {
     ...(env.DATABASE_SSL_CA_BASE64
       ? { ca: Buffer.from(env.DATABASE_SSL_CA_BASE64, 'base64').toString('utf8') }
       : {}),
     rejectUnauthorized: true,
   };
+}
+
+function commonOptions(env, connectionString) {
+  const ssl = postgresSslOptions(env, connectionString);
   return {
     ssl,
     connectionTimeoutMillis: 5_000,

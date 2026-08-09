@@ -43,13 +43,14 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
   };
   const start = (name, runOnce, idleMs) => tasks.push(runWorkerLoop({ name, signal, health, logger,
     runOnce, idleMs, onIteration: recordIteration }));
+  let nextRunnerRequeueAt = 0;
   start('readiness', async () => {
     try {
       await pool.query('SELECT 1');
       health.checks.database = 'OK';
       health.checks.discord = client.isReady() ? 'OK' : 'NOT_READY';
       const ready = client.isReady() && health.checks.schema === 'OK'
-        && health.checks.runtimeLease === 'OK' && health.checks.config === 'OK'
+        && health.checks.runtimeLease === 'OK' && health.checks.config === 'OK' && health.checks.bootstrap === 'READY'
         && health.checks.keyrings === 'OK';
       health.ready = ready;
       if (ready) health.lastError = null;
@@ -80,7 +81,12 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
         if (index >= effectiveConcurrency) return false;
         const acquisitionContext = createContext({ actorType: 'SYSTEM', actorId: holder,
           guildId: env.DISCORD_GUILD_ID, idempotencyKey: `runner-acquire:${uuidv7()}` });
-        await requeueDueRunnerJobs(acquisitionContext, { pool });
+        // Recovery is durable and also runs in maintenance. Avoid making every
+        // idle runner slot take a locking requeue transaction four times/sec.
+        if (Date.now() >= nextRunnerRequeueAt) {
+          nextRunnerRequeueAt = Date.now() + 5_000;
+          await requeueDueRunnerJobs(acquisitionContext, { pool });
+        }
         const job = await acquireRunnableJob({ holder }, acquisitionContext, { pool });
         if (!job) return false;
         const leaseAbort = new AbortController();

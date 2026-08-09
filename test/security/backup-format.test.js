@@ -134,8 +134,26 @@ test('PostgreSQL tool CA exists only while its child-process action runs', async
     assert.equal((await stat(path)).mode & 0o777, 0o600);
   });
   await assert.rejects(() => access(certificatePath));
-  await assert.rejects(() => withPostgresRootCertificate({}, async () => {}),
-    (error) => error.code === 'POSTGRES_CA_UNAVAILABLE');
+  let publicRootPath = 'not-called';
+  await withPostgresRootCertificate({}, async (path) => { publicRootPath = path; });
+  assert.equal(publicRootPath, null);
+});
+
+test('backup leaves PGSSLROOTCERT unset when managed PostgreSQL uses a public trusted root', async () => {
+  const s3 = { send: async (command) => {
+    if (command.input.Body) return {};
+    return { ContentLength: 5, VersionId: 'version' };
+  } };
+  const spawnProcess = (_binary, _args, options) => {
+    assert.equal(options.env.PGSSLROOTCERT, undefined);
+    const child = new EventEmitter(); child.stdout = Readable.from([Buffer.from('dump')]);
+    child.stderr = new EventEmitter(); setImmediate(() => child.emit('close', 0)); return child;
+  };
+  await assert.rejects(() => createEncryptedBackup({
+    env: { S3_BUCKET: 'test', GIT_SHA: 'test-sha', DATABASE_BACKUP_URL: 'postgresql://u:p@db/questshop',
+      BACKUP_ENCRYPTION_KEYS_JSON: keyring, PG_DUMP_PATH: 'pg_dump' }, schemaVersion: 1, s3, spawnProcess,
+    upload: async () => { throw new Error('stop after process environment assertion'); },
+  }), /stop after process environment assertion/);
 });
 
 test('S3 upload failure terminates the in-flight pg_dump before temporary TLS cleanup', async () => {

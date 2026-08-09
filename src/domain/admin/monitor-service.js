@@ -1,11 +1,20 @@
 import { v7 as uuidv7 } from 'uuid';
 import { decryptSecret, encryptSecret } from '../../adapters/crypto/keyring.js';
 import { createQuestApiClient, profileFromEnv } from '../../quest-engine/api/client.js';
+import { getPersistentDiscordRateLimitCoordinator } from '../../quest-engine/rate-limits/coordinator.js';
 import { withTransaction } from '../../db/transaction.js';
 import { appendAdminAudit } from './audit.js';
 import { StaleStateError } from '../../shared/errors.js';
 
 const MONITOR_CAPABILITIES = Object.freeze(['SCAN', 'TEST']);
+const DEFAULT_MONITOR_HEALTH_TIMEOUT_MS = 30_000;
+const DEFAULT_ALL_MONITORS_DEADLINE_MS = 90_000;
+
+function publicMonitor(monitor) {
+  if (!monitor) return monitor;
+  const { key_version: _keyVersion, nonce: _nonce, ciphertext: _ciphertext, auth_tag: _authTag, ...safe } = monitor;
+  return safe;
+}
 
 function monitorName(profile) {
   return profile.global_name ?? profile.username ?? String(profile.id);
@@ -14,6 +23,7 @@ function monitorName(profile) {
 function healthErrorCode(error) {
   if (error?.fatalAuth || [401, 403].includes(error?.status)) return 'TOKEN_REJECTED';
   if (error?.code === 'SECRET_DECRYPT_FAILED') return 'SECRET_DECRYPT_FAILED';
+  if (error?.name === 'TimeoutError' || error?.name === 'AbortError') return 'HEALTH_CHECK_TIMEOUT';
   if (error?.status === 429) return 'RATE_LIMITED';
   if (Number(error?.status) >= 500 || error?.name === 'DiscordApiTransportError') return 'DISCORD_UNAVAILABLE';
   return error?.code ?? error?.name ?? 'HEALTH_CHECK_FAILED';
@@ -22,7 +32,8 @@ function healthErrorCode(error) {
 export async function addMonitor({ token, env }, context, options = {}) {
   if (!token?.trim()) throw new TypeError('monitor token is required');
   const questApiFactory = options.questApiFactory ?? createQuestApiClient;
-  const profile = await questApiFactory({ token, profile: profileFromEnv(env) }).fetchCurrentUser();
+  const profile = await questApiFactory({ token, profile: profileFromEnv(env),
+    coordinator: options.coordinator ?? getPersistentDiscordRateLimitCoordinator(options.pool) }).fetchCurrentUser();
   if (!profile?.id) throw new TypeError('monitor token profile is invalid');
   const id = uuidv7();
   const encrypted = encryptSecret(token, env.DATA_ENCRYPTION_KEYS_JSON, `monitor:${id}:${context.guildId}`);
@@ -42,7 +53,8 @@ export async function addMonitor({ token, env }, context, options = {}) {
 export async function rotateMonitorCredential({ monitorId, token, env }, context, options = {}) {
   if (!token?.trim()) throw new TypeError('token is required');
   const questApiFactory = options.questApiFactory ?? createQuestApiClient;
-  const profile = await questApiFactory({ token, profile: profileFromEnv(env) }).fetchCurrentUser();
+  const profile = await questApiFactory({ token, profile: profileFromEnv(env),
+    coordinator: options.coordinator ?? getPersistentDiscordRateLimitCoordinator(options.pool) }).fetchCurrentUser();
   const encrypted = encryptSecret(token, env.DATA_ENCRYPTION_KEYS_JSON,
     `monitor:${monitorId}:${context.guildId}`);
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
@@ -130,11 +142,14 @@ export async function checkMonitorHealth({ monitorId, env }, context, options = 
   const questApiFactory = options.questApiFactory ?? createQuestApiClient;
   let outcome;
   try {
+    const timeoutMs = Math.max(1, Number(options.timeoutMs ?? DEFAULT_MONITOR_HEALTH_TIMEOUT_MS));
+    const signal = AbortSignal.timeout(timeoutMs);
     const token = decryptSecret({ keyVersion: monitor.key_version, nonce: monitor.nonce,
       ciphertext: monitor.ciphertext, authTag: monitor.auth_tag }, env.DATA_ENCRYPTION_KEYS_JSON,
     `monitor:${monitor.id}:${context.guildId}`);
-    const api = questApiFactory({ token, profile: profileFromEnv(env) });
-    const [profile, quests] = await Promise.all([api.fetchCurrentUser(), api.fetchQuests()]);
+    const api = questApiFactory({ token, profile: profileFromEnv(env),
+      coordinator: options.coordinator ?? getPersistentDiscordRateLimitCoordinator(options.pool) });
+    const [profile, quests] = await Promise.all([api.fetchCurrentUser(signal), api.fetchQuests(signal)]);
     if (!profile?.id || String(profile.id) !== monitor.account_id) {
       const mismatch = Object.assign(new Error('Monitor account mismatch'), { fatalAuth: true });
       throw mismatch;
@@ -146,7 +161,7 @@ export async function checkMonitorHealth({ monitorId, env }, context, options = 
       errorCode: code };
   }
   const persisted = await persistHealth({ monitor, outcome, context }, options);
-  return { monitor: persisted ?? monitor, ...outcome, staleCredential: !persisted };
+  return { monitor: publicMonitor(persisted ?? monitor), ...outcome, staleCredential: !persisted };
 }
 
 export async function checkAllMonitorHealth({ env }, context, options = {}) {
@@ -154,9 +169,19 @@ export async function checkAllMonitorHealth({ env }, context, options = {}) {
     (await client.query(`SELECT id FROM monitor_accounts
       ORDER BY priority DESC,last_used_at NULLS FIRST,created_at`)).rows
   ));
+  const deadlineAt = Date.now() + Math.max(1, Number(options.deadlineMs ?? DEFAULT_ALL_MONITORS_DEADLINE_MS));
   const results = [];
   for (const monitor of monitors) {
-    results.push(await checkMonitorHealth({ monitorId: monitor.id, env }, context, options));
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      results.push({ monitor: { id: monitor.id }, healthState: 'DEGRADED',
+        errorCode: 'HEALTH_CHECK_DEADLINE', staleCredential: false });
+      continue;
+    }
+    results.push(await checkMonitorHealth({ monitorId: monitor.id, env }, context, {
+      ...options,
+      timeoutMs: Math.min(Number(options.timeoutMs ?? DEFAULT_MONITOR_HEALTH_TIMEOUT_MS), remainingMs),
+    }));
   }
   return results;
 }

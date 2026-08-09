@@ -1,9 +1,11 @@
 import { selectQuestExecutor } from '../executors/registry.js';
+import { ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION } from '../../config/versions.js';
 import {
   assertQuestObject,
   questCompatibilityIssue,
   QuestCompatibilityError,
 } from './compatibility.js';
+import { questContractHash } from './contract.js';
 
 function taskEntries(taskConfig) {
   const tasks = taskConfig?.tasks;
@@ -91,13 +93,15 @@ export function normalizeQuest(raw, options = {}) {
   const id = String(raw.id);
   const config = raw.config ?? {};
   const status = raw.user_status ?? {};
-  const configuredTasks = taskEntries(config.task_config_v2 ?? config.task_config);
+  const taskConfig = config.task_config_v2 ?? config.task_config;
+  const configuredTasks = taskEntries(taskConfig);
   const { task, entries } = chooseTask(configuredTasks, status, options);
   const target = finite(task.definition?.target);
   const issues = [];
   if (!entries.length) issues.push(questCompatibilityIssue('TASK_DEFINITIONS_MISSING', 'Task definitions are missing'));
   if (target <= 0) issues.push(questCompatibilityIssue('TASK_TARGET_INVALID', 'Task target is invalid'));
-  if (((config.task_config_v2 ?? config.task_config)?.join_operator ?? 'or') === 'and' && entries.length > 1) {
+  const joinOperator = taskConfig?.join_operator ?? 'or';
+  if (joinOperator === 'and' && entries.length > 1) {
     issues.push(questCompatibilityIssue('MULTI_TASK_AND', 'Multi-task AND is unsupported'));
   }
   const progressSecs = readProgress(status, task, target);
@@ -105,7 +109,7 @@ export function normalizeQuest(raw, options = {}) {
   const executor = selectQuestExecutor({ eventName: task.type, autoSupported: issues.length === 0 });
   const startsAt = config.starts_at ?? null;
   const expiresAt = config.expires_at ?? null;
-  return {
+  const normalized = {
     id,
     name: config.messages?.quest_name ?? config.messages?.quest_title ?? id,
     applicationId: config.application?.id == null ? null : String(config.application.id),
@@ -129,7 +133,15 @@ export function normalizeQuest(raw, options = {}) {
     schemaIssues: issues.map((issue) => issue.message),
     compatibilityIssues: issues,
     coreComplete: Boolean(id && task.type && target > 0 && startsAt && expiresAt && questUrl(id, config)),
+    joinOperator,
   };
+  const contract = questContractHash(normalized, options.versions ?? {
+    engineVersion: ENGINE_VERSION,
+    executorVersion: EXECUTOR_VERSION,
+    contractVersion: QUEST_CONTRACT_VERSION,
+  });
+  return { ...normalized, contractHash: contract.hash, contractCanonical: contract.canonical,
+    contractComplete: contract.complete && issues.length === 0 && executor.supportsAutomaticProgress };
 }
 
 export function normalizeQuestPayload(payload, enrollmentBlockedUntil = null) {

@@ -202,7 +202,8 @@ Setup ปิด Backup ไว้ก่อนเพื่อให้เปิด
 สำหรับ Docker ให้ Mount `.env` เป็น Secret file หรือย้ายค่าข้างในเข้า Secret manager ของ Platform;
 ไฟล์นี้ไม่ถูก Copy เข้า Image โดยตั้งใจ
 
-สำหรับ Host แบบ stateless ให้สร้าง Runtime bundle ที่ตัด `DATABASE_DIRECT_URL` ออก แล้วนำเนื้อหาไฟล์ไปเก็บใน
+สำหรับ Host แบบ stateless ให้สร้าง Runtime bundle ที่ตัด `DATABASE_DIRECT_URL` และ `DATABASE_RESTORE_URL` ออก
+เพื่อลดสิทธิ์ของบอท 24/7 แล้วนำเนื้อหาไฟล์ไปเก็บใน
 Secret manager เป็น `QUESTSHOP_SECRET_BUNDLE`:
 
 ```bash
@@ -306,12 +307,17 @@ CI ตรวจ Syntax, ESLint, PostgreSQL tests, 2× capacity load test, `npm a
 
 ```bash
 npm run backup
+npm run backup:reconcile
 npm run restore:drill
 ```
 
 Backup ใช้ `pg_dump --format=custom` แบบ streaming → QSBK1 AES-256-GCM → S3 multipart upload → checksum/
 manifest verification ส่วน Restore drill สร้างฐานข้อมูลชั่วคราว ตรวจ Schema, Wallet/Ledger, Reservation,
 Payment, Queue, Outbox และ Crypto แล้วลบฐานข้อมูลชั่วคราว
+
+หาก Pre-migration backup อัปโหลดสำเร็จแต่ Migration ล้มก่อนบันทึกใน PostgreSQL ให้ Owner ใช้
+`npm run backup:reconcile` จาก deployment/DR environment เพื่ออ่าน Manifest ที่ยืนยันแล้วบน S3 กลับเข้า
+`backup_runs` ก่อน Restore drill; Runtime bot ปกติไม่มี Restore credential.
 
 Migration จะไม่เริ่มเมื่อ Pre-migration backup ที่จำเป็นล้มเหลว อ่านขั้นตอนเหตุฉุกเฉินได้ที่
 [docs/runbooks/README.md](docs/runbooks/README.md)

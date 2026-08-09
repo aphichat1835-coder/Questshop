@@ -8,12 +8,16 @@ import { createContext } from '../../shared/correlation.js';
 import { createQuestApiClient, profileFromEnv } from '../../quest-engine/api/client.js';
 import { executeQuestExecutor } from '../../quest-engine/executors/contract.js';
 import { selectQuestExecutor } from '../../quest-engine/executors/registry.js';
+import { getPersistentDiscordRateLimitCoordinator } from '../../quest-engine/rate-limits/coordinator.js';
 import { evaluateExpiryAdmission } from '../catalog/expiry.js';
 import { enqueueProjection } from '../outbox/service.js';
 import { openReview } from '../reviews/service.js';
 import { assertTransition, recordTransition } from '../shared/transition.js';
 import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
-import { captureReservation, releaseReservation } from '../wallet/service.js';
+import {
+  captureReservationInTransaction,
+  releaseReservationInTransaction,
+} from '../wallet/service.js';
 import { progressBucket, RUNNER_JOB_TRANSITIONS } from './states.js';
 import { isRunnerVersionCompatible, RUNNER_VERSION_COMPATIBILITY } from '../../config/versions.js';
 import { secureJitter } from '../../shared/random.js';
@@ -28,9 +32,9 @@ function requestHash(kind, payload) {
   return createHash('sha256').update(`${kind}:${JSON.stringify(payload)}`).digest('hex');
 }
 
-function isUncertain(error) {
+export function isUncertainMutationError(error) {
+  if (typeof error?.possiblySent === 'boolean') return error.possiblySent;
   return error?.code === 'PROVIDER_RESULT_AMBIGUOUS'
-    || error?.name === 'AbortError'
     || error?.name === 'TypeError'
     || error?.status === 429
     || Number(error?.status) >= 500;
@@ -343,6 +347,63 @@ async function createAttempt(job, context, options) {
   ));
 }
 
+async function updateAttempt(attempt, { stage, error = null, evidence = null, completed = false }, options) {
+  if (!attempt) return null;
+  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => (
+    (await client.query(`UPDATE runner_attempts SET stage=$2,error_class=COALESCE($3,error_class),
+      error_code=COALESCE($4,error_code),evidence=CASE WHEN $5::jsonb IS NULL THEN evidence ELSE evidence || $5::jsonb END,
+      completed_at=CASE WHEN $6 THEN clock_timestamp() ELSE completed_at END WHERE id=$1 RETURNING *`,
+    [attempt.id, stage, error?.category ?? null, error?.code ?? error?.name ?? null,
+      evidence == null ? null : JSON.stringify(evidence), completed])).rows[0]
+  ));
+}
+
+async function recoverPendingMutation(job, fresh, context, options) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
+    const pending = (await client.query(`SELECT * FROM runner_mutations WHERE job_id=$1
+      AND status IN ('PREPARED','IN_FLIGHT','ACCEPTED','UNCERTAIN') ORDER BY sequence_number DESC LIMIT 1 FOR UPDATE`,
+    [job.id])).rows[0];
+    const owned = (await client.query(`SELECT 1 FROM runner_jobs WHERE id=$1 AND lease_owner=$2
+      AND fencing_token=$3 AND lease_expires_at>clock_timestamp()`,
+    [job.id, job.lease_owner, job.fencing_token])).rowCount;
+    if (!owned) throw new FencingLostError(`runner:${job.id}`);
+    if (!pending) {
+      const completionEvidence = (await client.query(`SELECT EXISTS(
+        SELECT 1 FROM runner_mutations WHERE job_id=$1 AND status='VERIFIED'
+          AND evidence @> '{"completed":true}'::jsonb
+        UNION ALL
+        SELECT 1 FROM runner_attempts WHERE job_id=$1
+          AND evidence @> '{"completionVerified":true}'::jsonb
+      ) AS value`, [job.id])).rows[0].value;
+      if (!completionEvidence) return null;
+      if (fresh.completed && fresh.completedAt) return { recovered: 'VERIFIED_COMPLETION' };
+      throw new QuestshopError('COMPLETION_EVIDENCE_CONTRADICTED',
+        'Durable completion evidence does not match fresh Discord state', { category: 'AMBIGUOUS' });
+    }
+    const applied = mutationApplied(pending.mutation_kind, pending.target_payload,
+      pending.baseline_progress, fresh);
+    if (applied) {
+      await client.query(`UPDATE runner_mutations SET status='VERIFIED',verified_at=clock_timestamp(),
+        evidence=evidence || $2::jsonb WHERE id=$1`, [pending.id,
+        JSON.stringify({ recoveryVerified: true, progress: fresh.progressSecs,
+          completed: Boolean(fresh.completed), completedAt: fresh.completedAt ?? null })]);
+      return { recovered: 'VERIFIED', mutation: pending };
+    }
+    // Only an explicitly uncertain transport result can be retried once after
+    // a fresh server read proves that its requested effect is absent.
+    const retries = Number(pending.evidence?.recoveryControlledRetries ?? 0);
+    if (pending.status === 'UNCERTAIN' && retries < 1) {
+      await client.query(`UPDATE runner_mutations SET status='FAILED',error_class='RECOVERY_NOT_APPLIED',
+        evidence=evidence || $2::jsonb WHERE id=$1`, [pending.id,
+        JSON.stringify({ recoveryVerifiedAbsent: true, recoveryControlledRetries: retries + 1 })]);
+      return { recovered: 'NOT_APPLIED', mutation: pending };
+    }
+    throw new QuestshopError('MUTATION_AMBIGUOUS', 'Mutation ก่อนหน้าไม่ยืนยันผล จึงหยุดเพื่อความปลอดภัย', {
+      category: 'AMBIGUOUS', details: { mutationId: pending.id, status: pending.status },
+    });
+  });
+}
+
 async function prepareMutation(job, attempt, kind, payload, baseline, context, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const owned = (await client.query(`
@@ -378,7 +439,7 @@ async function prepareMutation(job, attempt, kind, payload, baseline, context, o
 async function markMutation(job, mutationId, status, evidence, errorClass, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const updated = (await client.query(`
-      UPDATE runner_mutations SET status = $2, evidence = $3, error_class = $4,
+      UPDATE runner_mutations SET status = $2, evidence = evidence || $3::jsonb, error_class = $4,
         verified_at = CASE WHEN $2 = 'VERIFIED' THEN clock_timestamp() ELSE verified_at END
       WHERE id = $1 AND EXISTS(SELECT 1 FROM runner_jobs j WHERE j.id=runner_mutations.job_id
         AND j.lease_owner=$5 AND j.fencing_token=$6 AND j.lease_expires_at>clock_timestamp())
@@ -389,13 +450,42 @@ async function markMutation(job, mutationId, status, evidence, errorClass, optio
   });
 }
 
+async function prepareControlledRetry(job, original, attempt, kind, payload, baseline, context, options) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
+    const owned = (await client.query(`SELECT 1 FROM runner_jobs WHERE id=$1 AND lease_owner=$2
+      AND fencing_token=$3 AND lease_expires_at>clock_timestamp() FOR UPDATE`,
+    [job.id, job.lease_owner, job.fencing_token])).rowCount;
+    if (!owned) throw new FencingLostError(`runner:${job.id}`);
+    const prior = (await client.query(`SELECT * FROM runner_mutations WHERE id=$1 AND job_id=$2 FOR UPDATE`,
+      [original.id, job.id])).rows[0];
+    if (!prior || !['ACCEPTED', 'UNCERTAIN'].includes(prior.status)
+      || prior.evidence?.controlledRetryScheduled) {
+      throw new QuestshopError('MUTATION_RETRY_BUDGET_EXHAUSTED', 'Mutation controlled retry was already scheduled', {
+        category: 'AMBIGUOUS',
+      });
+    }
+    await client.query(`UPDATE runner_mutations SET status='FAILED',error_class=COALESCE(error_class,'NOT_APPLIED'),
+      evidence=evidence||$2::jsonb WHERE id=$1`, [prior.id,
+      JSON.stringify({ notApplied: true, controlledRetryScheduled: true })]);
+    const sequence = Number((await client.query(`SELECT COALESCE(max(sequence_number),0)::integer+1 AS value
+      FROM runner_mutations WHERE job_id=$1`, [job.id])).rows[0].value);
+    const retry = (await client.query(`INSERT INTO runner_mutations(id,job_id,attempt_id,sequence_number,
+      mutation_kind,status,baseline_progress,target_payload,request_hash,evidence,trace_id)
+      VALUES($1,$2,$3,$4,$5,'PREPARED',$6,$7,$8,$9,$10) RETURNING *`, [uuidv7(), job.id,
+      attempt.id, sequence, kind, baseline, payload, requestHash(kind, payload),
+      { controlledRetry: true, parentMutationId: prior.id }, context.traceId])).rows[0];
+    return (await client.query(`UPDATE runner_mutations SET status='IN_FLIGHT',attempted_at=clock_timestamp()
+      WHERE id=$1 AND status='PREPARED' RETURNING *`, [retry.id])).rows[0];
+  });
+}
+
 async function acceptInitialMutation(job, mutation, perform, options) {
   try {
     await perform();
     await markMutation(job, mutation.id, 'ACCEPTED', {}, null, options);
     return null;
   } catch (error) {
-    if (!isUncertain(error)) {
+    if (!isUncertainMutationError(error)) {
       await markMutation(job, mutation.id, 'FAILED', {}, error.code ?? error.name, options);
       throw error;
     }
@@ -408,7 +498,8 @@ async function verifyMutationResult(job, mutation, kind, payload, baseline, fetc
   try {
     const fresh = await fetchFresh();
     if (mutationApplied(kind, payload, baseline, fresh)) {
-      await markMutation(job, mutation.id, 'VERIFIED', { progress: fresh.progressSecs }, null, options);
+      await markMutation(job, mutation.id, 'VERIFIED', { progress: fresh.progressSecs,
+        completed: Boolean(fresh.completed), completedAt: fresh.completedAt ?? null }, null, options);
       return fresh;
     }
     return null;
@@ -421,16 +512,12 @@ async function verifyMutationResult(job, mutation, kind, payload, baseline, fetc
 }
 
 async function controlledRetry({ job, mutation, perform, fetchFresh, kind, payload, baseline, options }) {
-  try {
-    await perform();
-    const fresh = await fetchFresh();
-    if (!mutationApplied(kind, payload, baseline, fresh)) return null;
-    await markMutation(job, mutation.id, 'VERIFIED', { controlledRetry: true, progress: fresh.progressSecs }, null, options);
-    return fresh;
-  } catch (error) {
-    await markMutation(job, mutation.id, 'UNCERTAIN', { controlledRetry: true }, error.code ?? error.name, options);
-    return null;
-  }
+  const retryError = await acceptInitialMutation(job, mutation, perform, options);
+  const fresh = await verifyMutationResult(job, mutation, kind, payload, baseline, fetchFresh, options);
+  if (fresh) return fresh;
+  await markMutation(job, mutation.id, retryError ? 'UNCERTAIN' : 'FAILED',
+    { controlledRetry: true, notApplied: true }, retryError?.code ?? 'NOT_APPLIED', options);
+  return null;
 }
 
 async function executeMutation({ job, attempt, kind, payload, baseline, perform, fetchFresh, context, options }) {
@@ -438,10 +525,11 @@ async function executeMutation({ job, attempt, kind, payload, baseline, perform,
   const firstError = await acceptInitialMutation(job, mutation, perform, options);
   const verified = await verifyMutationResult(job, mutation, kind, payload, baseline, fetchFresh, options);
   if (verified) return verified;
-  await markMutation(job, mutation.id, firstError ? 'UNCERTAIN' : 'FAILED',
-    { notApplied: true, controlledRetryPending: true }, firstError?.code ?? 'NOT_APPLIED', options);
+  const retryMutation = await prepareControlledRetry(job, mutation, attempt, kind, payload,
+    baseline, context, options);
   await delay(firstError ? retryDelay(firstError) : secureJitter(1000), undefined, { ref: false });
-  const retried = await controlledRetry({ job, mutation, perform, fetchFresh, kind, payload, baseline, options });
+  const retried = await controlledRetry({ job, mutation: retryMutation,
+    perform, fetchFresh, kind, payload, baseline, options });
   if (retried) return retried;
   throw new QuestshopError('MUTATION_AMBIGUOUS', 'Mutation ยังไม่ชัดเจนหลัง Controlled retry', {
     category: 'AMBIGUOUS',
@@ -521,31 +609,7 @@ async function transitionToSettling(job, context, options) {
   });
 }
 
-async function completeJob(job, context, options) {
-  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
-    const updated = await updateOwnedJob(client, job, 'COMPLETED', { releaseLease: true }, context);
-    await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
-      aggregateId: updated.id, aggregateVersion: updated.state_version,
-      surfaceKey: 'LOG_QUEST_OPERATIONS', context });
-    return updated;
-  });
-}
-
-async function failJob(job, context, options) {
-  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
-    const current = (await client.query(`SELECT *,lease_expires_at>clock_timestamp() AS lease_valid
-      FROM runner_jobs WHERE id = $1 FOR UPDATE`, [job.id])).rows[0];
-    if (!current || ['COMPLETED', 'FAILED'].includes(current.state)) return current;
-    const updated = await updateOwnedJob(client, current, 'FAILED', { releaseLease: true }, context);
-    await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
-      aggregateId: updated.id, aggregateVersion: updated.state_version,
-      surfaceKey: 'LOG_QUEST_OPERATIONS', context });
-    return updated;
-  });
-}
-
-export async function materializeNextOrderItem({ orderId }, context, options = {}) {
-  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
+export async function materializeNextOrderItemInTransaction(client, { orderId }, context) {
     const count = Number((await client.query(`
       SELECT count(*)::integer AS count FROM runner_jobs
       WHERE state IN ('QUEUED','LEASED','RUNNING','WAITING_RATE_LIMIT','WAITING_RETRY')
@@ -565,12 +629,12 @@ export async function materializeNextOrderItem({ orderId }, context, options = {
     await client.query(`
       INSERT INTO runner_jobs(
         id, order_item_id, discord_user_id, account_id, state, deadline_at,
-        engine_version, executor_version, contract_version,
+        engine_version, executor_version, contract_version, contract_hash,
         runner_state_schema_version, trace_id
-      ) VALUES ($1,$2,$3,$4,'QUEUED',$5,$6,$7,$8,$9,$10)
+      ) VALUES ($1,$2,$3,$4,'QUEUED',$5,$6,$7,$8,$9,$10,$11)
     `, [
       uuidv7(), item.id, item.discord_user_id, item.account_id, item.deadline_at,
-      item.engine_version, item.executor_version, item.contract_version,
+      item.engine_version, item.executor_version, item.contract_version, item.contract_hash,
       item.runner_state_schema_version, item.trace_id,
     ]);
     await recordTransition(client, {
@@ -578,6 +642,78 @@ export async function materializeNextOrderItem({ orderId }, context, options = {
       fromState: 'RESERVED', toState: 'QUEUED', stateVersion: queued.state_version, context,
     });
     return queued;
+}
+
+export async function materializeNextOrderItem({ orderId }, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, (client) => (
+    materializeNextOrderItemInTransaction(client, { orderId }, context)
+  ));
+}
+
+async function terminalizeOwnedJobInTransaction(client, job, nextState, context, reasonCode) {
+  const current = (await client.query(`SELECT * FROM runner_jobs WHERE id=$1 FOR UPDATE`, [job.id])).rows[0];
+  if (!current || ['COMPLETED', 'FAILED'].includes(current.state)) return current;
+  if (current.lease_owner !== job.lease_owner || String(current.fencing_token) !== String(job.fencing_token)
+    || !(await client.query(`SELECT $1::timestamptz > clock_timestamp() AS valid`, [current.lease_expires_at])).rows[0].valid) {
+    throw new FencingLostError(`runner:${job.id}`);
+  }
+  assertJobTransition(current.state, nextState);
+  const updated = (await client.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
+    lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+    WHERE id=$1 AND state=$3 AND state_version=$4 AND lease_owner=$5 AND fencing_token=$6
+      AND lease_expires_at>clock_timestamp() RETURNING *`,
+  [current.id, nextState, current.state, current.state_version, job.lease_owner, job.fencing_token])).rows[0];
+  if (!updated) throw new FencingLostError(`runner:${job.id}`);
+  await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: updated.id,
+    fromState: current.state, toState: nextState, stateVersion: updated.state_version, reasonCode, context });
+  await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
+    aggregateId: updated.id, aggregateVersion: updated.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context });
+  return updated;
+}
+
+export async function settleRunnerSuccess(job, { claimUrl, orderId }, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const item = await captureReservationInTransaction(client, { orderItemId: job.order_item_id, claimUrl,
+      runnerOwnership: runnerOwnership(job) }, context);
+    const terminal = await terminalizeOwnedJobInTransaction(client, job, 'COMPLETED', context, 'QUEST_COMPLETED_VERIFIED');
+    await materializeNextOrderItemInTransaction(client, { orderId: orderId ?? item.order_id }, context);
+    return terminal;
+  });
+}
+
+export async function settleRunnerRelease(job, { terminalState, reason, orderId }, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const item = await releaseReservationInTransaction(client, { orderItemId: job.order_item_id, terminalState, reason,
+      runnerOwnership: runnerOwnership(job) }, context);
+    const terminal = await terminalizeOwnedJobInTransaction(client, job, 'FAILED', context, reason);
+    await materializeNextOrderItemInTransaction(client, { orderId: orderId ?? item.order_id }, context);
+    return terminal;
+  });
+}
+
+// Maintenance has no live worker lease. It may only repair an item whose
+// deadline has already passed, and it closes the item/job pair in the same
+// serializable transaction so a crash cannot strand later order items.
+export async function releaseExpiredOrderItem({ orderItemId, reason = 'QUEST_EXPIRED_BEFORE_START' }, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const job = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [orderItemId])).rows[0];
+    const item = await releaseReservationInTransaction(client, {
+      orderItemId, terminalState: 'EXPIRED_RELEASED', reason,
+    }, context);
+    if (job && !['COMPLETED', 'FAILED'].includes(job.state)) {
+      assertJobTransition(job.state, 'FAILED');
+      const terminal = (await client.query(`UPDATE runner_jobs SET state='FAILED',state_version=state_version+1,
+        lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+        WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+      [job.id, job.state, job.state_version])).rows[0];
+      if (!terminal) throw new QuestshopError('STALE_RUNNER_STATE', `Runner job ${job.id} changed during expiry settlement`);
+      await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: terminal.id,
+        fromState: job.state, toState: 'FAILED', stateVersion: terminal.state_version, reasonCode: reason, context });
+      await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
+        aggregateId: terminal.id, aggregateVersion: terminal.state_version, surfaceKey: 'LOG_QUEST_OPERATIONS', context });
+    }
+    await materializeNextOrderItemInTransaction(client, { orderId: item.order_id }, context);
+    return item;
   });
 }
 
@@ -593,11 +729,17 @@ async function loadRunnerData(job, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => (
     (await client.query(`
       SELECT o.*, i.quest_id, i.state AS item_state, i.deadline_at,
-        q.*, c.key_version, c.nonce, c.ciphertext, c.auth_tag
+        i.started_at AS item_started_at, i.contract_hash AS item_contract_hash,
+        i.metadata_revision AS item_metadata_revision,
+        q.*, q.current_contract_hash AS catalog_contract_hash,
+        r.contract_hash AS metadata_contract_hash,
+        c.key_version, c.nonce, c.ciphertext, c.auth_tag
       FROM runner_jobs j
       JOIN order_items i ON i.id = j.order_item_id
       JOIN orders o ON o.id = i.order_id
       JOIN quests q ON q.quest_id = i.quest_id
+      LEFT JOIN quest_metadata_revisions r ON r.quest_id=i.quest_id
+        AND r.revision=i.metadata_revision
       JOIN order_credentials c ON c.order_id = o.id
       WHERE j.id = $1
     `, [job.id])).rows[0]
@@ -612,11 +754,24 @@ async function prepareRunnerExecution(job, env, signal, options) {
   const token = decryptSecret({ keyVersion: data.key_version, nonce: data.nonce,
     ciphertext: data.ciphertext, authTag: data.auth_tag }, env.DATA_ENCRYPTION_KEYS_JSON,
   `order:${data.id}:${env.DISCORD_GUILD_ID}`);
-  const api = createQuestApiClient({ token, profile: profileFromEnv(env) });
+  const apiFactory = options.questApiFactory ?? createQuestApiClient;
+  const api = apiFactory({ token, profile: profileFromEnv(env),
+    coordinator: options.coordinator ?? getPersistentDiscordRateLimitCoordinator(options.pool) });
   const [profile, quests] = await Promise.all([api.fetchCurrentUser(signal), api.fetchQuests(signal)]);
   if (String(profile.id) !== data.account_id) throw new QuestshopError('RUNNER_ACCOUNT_MISMATCH', 'Token account changed');
   const quest = quests.find((item) => item.id === data.quest_id);
   if (!quest) throw new QuestshopError('QUEST_MISSING', 'Quest disappeared from account');
+  // An item is a signed business promise for one normalized Quest contract.
+  // Never execute a new target/event/progress key under the price and evidence
+  // captured for an older contract.  N-1 rows without a hash remain readable;
+  // every new checkout is pinned by migration 0024.
+  if (data.item_contract_hash && (data.item_contract_hash !== quest.contractHash
+    || data.item_contract_hash !== data.catalog_contract_hash
+    || (data.metadata_contract_hash && data.item_contract_hash !== data.metadata_contract_hash))) {
+    throw new QuestshopError('QUEST_CONTRACT_CHANGED', 'สัญญาการทำ Quest เปลี่ยนหลังยืนยันรายการ', {
+      category: 'BUSINESS',
+    });
+  }
   return { data, api, quest };
 }
 
@@ -626,22 +781,61 @@ function runnerOwnership(job) {
 
 async function releaseBeforeExecution({ job, data, quest, env, context, options }) {
   if (quest.completed) {
-    await releaseReservation({ orderItemId: job.order_item_id, terminalState: 'EXTERNAL_COMPLETED_RELEASED',
-      reason: 'EXTERNAL_COMPLETED_BEFORE_START', runnerOwnership: runnerOwnership(job) }, context, options);
-    await failJob(job, context, options);
-    await materializeNextOrderItem({ orderId: data.id }, context, options);
+    if (data.item_started_at) {
+      throw new QuestshopError('COMPLETION_PROVENANCE_MISSING',
+        'Quest completed after this job started but no durable runner proof identifies the actor', {
+          category: 'AMBIGUOUS',
+        });
+    }
+    await settleRunnerRelease(job, { terminalState: 'EXTERNAL_COMPLETED_RELEASED',
+      reason: 'EXTERNAL_COMPLETED_BEFORE_START', orderId: data.id }, context, options);
     return { outcome: 'EXTERNAL_COMPLETED_RELEASED' };
+  }
+  const blockedUntil = Date.parse(quest.enrollmentBlockedUntil);
+  const enrollmentWait = Number.isFinite(blockedUntil)
+    ? await withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => (
+      Number((await client.query(`SELECT GREATEST(0, extract(epoch FROM ($1::timestamptz-clock_timestamp()))*1000)::bigint AS wait_ms`,
+        [new Date(blockedUntil).toISOString()])).rows[0].wait_ms)
+    ))
+    : 0;
+  if (enrollmentWait > 0) {
+    await checkpointRetryJob(job, context, options, 'QUEST_ENROLLMENT_BLOCKED', {
+      stateOverride: 'QUEUED', delayMs: Math.max(1_000, enrollmentWait),
+    });
+    return { outcome: 'WAITING_FOR_ENROLLMENT_WINDOW' };
   }
   const admission = await withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, (client) => (
     evaluateExpiryAdmission(client, { quest: { ...data, progress_actual: quest.progress },
       runnerConcurrency: env.RUNNER_CONCURRENCY })
   ));
   if (admission.eligible) return null;
-  await releaseReservation({ orderItemId: job.order_item_id, terminalState: 'EXPIRED_RELEASED',
-    reason: admission.reason, runnerOwnership: runnerOwnership(job) }, context, options);
-  await failJob(job, context, options);
-  await materializeNextOrderItem({ orderId: data.id }, context, options);
+  if (admission.reason === 'QUEST_NOT_STARTED') {
+    const delayMs = Math.max(1_000, Date.parse(admission.availableAt) - Date.parse(
+      await withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => (
+        (await client.query('SELECT clock_timestamp() AS value')).rows[0].value
+      )),
+    ));
+    await checkpointRetryJob(job, context, options, 'QUEST_NOT_STARTED', {
+      stateOverride: 'QUEUED', delayMs,
+    });
+    return { outcome: 'WAITING_FOR_START_TIME' };
+  }
+  await settleRunnerRelease(job, { terminalState: 'EXPIRED_RELEASED',
+    reason: admission.reason, orderId: data.id }, context, options);
   return { outcome: 'EXPIRED_RELEASED' };
+}
+
+async function settleRecoveredCompletion({ state, data, quest, context, options }) {
+  if (!quest.completedAt) {
+    throw new QuestshopError('COMPLETION_NOT_VERIFIED', 'Discord did not confirm completed_at after recovery', {
+      category: 'AMBIGUOUS',
+    });
+  }
+  state.runningJob = await transitionRunning(state.runningJob, context, options);
+  await updateItemProgress(state.runningJob, quest, context, options);
+  state.runningJob = await transitionToSettling(state.runningJob, context, options);
+  await settleRunnerSuccess(state.runningJob, { claimUrl: quest.url, orderId: data.id }, context, options);
+  return { outcome: 'READY_TO_CLAIM', quest, recovered: true };
 }
 
 async function executeAndSettleRunner({ state, attempt, data, api, quest: initialQuest, signal, context, options }) {
@@ -677,11 +871,11 @@ async function executeAndSettleRunner({ state, attempt, data, api, quest: initia
   if (!execution.verified || !verified.completed || !verified.completedAt) {
     throw new QuestshopError('COMPLETION_NOT_VERIFIED', 'Discord did not confirm completed_at');
   }
+  await updateAttempt(attempt, { stage: 'COMPLETION_VERIFIED', evidence: {
+    completionVerified: true, completedAt: verified.completedAt, progress: verified.progressSecs,
+  } }, options);
   state.runningJob = await transitionToSettling(state.runningJob, context, options);
-  await captureReservation({ orderItemId: state.runningJob.order_item_id, claimUrl: verified.url,
-    runnerOwnership: runnerOwnership(state.runningJob) }, context, options);
-  await completeJob(state.runningJob, context, options);
-  await materializeNextOrderItem({ orderId: data.id }, context, options);
+  await settleRunnerSuccess(state.runningJob, { claimUrl: verified.url, orderId: data.id }, context, options);
   return { outcome: 'READY_TO_CLAIM', quest: verified };
 }
 
@@ -763,13 +957,14 @@ export async function moveRunnerToManualReview(job, context, options, error, con
 function needsManualReview(error) {
   const ambiguous = error.code === 'MUTATION_AMBIGUOUS' || error.category === 'AMBIGUOUS';
   const contractFailure = error.name === 'QuestCompatibilityError'
-    || ['EXECUTOR_INCOMPATIBLE', 'QUEST_PAYLOAD_NOT_ARRAY', 'QUEST_ENTRY_INVALID'].includes(error.code);
+    || ['EXECUTOR_INCOMPATIBLE', 'QUEST_CONTRACT_CHANGED', 'QUEST_PAYLOAD_NOT_ARRAY', 'QUEST_ENTRY_INVALID'].includes(error.code);
   return { manualReview: ambiguous || contractFailure, contractFailure };
 }
 
 async function resolveRunnerFailure({ state, job, context, options, error }) {
   if (error instanceof FencingLostError) throw error;
-  if (error?.name === 'AbortError' && error.code !== 'MUTATION_AMBIGUOUS') {
+  if (error?.name === 'AbortError' && !isUncertainMutationError(error)
+    && error.code !== 'MUTATION_AMBIGUOUS') {
     await checkpointRetryJob(state.runningJob, context, options);
     return { outcome: 'CHECKPOINTED_FOR_RESTART', error };
   }
@@ -794,10 +989,8 @@ async function resolveRunnerFailure({ state, job, context, options, error }) {
     await moveRunnerToManualReview(job, context, options, error, review.contractFailure);
     return { outcome: 'MANUAL_REVIEW', error };
   }
-  await releaseReservation({ orderItemId: job.order_item_id, terminalState: 'FAILED_RELEASED',
-    reason: error.code ?? error.name, runnerOwnership: runnerOwnership(state.runningJob) }, context, options);
-  await failJob(state.runningJob, context, options);
-  if (state.order?.id) await materializeNextOrderItem({ orderId: state.order.id }, context, options);
+  await settleRunnerRelease(state.runningJob, { terminalState: 'FAILED_RELEASED',
+    reason: error.code ?? error.name, orderId: state.order?.id }, context, options);
   return { outcome: 'FAILED_RELEASED', error };
 }
 
@@ -806,12 +999,29 @@ export async function processRunnerJob(job, { env, signal, options = {} }) {
   const attempt = await createAttempt(job, context, options);
   const state = { runningJob: job, order: null };
   try {
+    await updateAttempt(attempt, { stage: 'PREFLIGHT' }, options);
     const prepared = await prepareRunnerExecution(job, env, signal, options);
     state.order = prepared.data;
+    await updateAttempt(attempt, { stage: 'RECOVERY_VERIFY' }, options);
+    const recovery = await recoverPendingMutation(job, prepared.quest, context, options);
+    if (['VERIFIED', 'VERIFIED_COMPLETION'].includes(recovery?.recovered) && prepared.quest.completed) {
+      const settled = await settleRecoveredCompletion({ state, data: prepared.data,
+        quest: prepared.quest, context, options });
+      await updateAttempt(attempt, { stage: 'TERMINAL', evidence: settled, completed: true }, options);
+      return settled;
+    }
     const released = await releaseBeforeExecution({ job, ...prepared, env, context, options });
-    if (released) return released;
-    return executeAndSettleRunner({ state, attempt, ...prepared, signal, context, options });
+    if (released) {
+      await updateAttempt(attempt, { stage: 'TERMINAL', evidence: released, completed: true }, options);
+      return released;
+    }
+    await updateAttempt(attempt, { stage: 'EXECUTE' }, options);
+    const result = await executeAndSettleRunner({ state, attempt, ...prepared, signal, context, options });
+    await updateAttempt(attempt, { stage: 'TERMINAL', evidence: { outcome: result.outcome }, completed: true }, options);
+    return result;
   } catch (error) {
-    return resolveRunnerFailure({ state, job, context, options, error });
+    const result = await resolveRunnerFailure({ state, job, context, options, error });
+    await updateAttempt(attempt, { stage: 'FAILED', error, evidence: { outcome: result.outcome }, completed: true }, options);
+    return result;
   }
 }

@@ -14,9 +14,11 @@ export async function withPostgresRootCertificate(env, action, {
 } = {}) {
   const certificate = Buffer.from(env.DATABASE_SSL_CA_BASE64 ?? '', 'base64');
   if (!certificate.length) {
-    throw Object.assign(new Error('DATABASE_SSL_CA_BASE64 is required for PostgreSQL tooling'), {
-      code: 'POSTGRES_CA_UNAVAILABLE',
-    });
+    // Managed PostgreSQL may chain to a public root already trusted by the
+    // operating system. In that case libpq must use its normal trust store;
+    // setting PGSSLROOTCERT to an empty/fake path would make a valid TLS setup
+    // fail. The caller still enforces sslmode=verify-full in configuration.
+    return action(null);
   }
   const directory = await makeTempDirectory(join(tmpdir(), 'questshop-pg-ca-'));
   const path = join(directory, 'root.crt');
