@@ -7,13 +7,14 @@ import { appendAdminAudit } from './audit.js';
 import { StaleStateError } from '../../shared/errors.js';
 
 const MONITOR_CAPABILITIES = Object.freeze(['SCAN', 'TEST']);
+const MONITOR_CREDENTIAL_FIELDS = new Set(['key_version', 'nonce', 'ciphertext', 'auth_tag']);
 const DEFAULT_MONITOR_HEALTH_TIMEOUT_MS = 30_000;
 const DEFAULT_ALL_MONITORS_DEADLINE_MS = 90_000;
 
 function publicMonitor(monitor) {
   if (!monitor) return monitor;
-  const { key_version: _keyVersion, nonce: _nonce, ciphertext: _ciphertext, auth_tag: _authTag, ...safe } = monitor;
-  return safe;
+  return Object.fromEntries(Object.entries(monitor)
+    .filter(([field]) => !MONITOR_CREDENTIAL_FIELDS.has(field)));
 }
 
 function monitorName(profile) {

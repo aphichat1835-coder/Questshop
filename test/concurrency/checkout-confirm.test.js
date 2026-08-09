@@ -11,6 +11,8 @@ let pool;
 before(async () => { pool = await createTestPool(); });
 after(async () => { await pool?.end(); });
 
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
 function checkoutEnvironment() {
   const key = Buffer.alloc(32, 4).toString('base64');
   return {
@@ -29,7 +31,7 @@ function checkoutApi() {
   const quest = { id: 'race-quest', name: 'Race Quest', eventName: 'WATCH_VIDEO',
     secondsNeeded: 60, progressSecs: 0, progress: 0, completed: false, completedAt: null,
     enrolled: true, enrolledAt: now.toISOString(), autoSupported: true, executorId: 'video',
-    startsAt: now.toISOString(), expiresAt: new Date(now.getTime() + 86_400_000).toISOString(),
+    startsAt: now.toISOString(), expiresAt: new Date(now.getTime() + ONE_DAY_MS).toISOString(),
     url: 'https://discord.com/quests/race-quest', artworkUrl: null, orbs: 10,
     applicationId: 'app-race', progressKey: 'video', coreComplete: true, compatibilityIssues: [] };
   const contract = questContractHash(quest, { engineVersion: '1.0.0', executorVersion: '1.0.0',

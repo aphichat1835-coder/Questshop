@@ -2,6 +2,9 @@ import { readFile } from 'node:fs/promises';
 import { v7 as uuidv7 } from 'uuid';
 import { RUNNER_VERSION_COMPATIBILITY, isRunnerVersionCompatible } from '../config/versions.js';
 
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
 async function memoryLimitBytes() {
   for (const path of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
     try {
@@ -152,9 +155,9 @@ async function applyOperationalAlerts(pool, snapshot, health, runtime) {
   await setIncident(pool, { code: 'OUTBOX_STUCK', scope: 'DISCORD', active: snapshot.outbox.stuck > 0, severity: 'ERROR', evidence: snapshot.outbox });
   const errorRateHigh = snapshot.errors.total >= 20 && snapshot.errors.failed / snapshot.errors.total >= 0.05;
   await setIncident(pool, { code: 'ERROR_RATE_HIGH', scope: 'OPERATIONS', active: errorRateHigh, severity: 'ERROR', evidence: snapshot.errors });
-  await setIncident(pool, { code: 'BACKUP_STALE', scope: 'DATABASE', active: snapshot.backupAgeMs > 26 * 3_600_000,
+  await setIncident(pool, { code: 'BACKUP_STALE', scope: 'DATABASE', active: snapshot.backupAgeMs > 26 * HOUR_MS,
     severity: 'ERROR', evidence: { ageMs: Number.isFinite(snapshot.backupAgeMs) ? snapshot.backupAgeMs : null } });
-  await setIncident(pool, { code: 'RESTORE_DRILL_STALE', scope: 'DATABASE', active: snapshot.restoreAgeMs > 35 * 86_400_000,
+  await setIncident(pool, { code: 'RESTORE_DRILL_STALE', scope: 'DATABASE', active: snapshot.restoreAgeMs > 35 * DAY_MS,
     severity: 'ERROR', evidence: { ageMs: Number.isFinite(snapshot.restoreAgeMs) ? snapshot.restoreAgeMs : null } });
   await setIncident(pool, { code: 'BACKUP_CORRUPTION', scope: 'DATABASE', active: snapshot.backupCorruption > 0,
     severity: 'CRITICAL', evidence: { count: snapshot.backupCorruption } });

@@ -174,7 +174,7 @@ test('maintenance advances a failed monitor batch left incomplete by an older wo
 test('fatal Monitor authentication failure quarantines before the batch chooses its next token', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const traceId = uuidv7(); const first = uuidv7(); const second = uuidv7(); const batchId = uuidv7();
-  const runId = uuidv7(); const questId = `fatal-auth-${runId.slice(0, 8)}`;
+  const runId = uuidv7(); const workerId = uuidv7(); const questId = `fatal-auth-${runId.slice(0, 8)}`;
   const context = createContext({ traceId, actorType: 'SYSTEM', actorId: 'quest-test', guildId: 'guild',
     idempotencyKey: 'fatal-auth-switches-monitor' });
   await pool.query(`INSERT INTO monitor_accounts(id,account_id,capabilities,state,priority) VALUES
@@ -187,8 +187,8 @@ test('fatal Monitor authentication failure quarantines before the batch chooses 
     VALUES($1,$2,'RUNNING',ARRAY[$3,$4]::uuid[],$5,'SYSTEM')`, [batchId, questId, first, second, traceId]);
   await pool.query(`INSERT INTO quest_test_runs(id,quest_id,batch_id,target_monitor_id,monitor_id,state,engine_version,
     executor_version,contract_version,attempt_in_monitor,trace_id,lease_owner,lease_expires_at,fencing_token)
-    VALUES($1,$2,$3,$4,$4,'TESTING','1','1','1',1,$5,'worker',clock_timestamp()+interval '2 minutes',1)`,
-  [runId, questId, batchId, first, traceId]);
+    VALUES($1,$2,$3,$4,$4,'TESTING','1','1','1',1,$5,$6,clock_timestamp()+interval '2 minutes',1)`,
+  [runId, questId, batchId, first, traceId, workerId]);
   const run = (await pool.query('SELECT * FROM quest_test_runs WHERE id=$1', [runId])).rows[0];
   await handleTestFailure(pool, run, { id: first, consecutive_failures: 0 },
     Object.assign(new Error('token rejected'), { fatalAuth: true, code: 'TOKEN_REJECTED' }), context);

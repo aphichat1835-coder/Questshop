@@ -69,34 +69,66 @@ const environmentFields = {
   DISCORD_LOCALE: z.string().min(2).max(20).default('en-US'),
 };
 
-function refineEnvironment(value, ctx, { requireDirect, requireRestore }) {
-  if (requireDirect && !value.DATABASE_DIRECT_URL) {
-    ctx.addIssue({ code: 'custom', path: ['DATABASE_DIRECT_URL'], message: 'DATABASE_DIRECT_URL is required' });
-  }
+const BACKUP_SETTING_KEYS = Object.freeze([
+  'DATABASE_BACKUP_URL', 'S3_ENDPOINT', 'S3_BUCKET',
+  'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'BACKUP_ENCRYPTION_KEYS_JSON',
+]);
+
+function addEnvironmentIssue(ctx, message, path) {
+  ctx.addIssue({ code: 'custom', ...(path ? { path } : {}), message });
+}
+
+function isBackupEnabled(value) {
+  return value.BACKUP_ENABLED ?? value.NODE_ENV === 'production';
+}
+
+function validateRuntimeLimits(value, ctx) {
   if (value.RUNNER_CONCURRENCY > value.RUNNER_CONCURRENCY_HARD_MAX) {
-    ctx.addIssue({ code: 'custom', message: 'RUNNER_CONCURRENCY exceeds hard max' });
+    addEnvironmentIssue(ctx, 'RUNNER_CONCURRENCY exceeds hard max');
   }
   if (value.NODE_ENV === 'production' && !/^[0-9a-f]{40}$/i.test(value.GIT_SHA)) {
-    ctx.addIssue({ code: 'custom', message: 'GIT_SHA must be the 40-character deployment commit SHA in production' });
+    addEnvironmentIssue(ctx, 'GIT_SHA must be the 40-character deployment commit SHA in production');
   }
-  const backupKeys = ['DATABASE_BACKUP_URL', 'S3_ENDPOINT', 'S3_BUCKET',
-    'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'BACKUP_ENCRYPTION_KEYS_JSON'];
-  const backupEnabled = value.BACKUP_ENABLED ?? value.NODE_ENV === 'production';
-  if (backupEnabled && backupKeys.some((key) => value[key] == null || value[key] === '')) {
-    ctx.addIssue({ code: 'custom', message: 'BACKUP_ENABLED=true requires backup database, S3 and encryption settings' });
+}
+
+function validateBackupSettings(value, ctx, { requireRestore }) {
+  const backupEnabled = isBackupEnabled(value);
+  if (backupEnabled && BACKUP_SETTING_KEYS.some((key) => value[key] == null || value[key] === '')) {
+    addEnvironmentIssue(ctx, 'BACKUP_ENABLED=true requires backup database, S3 and encryption settings');
   }
   if (requireRestore && backupEnabled && !value.DATABASE_RESTORE_URL) {
-    ctx.addIssue({ code: 'custom', path: ['DATABASE_RESTORE_URL'],
-      message: 'DATABASE_RESTORE_URL is required for deployment and restore-drill tooling when backups are enabled' });
+    addEnvironmentIssue(ctx,
+      'DATABASE_RESTORE_URL is required for deployment and restore-drill tooling when backups are enabled',
+      ['DATABASE_RESTORE_URL']);
   }
-  for (const key of ['DATABASE_POOL_URL', ...(requireDirect ? ['DATABASE_DIRECT_URL'] : []), ...(backupEnabled
-    ? ['DATABASE_BACKUP_URL', ...(requireRestore ? ['DATABASE_RESTORE_URL'] : [])] : [])]) {
+  return backupEnabled;
+}
+
+function databaseUrlFields({ requireDirect, requireRestore, backupEnabled }) {
+  return [
+    'DATABASE_POOL_URL',
+    ...(requireDirect ? ['DATABASE_DIRECT_URL'] : []),
+    ...(backupEnabled ? ['DATABASE_BACKUP_URL', ...(requireRestore ? ['DATABASE_RESTORE_URL'] : [])] : []),
+  ];
+}
+
+function validateDatabaseTls(value, ctx, requirements) {
+  for (const key of databaseUrlFields(requirements)) {
     if (!value[key]) continue;
     const url = new URL(value[key]);
     if (value.NODE_ENV === 'production' && url.searchParams.get('sslmode') !== 'verify-full') {
-      ctx.addIssue({ code: 'custom', message: `${key} must use sslmode=verify-full` });
+      addEnvironmentIssue(ctx, `${key} must use sslmode=verify-full`);
     }
   }
+}
+
+function refineEnvironment(value, ctx, { requireDirect, requireRestore }) {
+  if (requireDirect && !value.DATABASE_DIRECT_URL) {
+    addEnvironmentIssue(ctx, 'DATABASE_DIRECT_URL is required', ['DATABASE_DIRECT_URL']);
+  }
+  validateRuntimeLimits(value, ctx);
+  const backupEnabled = validateBackupSettings(value, ctx, { requireRestore });
+  validateDatabaseTls(value, ctx, { requireDirect, requireRestore, backupEnabled });
 }
 
 const schema = z.object(environmentFields)

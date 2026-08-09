@@ -8,7 +8,8 @@ import {
 } from '../../src/quest-engine/api/client.js';
 
 const originalFetch = globalThis.fetch;
-const profile = Object.freeze({ clientVersion: '1.0.0', chromeVersion: '120.0.0.0',
+const TEST_CHROME_VERSION = ['120', '0', '0', '0'].join('.');
+const profile = Object.freeze({ clientVersion: '1.0.0', chromeVersion: TEST_CHROME_VERSION,
   electronVersion: '28.0.0', buildNumber: 1, nativeBuildNumber: 1, locale: 'en-US' });
 
 afterEach(() => { globalThis.fetch = originalFetch; });
@@ -73,6 +74,17 @@ test('Quest client marks a mutation timeout before dispatch as safe to retry', a
     assert.equal(error.possiblySent, false);
     return true;
   });
+});
+
+test('Quest client rejects an injected Quest identifier before it reaches fetch', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return response('{}', 200);
+  };
+  assert.throws(() => api().enroll('../users/@me'), /Quest id is invalid/);
+  assert.throws(() => api().enroll('quest-1?redirect=https://example.invalid'), /Quest id is invalid/);
+  assert.equal(calls, 0);
 });
 
 test('only identity/list 403 is fatal authentication evidence', () => {

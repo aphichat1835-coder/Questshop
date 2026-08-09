@@ -45,6 +45,15 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Changed
 
+- Quest API requests now validate a strict fixed Discord v9 endpoint allowlist before entering the rate-limit
+  queue, reject injected Quest identifiers before any HTTP call, and keep request timeout timers referenced so
+  Node 22 cannot end a hung-request or rate-limit retry before its safety timer fires.
+- Persistent Discord rate-limit blocking now shares the asynchronous contract of the in-memory coordinator;
+  Monitor health responses strip every encrypted credential column through an explicit denylist, and test
+  fixtures no longer resemble a routable IP address.
+- Environment validation, runner controlled-retry inputs, and duration constants were split into focused
+  helpers without changing the deployment, backup, TLS, or settlement policies.
+
 - Monitor test passes, Admin **ส่งเลย** overrides, checkout selections, Order Items and Runner Jobs are now
   pinned to one SHA-256 execution-contract fingerprint.  A changed task target/event/progress key cannot reuse a
   prior pass or silently run under an old quoted contract; it pauses public sale and is retained for safe review.

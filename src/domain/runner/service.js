@@ -450,7 +450,7 @@ async function markMutation(job, mutationId, status, evidence, errorClass, optio
   });
 }
 
-async function prepareControlledRetry(job, original, attempt, kind, payload, baseline, context, options) {
+async function prepareControlledRetry({ job, original, attempt, kind, payload, baseline, context }, options) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const owned = (await client.query(`SELECT 1 FROM runner_jobs WHERE id=$1 AND lease_owner=$2
       AND fencing_token=$3 AND lease_expires_at>clock_timestamp() FOR UPDATE`,
@@ -525,8 +525,9 @@ async function executeMutation({ job, attempt, kind, payload, baseline, perform,
   const firstError = await acceptInitialMutation(job, mutation, perform, options);
   const verified = await verifyMutationResult(job, mutation, kind, payload, baseline, fetchFresh, options);
   if (verified) return verified;
-  const retryMutation = await prepareControlledRetry(job, mutation, attempt, kind, payload,
-    baseline, context, options);
+  const retryMutation = await prepareControlledRetry({
+    job, original: mutation, attempt, kind, payload, baseline, context,
+  }, options);
   await delay(firstError ? retryDelay(firstError) : secureJitter(1000), undefined, { ref: false });
   const retried = await controlledRetry({ job, mutation: retryMutation,
     perform, fetchFresh, kind, payload, baseline, options });

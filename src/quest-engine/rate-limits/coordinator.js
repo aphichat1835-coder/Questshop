@@ -75,7 +75,9 @@ export class DiscordRateLimitCoordinator {
       const route = normalizedRoute(path);
       const wait = Math.max(this.globalBlockedUntil, this.routeBlockedUntil.get(route) ?? 0,
         this.accountBlockedUntil.get(account) ?? 0) - Date.now();
-      if (wait > 0) await delay(wait, undefined, { signal, ref: false });
+      // A caller awaiting the rate-limit promise must keep Node alive until it
+      // settles. Shutdown aborts this timer through its shared signal.
+      if (wait > 0) await delay(wait, undefined, { signal });
       await this.semaphore.acquire(signal);
       try {
         return await execute();
@@ -89,18 +91,18 @@ export class DiscordRateLimitCoordinator {
     }
   }
 
-  blockGlobally(milliseconds) {
+  async blockGlobally(milliseconds) {
     this.pruneExpired();
     this.globalBlockedUntil = Math.max(this.globalBlockedUntil, Date.now() + milliseconds);
   }
 
-  blockRoute(path, milliseconds) {
+  async blockRoute(path, milliseconds) {
     this.pruneExpired();
     const route = normalizedRoute(path);
     this.routeBlockedUntil.set(route, Math.max(this.routeBlockedUntil.get(route) ?? 0, Date.now() + milliseconds));
   }
 
-  blockAccount(token, milliseconds) {
+  async blockAccount(token, milliseconds) {
     this.pruneExpired();
     const account = fingerprint(token);
     this.accountBlockedUntil.set(account, Math.max(this.accountBlockedUntil.get(account) ?? 0, Date.now() + milliseconds));
@@ -141,7 +143,7 @@ export class PersistentDiscordRateLimitCoordinator extends DiscordRateLimitCoord
     )-clock_timestamp())*1000 AS wait_ms FROM quest_api_rate_limit_blocks
       WHERE blocked_until>clock_timestamp()`, [route, account])).rows[0];
     const waitMs = Math.max(0, Math.ceil(Number(row?.wait_ms ?? 0)));
-    if (waitMs > 0) await delay(waitMs, undefined, { signal, ref: false });
+    if (waitMs > 0) await delay(waitMs, undefined, { signal });
   }
 
   async schedule(input) {
@@ -159,17 +161,17 @@ export class PersistentDiscordRateLimitCoordinator extends DiscordRateLimitCoord
   }
 
   async blockGlobally(milliseconds) {
-    super.blockGlobally(milliseconds);
+    await super.blockGlobally(milliseconds);
     await this.persist('GLOBAL', '*', milliseconds);
   }
 
   async blockRoute(path, milliseconds) {
-    super.blockRoute(path, milliseconds);
+    await super.blockRoute(path, milliseconds);
     await this.persist('ROUTE', normalizedRoute(path), milliseconds);
   }
 
   async blockAccount(token, milliseconds) {
-    super.blockAccount(token, milliseconds);
+    await super.blockAccount(token, milliseconds);
     await this.persist('ACCOUNT', fingerprint(token), milliseconds);
   }
 }

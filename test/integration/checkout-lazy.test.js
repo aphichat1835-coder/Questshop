@@ -15,6 +15,8 @@ let pool;
 before(async () => { pool = await createTestPool(); });
 after(async () => { await pool?.end(); });
 
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
 test('large checkout reserves all items but materializes one account job', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7(); const rule = uuidv7(); const user = 'checkout-user';
@@ -24,7 +26,7 @@ test('large checkout reserves all items but materializes one account job', async
     eventName: 'WATCH_VIDEO', secondsNeeded: 60, progressSecs: 0, progress: 0, completed: false,
     completedAt: null, enrolled: true, enrolledAt: new Date().toISOString(), autoSupported: true,
     executorId: 'video', startsAt: new Date().toISOString(),
-    expiresAt: new Date(Date.now() + 86_400_000).toISOString(), url: `https://discord.com/quests/checkout-${index}`,
+    expiresAt: new Date(Date.now() + ONE_DAY_MS).toISOString(), url: `https://discord.com/quests/checkout-${index}`,
     artworkUrl: null, orbs: 100, applicationId: `app-${index}`, progressKey: 'video',
     coreComplete: true, compatibilityIssues: [] })).map((quest) => {
     const contract = questContractHash(quest, { engineVersion: '1.0.0', executorVersion: '1.0.0',

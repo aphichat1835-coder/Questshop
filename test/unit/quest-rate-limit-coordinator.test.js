@@ -8,18 +8,18 @@ import {
 
 test('rate-limit coordinator isolates a Quest route and account without exposing a token', async () => {
   const coordinator = new DiscordRateLimitCoordinator({ concurrency: 1 });
-  coordinator.blockRoute('/quests/one/heartbeat', 1_000);
-  coordinator.blockAccount('token-one', 1_000);
+  await coordinator.blockRoute('/quests/one/heartbeat', 1_000);
+  await coordinator.blockAccount('token-one', 1_000);
   const status = coordinator.status();
   assert.equal(status.routeBlocks, 1);
   assert.equal(status.accountBlocks, 1);
   assert.equal(JSON.stringify(status).includes('token-one'), false);
 });
 
-test('rate-limit coordinator removes expired local cooldown entries and shares one persistent coordinator per pool', () => {
+test('rate-limit coordinator removes expired local cooldown entries and shares one persistent coordinator per pool', async () => {
   const coordinator = new DiscordRateLimitCoordinator();
-  coordinator.blockRoute('/quests/one/heartbeat', -1);
-  coordinator.blockAccount('token-one', -1);
+  await coordinator.blockRoute('/quests/one/heartbeat', -1);
+  await coordinator.blockAccount('token-one', -1);
   assert.deepEqual(coordinator.status(), {
     queued: 0, accounts: 0, globalBlockedUntil: 0, routeBlocks: 0, accountBlocks: 0,
   });

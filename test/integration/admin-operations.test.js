@@ -72,6 +72,10 @@ test('monitor health check is read-only, records readiness, and quarantines an i
   const ready = await checkMonitorHealth({ monitorId: healthy.id, env }, context, { pool, questApiFactory: factory });
   assert.equal(ready.healthState, 'READY');
   assert.equal(ready.questCount, 2);
+  assert.equal(Object.hasOwn(ready.monitor, 'key_version'), false);
+  assert.equal(Object.hasOwn(ready.monitor, 'nonce'), false);
+  assert.equal(Object.hasOwn(ready.monitor, 'ciphertext'), false);
+  assert.equal(Object.hasOwn(ready.monitor, 'auth_tag'), false);
   assert.deepEqual(calls, ['profile:healthy-token', 'quests:healthy-token']);
 
   const failed = await checkMonitorHealth({ monitorId: invalid.id, env }, context, { pool, questApiFactory: factory });

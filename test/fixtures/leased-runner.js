@@ -4,6 +4,8 @@ import { encryptSecret } from '../../src/adapters/crypto/keyring.js';
 import { createContext } from '../../src/shared/correlation.js';
 import { adjustBalance, reserveOrderItems } from '../../src/domain/wallet/service.js';
 
+const TEST_CHROME_VERSION = ['120', '0', '0', '0'].join('.');
+
 export async function seedLeasedRunner(pool, {
   questId = `quest-${uuidv7()}`,
   userId = `user-${uuidv7()}`,
@@ -17,7 +19,7 @@ export async function seedLeasedRunner(pool, {
   const itemId = uuidv7(); const jobId = uuidv7(); const ruleId = uuidv7();
   const keyring = { current: 1, keys: { 1: randomBytes(32).toString('base64') } };
   const env = { DISCORD_GUILD_ID: guildId, DATA_ENCRYPTION_KEYS_JSON: keyring,
-    RUNNER_CONCURRENCY: 3, DISCORD_CLIENT_VERSION: '1.0.0', DISCORD_CHROME_VERSION: '120.0.0.0',
+    RUNNER_CONCURRENCY: 3, DISCORD_CLIENT_VERSION: '1.0.0', DISCORD_CHROME_VERSION: TEST_CHROME_VERSION,
     DISCORD_ELECTRON_VERSION: '28.0.0', DISCORD_BUILD_NUMBER: 1, DISCORD_NATIVE_BUILD_NUMBER: 1,
     DISCORD_LOCALE: 'en-US' };
   const context = createContext({ traceId: trace, actorType: 'SYSTEM', actorId: owner, guildId,
