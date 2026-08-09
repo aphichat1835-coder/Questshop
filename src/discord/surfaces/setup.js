@@ -2,6 +2,7 @@ import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
 import { appendAdminAudit } from '../../domain/admin/audit.js';
+import { assertPrivateSurface } from './privacy.js';
 
 const PRIVATE = new Set(['LOG_PAYMENTS', 'LOG_QUEST_OPERATIONS', 'LOG_ADMIN', 'LOG_SYSTEM', 'ADMIN_PANEL']);
 
@@ -23,28 +24,13 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
     throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ต้องเลือกห้องข้อความในเซิร์ฟเวอร์');
   }
   const member = await interaction.guild.members.fetchMe();
-  const permissions = channel.permissionsFor(member);
-  if (!permissions?.has(['ViewChannel', 'SendMessages', 'EmbedLinks', 'ReadMessageHistory'])) {
-    throw new QuestshopError('SURFACE_PERMISSION_MISSING', 'บอทไม่มีสิทธิ์ที่จำเป็นในห้องปลายทาง');
-  }
-  if (PRIVATE.has(surfaceKey) && channel.permissionsFor(interaction.guild.roles.everyone)?.has('ViewChannel')) {
-    throw new QuestshopError('PRIVATE_SURFACE_EXPOSED', 'ห้องหลังบ้านต้องปิด View Channel ของ @everyone ก่อน');
-  }
   if (PRIVATE.has(surfaceKey)) {
     const adminRoleId = config?.values?.adminRoleId;
-    if (adminRoleId) {
-      const adminRole = interaction.guild.roles.cache.get(adminRoleId);
-      if (!adminRole || !channel.permissionsFor(adminRole)?.has('ViewChannel')) {
-        throw new QuestshopError('PRIVATE_SURFACE_ADMIN_ROLE_MISSING', 'Admin Role ไม่มีสิทธิ์ดูห้องหลังบ้าน');
-      }
-    }
-    const expected = new Set([interaction.guild.roles.everyone.id, member.id, interaction.client.user.id,
-      interaction.guild.ownerId, ...(adminRoleId ? [adminRoleId] : []), ...member.roles?.cache?.keys?.() ?? []]);
-    const unexpectedRole = [...interaction.guild.roles.cache.values()].find((role) =>
-      role.id !== interaction.guild.roles.everyone.id && !expected.has(role.id)
-      && channel.permissionsFor(role)?.has('ViewChannel'));
-    if (unexpectedRole) {
-      throw new QuestshopError('PRIVATE_SURFACE_EXPOSED', 'ห้องหลังบ้านเปิดให้ Role ที่ไม่ได้อนุญาตเข้าดู');
+    try {
+      assertPrivateSurface({ channel, guild: interaction.guild, botMember: member, adminRoleId,
+        ownerId: interaction.client.questshop?.env?.OWNER_ID ?? interaction.guild.ownerId });
+    } catch (error) {
+      throw new QuestshopError(error.code ?? 'PRIVATE_SURFACE_EXPOSED', 'ห้องหลังบ้านยังไม่ปลอดภัยสำหรับข้อมูลร้าน');
     }
   }
   const existing = (await options.pool.query('SELECT * FROM surfaces WHERE surface_key = $1', [surfaceKey])).rows[0];

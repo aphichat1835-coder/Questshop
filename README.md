@@ -12,7 +12,6 @@ durable ใน PostgreSQL เพื่อให้กู้การทำงา
 > สถานะปัจจุบันคือ **implemented-but-unverified**: โค้ดและ Automated tests มีหลักฐานครอบคลุม
 > แต่ยังห้ามเรียกว่า Production-ready จนกว่า Discord UAT, TrueMoney จริง, Managed PostgreSQL,
 > Backup/Restore drill และ Owner closeout จะผ่านบน Git SHA เดียวกัน
-
 > [!WARNING]
 > ระบบ Quest ใช้ Discord user token/Self-bot behavior ซึ่งอาจขัดข้อกำหนดของ Discord และอาจทำให้
 > บัญชีถูกจำกัดหรือปิดใช้งาน เจ้าของระบบยอมรับความเสี่ยงนี้โดยชัดแจ้ง ผู้ติดตั้งต้องทบทวนข้อกำหนด
@@ -113,7 +112,7 @@ Discord handler มีหน้าที่ Validate/Acknowledge แล้วเ
 - npm และ lockfile ที่อยู่ใน repository
 - PostgreSQL 16+
 - Discord application/bot และ Production Guild หนึ่งแห่ง
-- TLS CA สำหรับ PostgreSQL; Production URL ต้องใช้ `sslmode=verify-full`
+- Production URL ต้องใช้ `sslmode=verify-full`; ระบุ TLS CA ได้เมื่อผู้ให้บริการใช้ private CA
 - S3-compatible storage และ `pg_dump`/`pg_restore` เมื่อเปิด Backup
 - หน่วยความจำเป้าหมาย 512 MB; RSS gate ต่ำกว่า 400 MB
 
@@ -138,6 +137,8 @@ Encryption/HMAC keyrings ให้โดยอัตโนมัติ ไฟล
 
 ```bash
 npm run migrate
+npm run db:verify-roles
+npm run setup:preflight
 npm run register
 npm start
 ```
@@ -179,6 +180,10 @@ npm run dev
 
 Setup เป็น idempotent: การรันซ้ำจะใช้ Secret เดิม ไม่ Rotate หรือสร้าง Key ใหม่ทับข้อมูลที่เข้ารหัสไว้
 
+Production deployment ต้องส่ง `GIT_SHA` ที่เป็น commit SHA 40 ตัวอักษรจาก CI/Image metadata ไม่ใช่ค่าที่
+เจ้าของร้านต้องสุ่มหรือกรอกเอง ระบบจะปฏิเสธ `unknown` ใน Production เพื่อให้ Migration, Backup และ UAT
+ผูกกับ source revision เดียวกันได้
+
 > [!CAUTION]
 > `.env` คือ Secret ถาวรของร้าน ต้องสำรองเข้า Secret manager ที่ปลอดภัย ห้าม Commit, ส่งในแชต,
 > ใส่ Docker image หรือปล่อยหายเมื่อ Redeploy หาก Key สูญหาย Token/Receiver เดิมอาจถอดรหัสไม่ได้
@@ -193,6 +198,23 @@ Setup ปิด Backup ไว้ก่อนเพื่อให้เปิด
 
 สำหรับ Docker ให้ Mount `.env` เป็น Secret file หรือย้ายค่าข้างในเข้า Secret manager ของ Platform;
 ไฟล์นี้ไม่ถูก Copy เข้า Image โดยตั้งใจ
+
+สำหรับ Host แบบ stateless สามารถสร้าง bundle แบบไม่แสดง Secret บนหน้าจอ แล้วนำเนื้อหาไฟล์ไปเก็บใน Secret
+manager เป็น `QUESTSHOP_SECRET_BUNDLE` ได้:
+
+```bash
+QUESTSHOP_SECRET_BUNDLE_FILE=/secure/questshop.bundle npm run setup:export-secret-bundle
+```
+
+Runtime จะอ่าน bundle เฉพาะเมื่อไม่มี `.env`; environment variable ที่กำหนดโดย Platform มีสิทธิ์เหนือกว่า
+bundle เสมอ และ bundle ไม่ใช่ช่องทาง Rotate key อัตโนมัติ
+
+> [!IMPORTANT]
+> ระบบใหม่ที่ยังไม่มีข้อมูล Durable จะสร้าง Sentinel แบบอัตโนมัติครั้งแรก สำหรับฐานข้อมูลเก่าที่มีข้อมูลแล้ว
+> แต่ยังไม่มี Sentinel ให้ตรวจ keyrings ด้วย Owner ก่อน แล้วรัน
+> `QUESTSHOP_KEYRING_ADOPTION=VERIFY_KEYS_AND_ADOPT npm run keys:adopt` เพียงครั้งเดียว ห้ามใช้คำสั่งนี้
+> เพื่อเดา/แก้ปัญหา key ที่สูญหาย คำสั่งเดียวกันนี้ใช้เพิ่ม Key version ใหม่หลัง Owner ตรวจค่าใน
+> Secret manager แล้วได้ แต่ไม่ยอมลบหรือแทนที่ Sentinel ของ Key เดิม
 
 ## Health endpoints
 

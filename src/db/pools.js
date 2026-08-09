@@ -7,12 +7,13 @@ let directPool;
 
 function commonOptions(env, connectionString) {
   const databaseUrl = new URL(connectionString);
-  const ssl = env.NODE_ENV === 'test' && databaseUrl.searchParams.get('sslmode') === 'disable'
-    ? false
-    : {
-      ca: Buffer.from(env.DATABASE_SSL_CA_BASE64, 'base64').toString('utf8'),
-      rejectUnauthorized: true,
-    };
+  const sslDisabledForTest = env.NODE_ENV === 'test' && databaseUrl.searchParams.get('sslmode') === 'disable';
+  const ssl = sslDisabledForTest ? false : {
+    ...(env.DATABASE_SSL_CA_BASE64
+      ? { ca: Buffer.from(env.DATABASE_SSL_CA_BASE64, 'base64').toString('utf8') }
+      : {}),
+    rejectUnauthorized: true,
+  };
   return {
     ssl,
     connectionTimeoutMillis: 5_000,

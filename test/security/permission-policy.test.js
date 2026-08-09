@@ -13,9 +13,11 @@ test('runtime has no Permission Drift detector or repair route', async () => {
   assert.doesNotMatch(sources, /perm_repair/);
 });
 
-test('surface installation retains only the one-time minimum permission precondition', async () => {
+test('startup requires Administrator once while private surfaces retain human privacy checks', async () => {
+  const startup = await readFile(new URL('../../src/bootstrap/startup.js', import.meta.url), 'utf8');
   const source = await readFile(new URL('../../src/discord/surfaces/setup.js', import.meta.url), 'utf8');
-  assert.match(source, /SURFACE_PERMISSION_MISSING/);
+  assert.match(startup, /Administrator/);
   assert.match(source, /PRIVATE_SURFACE_EXPOSED/);
+  assert.doesNotMatch(source, /SURFACE_PERMISSION_MISSING/);
   assert.doesNotMatch(source, /checkPermissionDrift|repairPermissionDrift/);
 });

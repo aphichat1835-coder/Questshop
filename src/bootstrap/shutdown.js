@@ -27,6 +27,15 @@ async function flushOutbox(runtime, deadline) {
   }
 }
 
+async function preserveCleanupFailure(action, failure) {
+  try {
+    await action();
+  } catch (error) {
+    return failure ?? error;
+  }
+  return failure;
+}
+
 export async function shutdown(runtime, reason = 'shutdown', { leaseLost = false, error = null } = {}) {
   if (runtime.shutdownPromise) return runtime.shutdownPromise;
   runtime.shutdownPromise = shutdownOnce(runtime, reason, { leaseLost, error });
@@ -42,20 +51,24 @@ async function shutdownOnce(runtime, reason, { leaseLost, error }) {
   runtime.abortController.abort(reason);
   // A process that lost the Runtime lease must stop Discord ingress before any
   // drain work.  It no longer has authority to publish customer-facing state.
-  if (leaseLost) runtime.client.destroy();
   let failure = null;
+  if (leaseLost) {
+    failure = await preserveCleanupFailure(async () => runtime.client?.destroy?.(), failure);
+  }
   try {
-    await bounded(runtime.workers.stop(), Math.min(deadline, Date.now() + 10_000), 'worker checkpoint');
+    await bounded(Promise.resolve(runtime.workers?.stop?.()), Math.min(deadline, Date.now() + 10_000), 'worker checkpoint');
     if (!leaseLost) await bounded(flushOutbox(runtime, deadline), deadline, 'outbox flush');
-    await bounded(runtime.heartbeat.catch(() => null), deadline, 'runtime heartbeat');
+    await bounded(Promise.resolve(runtime.heartbeat).catch(() => null), deadline, 'runtime heartbeat');
     if (!leaseLost) {
       await bounded(releaseLease({ resourceType: 'RUNTIME', resourceId: runtime.env.DISCORD_GUILD_ID,
         holder: runtime.runtimeHolder, fencingToken: runtime.runtimeLease.fencing_token }, { pool: runtime.pool }).catch(() => null),
       deadline, 'runtime lease release');
     }
-  } catch (error) { failure = error; }
-  if (!leaseLost) runtime.client.destroy();
-  await bounded(closePools().catch(() => null), deadline, 'database close').catch((error) => { failure ??= error; });
+  } catch (caught) { failure ??= caught; }
+  if (!leaseLost) {
+    failure = await preserveCleanupFailure(async () => runtime.client?.destroy?.(), failure);
+  }
+  await bounded(closePools().catch(() => null), deadline, 'database close').catch((caught) => { failure ??= caught; });
   runtime.health.live = false;
   await bounded(closeHealthServer(runtime.server).catch(() => null), deadline, 'health close')
     .catch((error) => { failure ??= error; });

@@ -39,11 +39,11 @@ try {
     let stderr = '';
     child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4000); });
     const restoreInput = pipeline(restored.dumpStream, child.stdin);
-    const code = await new Promise((resolve, reject) => {
+    const waitForRestore = new Promise((resolve, reject) => {
       child.once('error', reject);
       child.once('close', resolve);
     });
-    await restoreInput;
+    const [code] = await Promise.all([waitForRestore, restoreInput]);
     if (code !== 0) throw new Error(`pg_restore failed (${code}): ${stderr}`);
   });
   target = new Pool({ connectionString: targetUrl.toString(), password, ssl: { ca: Buffer.from(env.DATABASE_SSL_CA_BASE64, 'base64').toString('utf8'), rejectUnauthorized: true }, max: 1 });

@@ -16,6 +16,7 @@ import { runMaintenance } from '../workers/maintenance-worker.js';
 import { validateKeyringCoverage } from './keyring-coverage.js';
 import { validateRuntimeRole } from '../db/role-contract.js';
 import { processOutbox } from '../workers/outbox-worker.js';
+import { validateOrInitializeKeyringSentinels } from './keyring-sentinels.js';
 
 async function migrateWithBackup(env, health) {
   const backupEnabled = env.BACKUP_ENABLED ?? env.NODE_ENV === 'production';
@@ -31,6 +32,9 @@ async function migrateWithBackup(env, health) {
   if (migrationTable) {
     const schemaVersion = Number((await directPool.query('SELECT COALESCE(max(version),0) AS value FROM schema_migrations')).rows[0].value);
     const latestVersion = Math.max(...(await listMigrations()).map((migration) => migration.version));
+    if (schemaVersion < latestVersion && !backupEnabled && env.NODE_ENV === 'production') {
+      throw new Error('Production migrations require a verified pre-migration backup');
+    }
     if (backupEnabled && schemaVersion < latestVersion) {
       preMigrationBackup = await createEncryptedBackup({ env, schemaVersion, reason: 'pre-migration' });
       health.checks.preMigrationBackup = 'VERIFIED';
@@ -38,6 +42,7 @@ async function migrateWithBackup(env, health) {
   } else health.checks.preMigrationBackup = 'FIRST_INSTALL_NOT_APPLICABLE';
   await runMigrations({ pool: directPool, gitSha: env.GIT_SHA,
     runtimeRole: decodeURIComponent(new URL(env.DATABASE_POOL_URL).username) });
+  await validateOrInitializeKeyringSentinels(directPool, env);
   if (preMigrationBackup) {
     await directPool.query(`INSERT INTO backup_runs(id,backup_type,state,object_key,checksum,size_bytes,schema_version,
       git_sha,encryption_key_version,manifest,completed_at) VALUES($1,'PRE_MIGRATION','VERIFIED',$2,$3,$4,$5,$6,$7,$8,clock_timestamp())`,
@@ -76,7 +81,12 @@ async function connectDiscord(env, logger, health, pool, config) {
   await client.login(env.DISCORD_BOT_TOKEN);
   if (!client.isReady()) await once(client, 'ready');
   const guild = await client.guilds.fetch(env.DISCORD_GUILD_ID);
-  await guild.members.fetchMe();
+  const me = await guild.members.fetchMe();
+  if (!me.permissions.has('Administrator')) {
+    throw Object.assign(new Error('Questshop bot must have Discord Administrator permission'), {
+      code: 'DISCORD_ADMINISTRATOR_REQUIRED',
+    });
+  }
   health.checks.discord = 'OK';
   return client;
 }
@@ -141,41 +151,60 @@ async function cleanupFailedStartup({ abortController, client, error, health, lo
   logger.error({ error }, 'Questshop startup failed');
   await recordStartupCryptoIncident(pool, error);
   abortController.abort(error);
-  client?.destroy();
+  await Promise.resolve(client?.destroy?.()).catch((destroyError) => {
+    logger.error({ error: destroyError }, 'discord cleanup after failed startup failed');
+  });
   await closePools().catch(() => null);
   health.live = false;
   await closeHealthServer(server).catch(() => null);
 }
 
 export async function startup({ health = createHealthState(), server: existingServer = null,
-  onRuntimeLeaseLost = null } = {}) {
+  onRuntimeLeaseLost = null, onRuntimePrepared = null, signal: startupSignal = null } = {}) {
   const bootstrapPort = resolveBootstrapPort(process.env.PORT);
   const logger = createLogger({ gitSha: process.env.GIT_SHA ?? 'bootstrap' });
   const server = existingServer ?? await startHealthServer({ port: bootstrapPort,
     statusToken: process.env.STATUS_TOKEN ?? 'unconfigured', state: health });
   const abortController = new AbortController();
+  if (startupSignal) {
+    if (startupSignal.aborted) abortController.abort(startupSignal.reason);
+    else startupSignal.addEventListener('abort', () => abortController.abort(startupSignal.reason), { once: true });
+  }
+  const assertStarting = () => {
+    if (abortController.signal.aborted) {
+      throw Object.assign(new Error('Questshop startup interrupted'), { code: 'STARTUP_ABORTED', cause: abortController.signal.reason });
+    }
+  };
   let client;
   let pool;
   try {
     const env = loadEnvironment();
     health.checks.config = 'OK';
+    assertStarting();
     await migrateWithBackup(env, health);
+    assertStarting();
     pool = await openRuntimeDatabase(env, health);
+    assertStarting();
     const { holder, runtimeLease } = await acquireRuntimeOwnership(pool, env, health);
+    assertStarting();
     const config = await loadRuntimeConfig(pool);
     client = await connectDiscord(env, logger, health, pool, config);
+    assertStarting();
     await runMaintenance({ env, holder: 'startup-recovery', client, pool,
       runnerConcurrency: Number(config.values?.runnerConcurrency ?? env.RUNNER_CONCURRENCY) });
     health.checks.discord = 'OK';
     const workers = await startRecoveredWorkers({ abortController, client, env, health, logger, pool });
-    const heartbeat = startRuntimeHeartbeat({ abortController, env, holder, pool, runtimeLease,
-      health, logger, onRuntimeLeaseLost });
-    await markRuntimeReady({ env, health, logger, pool });
-    const runtime = { env, logger, health, server, pool, client, config, workers, abortController, heartbeat,
+    assertStarting();
+    const runtime = { env, logger, health, server, pool, client, config, workers, abortController, heartbeat: null,
       runtimeLease, runtimeHolder: holder, acceptingInteractions: true, shutdownPromise: null };
     // Interaction handlers must observe the same runtime object that shutdown
     // fences. This also gives bounded customer waits the process AbortSignal.
     client.questshop = runtime;
+    await onRuntimePrepared?.(runtime);
+    assertStarting();
+    runtime.heartbeat = startRuntimeHeartbeat({ abortController, env, holder, pool, runtimeLease,
+      health, logger, onRuntimeLeaseLost });
+    await markRuntimeReady({ env, health, logger, pool });
     return runtime;
   } catch (error) {
     await cleanupFailedStartup({ abortController, client, error, health, logger, pool, server });

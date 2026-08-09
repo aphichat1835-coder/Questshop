@@ -146,6 +146,26 @@ export async function markMonitorTestBatchPassed(client, { run, context }) {
   return batch;
 }
 
+// A worker can finish its durable TEST_PASSED transition immediately before a
+// process crash. This recovery pass closes that gap: it derives the batch
+// outcome from the already-verified run and lets normal sale reconciliation
+// reopen the eligible Quest afterwards.
+export async function reconcilePassedMonitorTestBatches(client, context) {
+  const candidates = (await client.query(`SELECT b.id AS batch_id,tr.*
+    FROM quest_test_batches b JOIN LATERAL (
+      SELECT * FROM quest_test_runs tr WHERE tr.batch_id=b.id AND tr.state='TEST_PASSED'
+      ORDER BY tr.completed_at DESC NULLS LAST,tr.updated_at DESC LIMIT 1
+    ) tr ON true
+    WHERE b.state IN ('QUEUED','RUNNING')
+    ORDER BY b.updated_at,b.id FOR UPDATE OF b SKIP LOCKED`)).rows;
+  let reconciled = 0;
+  for (const run of candidates) {
+    const batch = await markMonitorTestBatchPassed(client, { run, context: { ...context, traceId: run.trace_id } });
+    if (batch) reconciled += 1;
+  }
+  return reconciled;
+}
+
 export async function retryFailedTestAlert(client, { alertId, context }) {
   const alert = (await client.query(`SELECT * FROM quest_test_failure_alerts WHERE id=$1 FOR UPDATE`, [alertId])).rows[0];
   if (alert?.state !== 'OPEN') return { alert, batch: null, idempotent: true };

@@ -38,10 +38,10 @@ function questOptionDescription(row) {
 }
 
 export function renderSelection(page) {
+  const rows = page.rows.slice(0, 25);
   const select = new StringSelectMenuBuilder().setCustomId(customId('quest_select', page.session.id))
-    .setPlaceholder(page.count ? 'เลือก Quest ในหน้านี้' : 'ยังไม่มี Quest ที่รับทำได้')
-    .setMinValues(0).setMaxValues(Math.max(1, page.rows.length)).setDisabled(!page.rows.length);
-  if (page.rows.length) select.addOptions(page.rows.map((row) => ({
+    .setPlaceholder('เลือก Quest ในหน้านี้').setMinValues(0).setMaxValues(Math.max(1, rows.length));
+  if (rows.length) select.addOptions(rows.map((row) => ({
     label: String(row.quest_name).slice(0, 100), value: row.line_id,
     description: questOptionDescription(row), default: row.selected,
   })));
@@ -59,9 +59,11 @@ export function renderSelection(page) {
   const embed = new EmbedBuilder().setColor(COLOR.primary).setTitle('เลือก Quest ที่ต้องการ')
     .setDescription(description).setFooter({ text: 'ระบบจะตรวจราคา สถานะ และเวลาคงเหลืออีกครั้งก่อนยืนยัน' });
   if (page.session.payload.avatarUrl) embed.setThumbnail(page.session.payload.avatarUrl);
+  const selectionComponents = rows.length
+    ? [new ActionRowBuilder().addComponents(select)] : [];
   return {
     embeds: [embed],
-    components: [new ActionRowBuilder().addComponents(select), new ActionRowBuilder().addComponents(
+    components: [...selectionComponents, new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(customId('quest_prev', page.session.id)).setLabel('ก่อนหน้า')
         .setStyle(ButtonStyle.Secondary).setDisabled(page.page === 0),
       new ButtonBuilder().setCustomId(customId('quest_next', page.session.id)).setLabel('ถัดไป')

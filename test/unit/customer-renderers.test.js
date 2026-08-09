@@ -37,6 +37,14 @@ test('selection shows account, wallet, selection totals and a review action with
   assert.equal(buttons.includes('ตรวจสอบรายการ'), true);
 });
 
+test('selection omits the Discord select component when no eligible Quest exists', () => {
+  const body = renderSelection({ session, count: 0, selectedCount: 0, selectedTotalCents: 0,
+    walletAvailableCents: 2_000, page: 0, pages: 1, rows: [] });
+  assert.equal(body.components.length, 1);
+  assert.deepEqual(body.components[0].components.map((button) => button.data.label),
+    ['ก่อนหน้า', 'ถัดไป', 'เลือกทั้งหมด', 'ตรวจสอบรายการ']);
+});
+
 test('quote keeps the explicit revalidation boundary with edit and confirm actions', () => {
   const body = renderQuote({ session, walletAvailableCents: 2_000, totalCents: 500, items: [
     { quest_name: 'Dolly’s Factory', task_type: 'PLAY_ON_DESKTOP', orbs: 10,

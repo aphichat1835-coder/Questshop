@@ -212,14 +212,20 @@ async function executeTestQuest({ pool, run, monitor, env, runnerConcurrency, te
   if (!execution.verified || !current.completed || !current.completedAt) {
     throw Object.assign(new Error('Background test completion not verified'), { code: 'TEST_COMPLETION_NOT_VERIFIED' });
   }
-  const passed = await updateOwned(pool, run, `UPDATE quest_test_runs SET state='TEST_PASSED',
+  await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
+    assertTransition(TEST_TRANSITIONS, 'TESTING', 'TEST_PASSED');
+    const passed = (await client.query(`UPDATE quest_test_runs SET state='TEST_PASSED',
       state_version=state_version+1,evidence=$4,completed_at=clock_timestamp(),
-      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp() WHERE true`,
-  [{ accountVisible: true, executorId: executor.id, completedAt: current.completedAt,
-      traceId: context.traceId }], 'TEST_PASSED', 'TEST_COMPLETION_VERIFIED', context);
-  await withTransaction({ pool, isolation: 'SERIALIZABLE' }, (client) => markMonitorTestBatchPassed(client, {
-    run: passed, context,
-  }));
+      lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+      WHERE id=$1 AND state='TESTING' AND lease_owner=$2 AND fencing_token=$3
+        AND lease_expires_at>clock_timestamp() RETURNING *`, [run.id, run.lease_owner, run.fencing_token,
+      { accountVisible: true, executorId: executor.id, completedAt: current.completedAt, traceId: context.traceId }])).rows[0];
+    if (!passed) throw new FencingLostError(`quest-test:${run.id}`);
+    await recordTransition(client, { aggregateType: 'QUEST_TEST', aggregateId: passed.id,
+      fromState: 'TESTING', toState: 'TEST_PASSED', stateVersion: passed.state_version,
+      reasonCode: 'TEST_COMPLETION_VERIFIED', context });
+    await markMonitorTestBatchPassed(client, { run: passed, context });
+  });
   await pool.query(`UPDATE monitor_accounts SET consecutive_failures=0,updated_at=clock_timestamp()
       WHERE id=$1`, [monitor.id]);
   await ingestDiscovery({ normalized: current, source: 'MONITOR',

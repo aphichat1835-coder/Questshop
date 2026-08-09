@@ -161,7 +161,7 @@ export async function completeSetupValues({ fileValues = {}, processValues = pro
 
   const candidate = { ...fileValues, ...processValues, ...updates };
   for (const key of SETUP_ONLY_FIELDS) delete candidate[key];
-  const missing = [...EXTERNAL_SETUP_FIELDS, 'DATABASE_SSL_CA_BASE64']
+  const missing = [...EXTERNAL_SETUP_FIELDS]
     .filter((key) => !pickNonempty(candidate[key]));
   if (missing.length) return { candidate, generated: updates, missing, validated: null };
   const validated = loadEnvironment(candidate);
@@ -186,5 +186,7 @@ export async function writeEnvironmentFile(filePath, original, updates) {
     await unlink(temporary).catch(() => null);
     throw error;
   }
-  return { path: target, content };
+  // Do not return the serialized file.  Callers only need the durable path;
+  // returning content makes accidental secret logging far too easy.
+  return { path: target };
 }

@@ -76,8 +76,10 @@ async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_
       assertJobTransition(current.state, terminalJobState);
       const terminal = (await client.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
         lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-        WHERE id=$1 AND state_version=$3 RETURNING *`,
-      [current.id, terminalJobState, current.state_version])).rows[0];
+        WHERE id=$1 AND state=$3 AND state_version=$4 AND lease_owner=$5 AND fencing_token=$6
+          AND lease_expires_at>clock_timestamp() RETURNING *`,
+      [current.id, terminalJobState, current.state, current.state_version, current.lease_owner, current.fencing_token])).rows[0];
+      if (!terminal) throw new FencingLostError(`runner:${current.id}`);
       await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: current.id,
         fromState: current.state, toState: terminalJobState, stateVersion: terminal.state_version,
         reasonCode: 'CHECKPOINT_RECONCILED_TERMINAL_ITEM', context });
@@ -89,17 +91,23 @@ async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_
       ? null
       : Math.max(0, Math.ceil(Number(delayMs) / 1_000));
     const itemNext = next;
+    assertTransition(ORDER_ITEM_TRANSITIONS, item.state, itemNext);
     const updatedJob = (await client.query(`UPDATE runner_jobs SET state=$2,state_version=state_version+1,
       available_at=CASE WHEN $3::integer IS NULL THEN clock_timestamp()+make_interval(secs => floor(random()*LEAST(300::double precision,
         5::double precision*power(2::double precision,GREATEST(0,attempt_count-1))))::integer)
         ELSE clock_timestamp()+make_interval(secs => $3::integer) END,
       lease_owner=NULL,lease_expires_at=NULL,
-      updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [current.id, next, delaySeconds])).rows[0];
+      updated_at=clock_timestamp() WHERE id=$1 AND state=$4 AND state_version=$5
+        AND lease_owner=$6 AND fencing_token=$7 AND lease_expires_at>clock_timestamp() RETURNING *`,
+    [current.id, next, delaySeconds, current.state, current.state_version, current.lease_owner, current.fencing_token])).rows[0];
+    if (!updatedJob) throw new FencingLostError(`runner:${current.id}`);
     await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: current.id,
       fromState: current.state, toState: next, stateVersion: updatedJob.state_version,
       reasonCode, context });
     const updatedItem = (await client.query(`UPDATE order_items SET state=$2,state_version=state_version+1,
-      updated_at=clock_timestamp() WHERE id=$1 RETURNING *`, [current.order_item_id, itemNext])).rows[0];
+      updated_at=clock_timestamp() WHERE id=$1 AND state=$3 AND state_version=$4 RETURNING *`,
+    [current.order_item_id, itemNext, item.state, item.state_version])).rows[0];
+    if (!updatedItem) throw new QuestshopError('ITEM_STATE_CONFLICT', 'Order item changed during runner checkpoint');
     await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: updatedItem.id,
       fromState: item.state, toState: itemNext, stateVersion: updatedItem.state_version,
       reasonCode, context });
@@ -234,8 +242,11 @@ export async function requeueDueRunnerJobsInTransaction(client, context, { inclu
     `, [includeExpired])).rows;
   let moved = 0;
   for (const job of candidates) {
-    assertJobTransition(job.state, 'QUEUED');
-    assertTransition(ORDER_ITEM_TRANSITIONS, job.item_state, 'QUEUED');
+    if (!(RUNNER_JOB_TRANSITIONS[job.state] ?? []).includes('QUEUED')
+      || !(ORDER_ITEM_TRANSITIONS[job.item_state] ?? []).includes('QUEUED')) {
+      await containRunnerQueueMismatch(client, job, context, 'INVALID_REQUEUE_TRANSITION');
+      continue;
+    }
     const updatedJob = (await client.query(`UPDATE runner_jobs SET state='QUEUED',
       state_version=state_version+1,updated_at=clock_timestamp()
       WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
@@ -245,7 +256,14 @@ export async function requeueDueRunnerJobsInTransaction(client, context, { inclu
       state_version=state_version+1,updated_at=clock_timestamp()
       WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
     [job.order_item_id, job.item_state, job.item_state_version])).rows[0];
-    if (!updatedItem) throw new QuestshopError('ITEM_STATE_CONFLICT', 'Runner item changed during retry requeue');
+    if (!updatedItem) {
+      // Never perform an unaudited reverse write here. A paired CAS failure
+      // means our durable picture is no longer trustworthy, so fence this one
+      // job into review while allowing unrelated queue entries to progress.
+      await containRunnerQueueMismatch(client, { ...job, state: updatedJob.state,
+        state_version: updatedJob.state_version }, context, 'ITEM_CAS_AFTER_JOB_REQUEUE');
+      continue;
+    }
     const reasonCode = job.state === 'WAITING_RATE_LIMIT' ? 'RATE_LIMIT_DUE' : 'RETRY_DUE';
     await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
       fromState: job.state, toState: 'QUEUED', stateVersion: updatedJob.state_version,
@@ -256,6 +274,41 @@ export async function requeueDueRunnerJobsInTransaction(client, context, { inclu
     moved += 1;
   }
   return moved;
+}
+
+export async function containRunnerQueueMismatch(client, job, context, reasonCode) {
+  const evidence = { jobState: job.state, itemState: job.item_state, reasonCode };
+  await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
+    VALUES(gen_random_uuid(),'RUNNER_QUEUE_STATE_MISMATCH',$1,'OPEN','CRITICAL',$2,$3)
+    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
+      evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`, [job.id, evidence, job.trace_id]);
+  const currentItem = (await client.query('SELECT * FROM order_items WHERE id=$1 FOR UPDATE', [job.order_item_id])).rows[0];
+  const canReviewJob = (RUNNER_JOB_TRANSITIONS[job.state] ?? []).includes('MANUAL_REVIEW');
+  const canReviewItem = currentItem && (ORDER_ITEM_TRANSITIONS[currentItem.state] ?? []).includes('MANUAL_REVIEW');
+  if (!canReviewJob) return;
+  const updatedJob = (await client.query(`UPDATE runner_jobs SET state='MANUAL_REVIEW',state_version=state_version+1,
+    lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+    WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+  [job.id, job.state, job.state_version])).rows[0];
+  if (!updatedJob) return;
+  await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: updatedJob.id,
+    fromState: job.state, toState: 'MANUAL_REVIEW', stateVersion: updatedJob.state_version,
+    reasonCode: 'RUNNER_QUEUE_STATE_MISMATCH', context });
+  if (!canReviewItem) return;
+  const updatedItem = (await client.query(`UPDATE order_items SET state='MANUAL_REVIEW',state_version=state_version+1,
+    updated_at=clock_timestamp() WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+  [currentItem.id, currentItem.state, currentItem.state_version])).rows[0];
+  if (!updatedItem) return;
+  await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: updatedItem.id,
+    fromState: currentItem.state, toState: 'MANUAL_REVIEW', stateVersion: updatedItem.state_version,
+    reasonCode: 'RUNNER_QUEUE_STATE_MISMATCH', context });
+  await openReview(client, { subjectType: 'ORDER_ITEM', subjectId: updatedItem.id,
+    reason: 'RUNNER_QUEUE_STATE_MISMATCH', financial: true, ownerOnly: false, context });
+  await enqueueProjection(client, { projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM',
+    aggregateId: updatedItem.id, aggregateVersion: updatedItem.state_version, surfaceKey: 'QUEST_HISTORY', context });
+  await enqueueProjection(client, { projectionType: 'RUNNER_SUMMARY', aggregateType: 'RUNNER_JOB',
+    aggregateId: updatedJob.id, aggregateVersion: updatedJob.state_version,
+    surfaceKey: 'LOG_QUEST_OPERATIONS', context });
 }
 
 export async function requeueDueRunnerJobs(context, options = {}) {

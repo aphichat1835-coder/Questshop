@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 const snowflake = z.string().regex(/^\d{17,20}$/);
+const booleanText = z.enum(['true', 'false']).transform((value) => value === 'true');
 const keyringSchema = z.object({
   current: z.coerce.number().int().positive(),
   keys: z.record(z.string(), z.string().min(40)),
@@ -34,7 +35,7 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('production'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   TIMEZONE: z.literal('Asia/Bangkok').default('Asia/Bangkok'),
-  PRELAUNCH: z.string().default('true').transform((value) => value === 'true'),
+  PRELAUNCH: booleanText.default('true'),
   DISCORD_BOT_TOKEN: z.string().min(20),
   DISCORD_CLIENT_ID: snowflake,
   DISCORD_GUILD_ID: snowflake,
@@ -42,10 +43,10 @@ const schema = z.object({
   STATUS_TOKEN: z.string().min(32),
   DATABASE_POOL_URL: z.string().url(),
   DATABASE_DIRECT_URL: z.string().url(),
-  BACKUP_ENABLED: z.string().optional().transform((value) => value == null ? undefined : value === 'true'),
+  BACKUP_ENABLED: booleanText.optional(),
   DATABASE_BACKUP_URL: z.string().url().optional(),
   DATABASE_RESTORE_URL: z.string().url().optional(),
-  DATABASE_SSL_CA_BASE64: z.string().min(1),
+  DATABASE_SSL_CA_BASE64: z.string().min(1).optional(),
   PG_DUMP_PATH: z.string().min(1).default('pg_dump'),
   PG_RESTORE_PATH: z.string().min(1).default('pg_restore'),
   DATA_ENCRYPTION_KEYS_JSON: z.string().transform(jsonKeyring),
@@ -56,7 +57,7 @@ const schema = z.object({
   S3_BUCKET: z.string().min(3).optional(),
   S3_ACCESS_KEY_ID: z.string().min(1).optional(),
   S3_SECRET_ACCESS_KEY: z.string().min(1).optional(),
-  S3_FORCE_PATH_STYLE: z.string().default('true').transform((value) => value === 'true'),
+  S3_FORCE_PATH_STYLE: booleanText.default('true'),
   RUNNER_CONCURRENCY: z.coerce.number().int().min(1).max(5).default(3),
   RUNNER_CONCURRENCY_HARD_MAX: z.coerce.number().int().min(1).max(5).default(5),
   GIT_SHA: z.string().min(1).default('unknown'),
@@ -69,6 +70,9 @@ const schema = z.object({
 }).superRefine((value, ctx) => {
   if (value.RUNNER_CONCURRENCY > value.RUNNER_CONCURRENCY_HARD_MAX) {
     ctx.addIssue({ code: 'custom', message: 'RUNNER_CONCURRENCY exceeds hard max' });
+  }
+  if (value.NODE_ENV === 'production' && !/^[0-9a-f]{40}$/i.test(value.GIT_SHA)) {
+    ctx.addIssue({ code: 'custom', message: 'GIT_SHA must be the 40-character deployment commit SHA in production' });
   }
   const backupKeys = ['DATABASE_BACKUP_URL', 'DATABASE_RESTORE_URL', 'S3_ENDPOINT', 'S3_BUCKET',
     'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', 'BACKUP_ENCRYPTION_KEYS_JSON'];

@@ -14,6 +14,9 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Added
 
+- Owner-only `keys:adopt`, `db:verify-roles`, `setup:preflight` และ secret-bundle export สำหรับตรวจ
+  keyring/role/Discord Administrator โดยไม่พิมพ์ Secret ออกมา
+
 - Questshop runtime แบบ Single Guild บน Node.js 22, discord.js และ PostgreSQL 16+
 - First-run `npm run setup` ที่ถามเฉพาะ Discord/Database/CA จำนวน 7 ค่า แล้วสร้าง Status token,
   keyrings สามชุด, normalized CA และค่าเริ่มต้นลง `.env` permission `0600` แบบ idempotent
@@ -41,6 +44,16 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 - Automated unit, PostgreSQL integration, concurrency, crash, security, contract, recovery และ load tests
 
 ### Changed
+
+- Startup ตรวจ Discord Administrator ครั้งเดียวก่อนรับงาน; ห้องหลังบ้านไม่ทำ per-surface bot permission drift check
+- Payment Log ตรวจความเป็นส่วนตัวของมนุษย์ทุกครั้งก่อนถอดรหัสหรือส่งลิงก์ซองเต็ม; หากไม่ปลอดภัยจะปิด
+  Surface, เปิด Incident, แจ้ง Owner และเก็บ Financial DLQ ไว้ Replay หลังซ่อมสิทธิ์
+- Keyring ใช้ cryptographic sentinel ใน PostgreSQL เพื่อตรวจจับ key material คนละชุดแม้ version เท่ากัน
+- Keyring sentinel ตรวจชุด key versions แบบ exact และสร้างทั้งชุดใน Transaction เดียว; Database เก่าที่มี
+  ข้อมูลต้องผ่าน Owner adoption ที่ตั้งใจชัดเจนก่อน Runtime จะยอมเริ่ม
+- Production บังคับ `GIT_SHA` 40 ตัวอักษรเพื่อผูก deployment evidence กับ source revision จริง
+- Shutdown ทำ cleanup ต่อแม้ Discord destroy ล้มเหลว และ Startup รับ SIGTERM/SIGINT ก่อน Runtime พร้อม
+- Runner state mismatch ถูกกักไป Manual Review พร้อม Incident/Outbox แทนการวนคิวงานที่เสีย
 
 - คำสั่ง Runtime/Migration/Register/Backup โหลด `.env` ให้อัตโนมัติ และ Docker รองรับการ Mount
   `.env` โดยไม่ Copy Secret เข้า Image

@@ -247,6 +247,43 @@ test('quest-new role ping is durable and is not repeated when the message is rec
   assert.deepEqual(sent[1].allowedMentions, { parse: [] });
 });
 
+test('unsafe payment log goes to financial DLQ before the voucher renderer can decrypt anything', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const projection = uuidv7(); const event = uuidv7(); const trace = uuidv7();
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state)
+    VALUES('LOG_PAYMENTS','guild','payments-channel','anchor','ACTIVE')
+    ON CONFLICT(surface_key) DO UPDATE SET channel_id=EXCLUDED.channel_id,state='ACTIVE'`);
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'PAYMENT_LOG','topup-privacy','LOG_PAYMENTS',$2)`, [projection, `privacy-${event.slice(0, 16)}`]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','TOPUP','topup-privacy',1,$2,'PENDING',$3)`,
+  [event, projection, trace]);
+  let rendered = 0; let ownerNotified = 0;
+  const everyone = { id: 'everyone' };
+  const channel = {
+    isTextBased: () => true,
+    permissionsFor: () => ({ has: () => true }),
+    permissionOverwrites: { cache: new Map() },
+  };
+  const client = {
+    channels: { fetch: async () => channel },
+    guilds: { fetch: async () => ({ ownerId: 'owner', roles: { everyone, cache: new Map([[everyone.id, everyone]]) },
+      members: { fetchMe: async () => ({ id: 'bot', roles: { cache: new Map() } }) } }) },
+    users: { fetch: async () => ({ createDM: async () => ({ send: async () => { ownerNotified += 1; } }) }) },
+  };
+  assert.equal(await processOutbox({ holder: uuidv7(), client, pool,
+    env: { DISCORD_GUILD_ID: 'guild', OWNER_ID: 'owner' },
+    renderProjectionFunction: async () => { rendered += 1; return {}; } }), true);
+  assert.equal(rendered, 0);
+  assert.equal(ownerNotified, 1);
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [event])).rows[0].state, 'DEAD_LETTER');
+  assert.equal((await pool.query("SELECT state FROM surfaces WHERE surface_key='LOG_PAYMENTS'")).rows[0].state, 'DISABLED');
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM dead_letter_items
+    WHERE source_id=$1 AND category='FINANCIAL'`, [event])).rows[0].count), 1);
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM incidents
+    WHERE incident_code='LOG_PAYMENTS_PRIVACY_UNSAFE' AND state='OPEN'`)).rows[0].count), 1);
+});
+
 test('surface reconciliation refreshes existing anchors after config version changes', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   await pool.query("UPDATE surfaces SET state='DISABLED' WHERE surface_key<>'QUEST_AUTO'");

@@ -2,7 +2,7 @@ import { expireSessions } from '../domain/checkout/service.js';
 import { createContext } from '../shared/correlation.js';
 import { withTransaction } from '../db/transaction.js';
 import { assertTransition, recordTransition } from '../domain/shared/transition.js';
-import { materializeNextOrderItem, requeueDueRunnerJobsInTransaction } from '../domain/runner/service.js';
+import { containRunnerQueueMismatch, materializeNextOrderItem, requeueDueRunnerJobsInTransaction } from '../domain/runner/service.js';
 import { RUNNER_JOB_TRANSITIONS } from '../domain/runner/states.js';
 import { ORDER_ITEM_TRANSITIONS } from '../domain/orders/states.js';
 import { TOPUP_TRANSITIONS } from '../domain/payments/states.js';
@@ -14,7 +14,7 @@ import { releaseReservation } from '../domain/wallet/service.js';
 import { evaluateExpiryAdmission } from '../domain/catalog/expiry.js';
 import { resolvePrice } from '../domain/pricing/resolver.js';
 import { pauseQuestForRetest } from '../domain/catalog/service.js';
-import { advanceMonitorTestBatch, hasCurrentTestPass } from '../domain/catalog/test-gate.js';
+import { advanceMonitorTestBatch, hasCurrentTestPass, reconcilePassedMonitorTestBatches } from '../domain/catalog/test-gate.js';
 import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { openReview } from '../domain/reviews/service.js';
 import { acquireLease, releaseLease, renewLease } from '../db/leases.js';
@@ -65,11 +65,7 @@ async function recoverExpiredLeases(database, context) {
     `)).rows;
   for (const job of leased) {
     if (job.item_state !== 'LEASED') {
-      await database.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-        VALUES(gen_random_uuid(),'RUNNER_STATE_MISMATCH',$1,'OPEN','CRITICAL',$2,$3)
-        ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-          evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-      [job.id, { jobState: job.state, itemState: job.item_state }, context.traceId]);
+      await containRunnerQueueMismatch(database, job, context, 'EXPIRED_LEASE_STATE_MISMATCH');
       continue;
     }
     await transitionRunnerPair(database, job, { id: job.order_item_id, state: job.item_state,
@@ -107,11 +103,7 @@ async function recoverCrashedRunnerJobs(database, context) {
     const review = job.uncertain || job.state === 'SETTLING';
     const next = review ? 'MANUAL_REVIEW' : 'WAITING_RETRY';
     if (job.item_state !== job.state) {
-      await database.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-        VALUES(gen_random_uuid(),'RUNNER_STATE_MISMATCH',$1,'OPEN','CRITICAL',$2,$3)
-        ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-          evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-      [job.id, { jobState: job.state, itemState: job.item_state }, context.traceId]);
+      await containRunnerQueueMismatch(database, job, context, 'CRASH_RECOVERY_STATE_MISMATCH');
       continue;
     }
     await transitionRunnerPair(database, job, {
@@ -236,6 +228,7 @@ async function runTransactionalMaintenance(pool, context) {
     await recoverCrashedRunnerJobs(database, context);
     await requeueDueRunnerJobsInTransaction(database, context, { includeExpired: true });
     await recoverCrashedQuestTests(database, context);
+    await reconcilePassedMonitorTestBatches(database, context);
     await recoverCrashedPayments(database, context);
     await maintainMonitorsAndBlocks(database, context);
     await queueMaintenanceNotifications(database, context);
@@ -269,7 +262,8 @@ async function releaseExpiredOrderItems(pool, context) {
 }
 
 export async function reconcileSellableQuests(pool, context, runnerConcurrency) {
-  const sellable = (await pool.query("SELECT * FROM quests WHERE sale_state IN ('OPEN','PAUSED','CLOSED') LIMIT 100")).rows;
+  const sellable = (await pool.query(`SELECT * FROM quests WHERE sale_state IN ('OPEN','PAUSED','CLOSED')
+    ORDER BY updated_at,quest_id LIMIT 100`)).rows;
   for (const quest of sellable) {
     const admission = await withTransaction({ pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
       (database) => evaluateExpiryAdmission(database, { quest, runnerConcurrency }));

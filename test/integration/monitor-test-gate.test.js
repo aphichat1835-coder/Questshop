@@ -5,7 +5,7 @@ import { createTestPool } from '../fixtures/postgres.js';
 import { withTransaction } from '../../src/db/transaction.js';
 import { createContext } from '../../src/shared/correlation.js';
 import { ingestDiscovery } from '../../src/domain/catalog/service.js';
-import { advanceMonitorTestBatch, markMonitorTestBatchPassed } from '../../src/domain/catalog/test-gate.js';
+import { advanceMonitorTestBatch, markMonitorTestBatchPassed, reconcilePassedMonitorTestBatches } from '../../src/domain/catalog/test-gate.js';
 import { forcePublishFailedMonitorTest } from '../../src/domain/admin/operations-service.js';
 import { openReview, resolveSubjectReview } from '../../src/domain/reviews/service.js';
 
@@ -107,4 +107,26 @@ test('Admin retry resolves a Quest Manual Review by seeding a fresh test batch',
   assert.equal((await pool.query(`SELECT count(*)::integer AS count FROM state_transitions
     WHERE aggregate_type='QUEST_TEST_BATCH' AND aggregate_id=$1 AND to_state='RUNNING'`,
   [result.applied.batchId])).rows[0].count, 1);
+});
+
+test('maintenance derives a passed monitor batch after a crash between test-run and batch transitions', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const traceId = uuidv7(); const monitor = uuidv7(); const batch = uuidv7(); const run = uuidv7();
+  const context = createContext({ traceId, actorType: 'SYSTEM', actorId: 'recovery', guildId: 'guild',
+    idempotencyKey: 'reconcile-passed-batch' });
+  await pool.query(`INSERT INTO monitor_accounts(id,account_id,capabilities,state) VALUES($1,$2,ARRAY['TEST'],'ACTIVE')`,
+    [monitor, `recovery-monitor-${monitor.slice(0, 6)}`]);
+  const questId = `recovery-${run.slice(0, 8)}`;
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,name,task_type,task_target,url,expires_at,
+    executor_id,engine_version,executor_version,contract_version)
+    VALUES($1,'SUPPORTED',$1,'WATCH_VIDEO',60,$2,clock_timestamp()+interval '1 day','video','1','1','1')`,
+  [questId, `https://discord.com/quests/${questId}`]);
+  await pool.query(`INSERT INTO quest_test_batches(id,quest_id,state,monitor_order,trace_id,requested_by)
+    VALUES($1,$2,'RUNNING',ARRAY[$3]::uuid[],$4,'SYSTEM')`, [batch, questId, monitor, traceId]);
+  await pool.query(`INSERT INTO quest_test_runs(id,quest_id,batch_id,target_monitor_id,monitor_id,state,
+    engine_version,executor_version,contract_version,attempt_in_monitor,trace_id,completed_at)
+    VALUES($1,$2,$3,$4,$4,'TEST_PASSED','1','1','1',1,$5,clock_timestamp())`,
+  [run, questId, batch, monitor, traceId]);
+  await withTransaction({ pool, isolation: 'SERIALIZABLE' }, (client) => reconcilePassedMonitorTestBatches(client, context));
+  assert.equal((await pool.query('SELECT state FROM quest_test_batches WHERE id=$1', [batch])).rows[0].state, 'PASSED');
 });

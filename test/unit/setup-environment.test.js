@@ -10,6 +10,7 @@ import {
   upsertEnvironmentText,
   writeEnvironmentFile,
 } from '../../src/config/setup-environment.js';
+import { decodeSecretBundle } from '../../src/config/load-local-environment.js';
 
 const certificate = '-----BEGIN CERTIFICATE-----\nTEST-CA\n-----END CERTIFICATE-----\n';
 const external = Object.freeze({
@@ -20,6 +21,7 @@ const external = Object.freeze({
   OWNER_ID: '123456789012345680',
   DATABASE_POOL_URL: 'postgresql://runtime:password@host/db?sslmode=verify-full',
   DATABASE_DIRECT_URL: 'postgresql://migrator:password@host/db?sslmode=verify-full',
+  GIT_SHA: 'a'.repeat(40),
   DATABASE_SSL_CA_INPUT: certificate,
 });
 
@@ -117,4 +119,12 @@ test('environment text upsert preserves unrelated comments and settings', () => 
   });
   assert.match(result, /^# keep\nPORT=4000/m);
   assert.match(result, /BACKUP_ENABLED=false/);
+});
+
+test('stateless secret bundle is decoded without accepting malformed data', () => {
+  const bundle = Buffer.from(JSON.stringify({ STATUS_TOKEN: 'x'.repeat(32), PORT: '3000' })).toString('base64url');
+  assert.deepEqual(decodeSecretBundle(bundle), { STATUS_TOKEN: 'x'.repeat(32), PORT: '3000' });
+  assert.throws(() => decodeSecretBundle('not-base64-json'));
+  const invalid = Buffer.from(JSON.stringify({ 'not valid': 'x' })).toString('base64url');
+  assert.throws(() => decodeSecretBundle(invalid));
 });

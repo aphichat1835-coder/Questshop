@@ -9,6 +9,13 @@
   },
   "scripts": {
     "setup": "node scripts/setup.js",
+    "setup:init": "node scripts/setup.js",
+    "setup:verify": "node scripts/setup-verify.js",
+    "setup:preflight": "node scripts/setup-preflight.js",
+    "setup:export-secret-bundle": "node scripts/export-secret-bundle.js",
+    "keys:adopt": "node scripts/adopt-keyring-sentinels.js",
+    "db:verify-roles": "node scripts/verify-postgres-roles.js",
+    "deploy": "npm run setup:verify && npm run migrate && npm run register",
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "register": "node scripts/register-commands.js",

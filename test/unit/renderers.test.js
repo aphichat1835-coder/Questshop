@@ -22,7 +22,7 @@ test('quest-new projection does not expose internal sale state', async () => {
     orbs: 10, price_cents: 500, name: 'New Quest', detected_at: new Date(), updated_at: new Date(),
     expires_at: new Date(), url: 'https://discord.com/quests/q', sale_state: 'OPEN' }] }) };
   const body = await renderProjection(pool, { projection_type: 'QUEST_NEW', aggregate_id: 'q' });
-  assert.doesNotMatch(body.embeds[0].data.description, /OPEN|WATCH\\_VIDEO|สถานะการรับงาน/);
+  assert.doesNotMatch(body.embeds[0].data.description, /OPEN|WATCH(?:_\\)?VIDEO|สถานะการรับงาน/);
   assert.doesNotMatch(body.embeds[0].data.description, /สถานะ:/);
   assert.equal(body.embeds[0].data.footer, undefined);
   assert.match(body.embeds[0].data.description, /ดูวิดีโอ/);

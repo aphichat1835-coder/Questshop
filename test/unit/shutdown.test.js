@@ -33,3 +33,23 @@ test('runtime lease loss disables ingress and destroys Discord without releasing
   assert.equal(stopped, 1);
   assert.equal(released, 0);
 });
+
+test('Discord cleanup failure does not skip worker, database, or health cleanup', async () => {
+  let stopped = 0;
+  const runtime = {
+    acceptingInteractions: true,
+    health: { ready: true, status: 'HEALTHY', live: true },
+    abortController: new AbortController(),
+    client: { destroy: () => { throw new Error('discord destroy failed'); } },
+    workers: { stop: async () => { stopped += 1; } },
+    heartbeat: null,
+    pool: { query: async () => ({ rows: [{ count: 0 }] }) },
+    env: { DISCORD_GUILD_ID: 'guild' },
+    runtimeHolder: 'holder',
+    runtimeLease: { fencing_token: 4 },
+    server: null,
+  };
+  await assert.rejects(() => shutdown(runtime, 'SIGTERM'), /discord destroy failed/);
+  assert.equal(stopped, 1);
+  assert.equal(runtime.health.live, false);
+});

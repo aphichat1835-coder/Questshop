@@ -21,7 +21,8 @@ function orderItemLine(item) {
 function safeHttpsUrl(value) {
   try {
     const url = new URL(String(value));
-    return url.protocol === 'https:' ? url.toString().slice(0, 2000) : null;
+    const normalized = url.protocol === 'https:' ? url.toString() : null;
+    return normalized && normalized.length <= 512 ? normalized : null;
   } catch { return null; }
 }
 
@@ -58,6 +59,7 @@ async function renderTopupReceipt(pool, projection) {
       FROM wallet_transactions x WHERE x.reference_type='TOPUP' AND x.reference_id=t.id::text
         AND x.transaction_type='TOPUP_CREDIT' ORDER BY x.created_at DESC LIMIT 1) ledger ON true
     WHERE t.id=$1`, [projection.aggregate_id])).rows[0];
+  if (!topup) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบใบเสร็จเติมเงิน')], allowedMentions: noMentions };
   const total = BigInt(topup.amount_cents ?? 0) + BigInt(topup.bonus_cents ?? 0);
   const description = [
     `**Top-up ID:** \`${topup.id}\``, `**Provider transaction:** \`${escape(topup.provider_transaction_id)}\``,
@@ -127,6 +129,7 @@ async function renderPaymentLog(pool, projection, { env, client }) {
     JOIN receiver_versions r ON r.id=t.receiver_version_id
     LEFT JOIN LATERAL (SELECT w.* FROM wallet_transactions w WHERE w.reference_type='TOPUP'
       AND w.reference_id=t.id::text ORDER BY w.created_at DESC LIMIT 1) l ON true WHERE t.id=$1`, [projection.aggregate_id])).rows[0];
+  if (!topup) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบ Payment Log')], allowedMentions: noMentions };
   const sensitive = topup.key_version == null ? null : JSON.parse(decryptSecret({
     keyVersion: topup.key_version, nonce: topup.nonce, ciphertext: topup.ciphertext, authTag: topup.auth_tag,
   }, env.DATA_ENCRYPTION_KEYS_JSON, `topup:${topup.id}:${env.DISCORD_GUILD_ID}`));
