@@ -31,6 +31,7 @@ async function renderRefund(pool, projection, { client }) {
     w.available_before_cents,w.available_after_cents,w.id AS transaction_id
     FROM refunds f JOIN order_items i ON i.id=f.order_item_id
     JOIN wallet_transactions w ON w.id=f.wallet_transaction_id WHERE f.id=$1`, [projection.aggregate_id])).rows[0];
+  if (!refund) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบ Refund Log')], allowedMentions: noMentions };
   const user = await client.users.fetch(refund.discord_user_id).catch(() => null);
   const lines = [
     `**ผู้ได้รับเงินคืน:** <@${refund.discord_user_id}> (\`${refund.discord_user_id}\`)`,
@@ -162,6 +163,7 @@ async function renderQuestNew(pool, projection) {
         OR (p.rule_type='QUEST' AND p.quest_id=q.quest_id) OR (p.rule_type='TYPE' AND p.task_type=q.task_type) OR p.rule_type='DEFAULT')
       ORDER BY CASE p.rule_type WHEN 'TEMPORARY' THEN 1 WHEN 'QUEST' THEN 2 WHEN 'TYPE' THEN 3 ELSE 4 END,
         p.priority DESC,p.created_at DESC LIMIT 1) resolved ON true WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
+  if (!quest) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบข้อมูล Quest ใหม่')], allowedMentions: noMentions };
   const price = quest.price_cents == null ? 'ยังไม่กำหนด' : baht(quest.price_cents);
   const questUrl = safeHttpsUrl(quest.url);
   const description = [

@@ -25,7 +25,8 @@ test('monitor credential rotation validates the same account and never exposes p
   const monitor = await addMonitor({ token: 'initial-token', env }, context, { pool, questApiFactory: factory });
   assert.equal(monitor.account_id, 'account-1');
   assert.deepEqual(monitor.capabilities, ['SCAN', 'TEST']);
-  await setMonitorState({ monitorId: monitor.id, state: 'QUARANTINED' },
+  await setMonitorState({ monitorId: monitor.id, state: 'QUARANTINED',
+    expectedState: monitor.state, expectedVersion: monitor.state_version },
     context, { pool });
   await assert.rejects(() => rotateMonitorCredential({ monitorId: monitor.id, token: 'other-token', env },
     context, { pool, questApiFactory: factory }), /does not match/);
@@ -83,11 +84,20 @@ test('monitor health check is read-only, records readiness, and quarantines an i
     last_health_error_code: 'TOKEN_REJECTED',
   });
 
-  await setMonitorState({ monitorId: healthy.id, state: 'DISABLED' }, context, { pool });
+  const disabled = await setMonitorState({ monitorId: healthy.id, state: 'DISABLED',
+    expectedState: ready.monitor.state, expectedVersion: ready.monitor.state_version }, context, { pool });
+  invalidMonitorTokens.add('healthy-token');
+  const disabledInvalid = await checkMonitorHealth({ monitorId: healthy.id, env }, context,
+    { pool, questApiFactory: factory });
+  assert.equal(disabledInvalid.healthState, 'INVALID');
+  assert.equal(disabledInvalid.monitor.state, 'DISABLED');
+  await assert.rejects(() => setMonitorState({ monitorId: healthy.id, state: 'ACTIVE',
+    expectedState: 'DISABLED', expectedVersion: Number(disabled.state_version) - 1 }, context, { pool }),
+  (error) => error.code === 'STALE_STATE');
   const all = await checkAllMonitorHealth({ env }, context, { pool, questApiFactory: factory });
-  const disabled = all.find((result) => result.monitor.id === healthy.id);
-  assert.equal(disabled?.healthState, 'READY');
-  assert.equal(disabled?.monitor.state, 'DISABLED');
+  const disabledResult = all.find((result) => result.monitor.id === healthy.id);
+  assert.equal(disabledResult?.healthState, 'INVALID');
+  assert.equal(disabledResult?.monitor.state, 'DISABLED');
   assert.ok(all.some((result) => result.monitor.id === invalid.id));
   const plaintext = JSON.stringify((await pool.query(`SELECT before_state,after_state FROM admin_audit_logs
     WHERE action='MONITOR_HEALTH_CHECK'`)).rows);

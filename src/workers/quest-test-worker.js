@@ -72,20 +72,6 @@ export async function renewQuestTestLease(run, options = {}) {
   });
 }
 
-async function updateOwned(pool, run, sql, params, nextState, reasonCode, context) {
-  return withTransaction({ pool, isolation: 'READ COMMITTED' }, async (client) => {
-    assertTransition(TEST_TRANSITIONS, 'TESTING', nextState);
-    const row = (await client.query(`${sql} AND id=$1 AND state='TESTING' AND lease_owner=$2
-      AND fencing_token=$3 AND lease_expires_at>clock_timestamp() RETURNING *`,
-    [run.id, run.lease_owner, run.fencing_token, ...params])).rows[0];
-    if (!row) throw new FencingLostError(`quest-test:${run.id}`);
-    await recordTransition(client, { aggregateType: 'QUEST_TEST', aggregateId: run.id,
-      fromState: 'TESTING', toState: nextState, stateVersion: row.state_version,
-      reasonCode, context });
-    return row;
-  });
-}
-
 async function createTestMutation(pool, run, context, { kind, payload, baseline }) {
   return withTransaction({ pool, isolation: 'READ COMMITTED' }, async (client) => {
     const owned = (await client.query(`SELECT 1 FROM quest_test_runs WHERE id=$1 AND state='TESTING'
@@ -238,24 +224,33 @@ function monitorFailureState(error, failures) {
   return 'ACTIVE';
 }
 
-async function finishFailedTestRun(pool, run, error, context) {
+async function finishFailedTestRun(client, run, error, context) {
   const nextTestState = error.fatalAuth ? 'MANUAL_REVIEW' : 'TEST_FAILED';
-  return updateOwned(pool, run, `UPDATE quest_test_runs SET state=$4,state_version=state_version+1,
+  assertTransition(TEST_TRANSITIONS, 'TESTING', nextTestState);
+  const failed = (await client.query(`UPDATE quest_test_runs SET state=$4,state_version=state_version+1,
     error_class=$5,evidence=$6,completed_at=clock_timestamp(),lease_owner=NULL,
-    lease_expires_at=NULL,updated_at=clock_timestamp() WHERE true`, [
+    lease_expires_at=NULL,updated_at=clock_timestamp()
+    WHERE id=$1 AND state='TESTING' AND lease_owner=$2 AND fencing_token=$3
+      AND lease_expires_at>clock_timestamp() RETURNING *`, [run.id, run.lease_owner, run.fencing_token,
     nextTestState, error.code ?? error.name,
-    { accountSpecific: Boolean(error.fatalAuth || error.accountSpecific), traceId: context.traceId },
-  ], nextTestState, error.code ?? error.name, context);
+    { accountSpecific: Boolean(error.fatalAuth || error.accountSpecific), traceId: context.traceId }])).rows[0];
+  if (!failed) throw new FencingLostError(`quest-test:${run.id}`);
+  await recordTransition(client, { aggregateType: 'QUEST_TEST', aggregateId: run.id,
+    fromState: 'TESTING', toState: nextTestState, stateVersion: failed.state_version,
+    reasonCode: error.code ?? error.name, context });
+  return failed;
 }
 
 async function updateMonitorForFailure(pool, monitor, error, context) {
   if (!(error.fatalAuth || error.retryable || error.category === 'NETWORK')) return;
   const failures = Number(monitor.consecutive_failures) + 1;
   const state = monitorFailureState(error, failures);
-  await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
+  const updated = (await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
+    state_version=state_version+CASE WHEN state<>$2 THEN 1 ELSE 0 END,
     cooldown_until=CASE WHEN $2='COOLDOWN' THEN clock_timestamp()+interval '15 minutes'
-      ELSE cooldown_until END,updated_at=clock_timestamp() WHERE id=$1`, [monitor.id, state, failures]);
-  if (state !== 'QUARANTINED') return;
+      ELSE cooldown_until END,updated_at=clock_timestamp()
+    WHERE id=$1 AND state<>'DISABLED' RETURNING state`, [monitor.id, state, failures])).rows[0];
+  if (updated?.state !== 'QUARANTINED') return;
   await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
     VALUES(gen_random_uuid(),'MONITOR_QUARANTINED',$1,'OPEN','ERROR',$2,$3)
     ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
@@ -290,15 +285,20 @@ async function pauseQuestForTestFailure(pool, run, error, context) {
 }
 
 async function handleTestFailure(pool, run, monitor, error, context) {
-  const failedRun = await finishFailedTestRun(pool, run, error, context);
-  await updateMonitorForFailure(pool, monitor, error, context);
-  if (failedRun.batch_id) {
-    await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
-      const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [failedRun.quest_id])).rows[0];
-      if (quest) await advanceMonitorTestBatch(client, { run: failedRun, quest, error, context });
+  let failedRun;
+  if (run.batch_id) {
+    failedRun = await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
+      const failed = await finishFailedTestRun(client, run, error, context);
+      const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [failed.quest_id])).rows[0];
+      if (quest) await advanceMonitorTestBatch(client, { run: failed, quest, error, context });
+      return failed;
     });
-    return;
+  } else {
+    failedRun = await withTransaction({ pool, isolation: 'READ COMMITTED' },
+      (client) => finishFailedTestRun(client, run, error, context));
   }
+  await updateMonitorForFailure(pool, monitor, error, context);
+  if (failedRun.batch_id) return;
   await queueAlternativeMonitorTest(pool, run, monitor, error);
   await pauseQuestForTestFailure(pool, run, error, context);
 }

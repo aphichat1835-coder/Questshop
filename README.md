@@ -136,15 +136,16 @@ Encryption/HMAC keyrings ให้โดยอัตโนมัติ ไฟล
 ### เตรียมฐานข้อมูลและคำสั่ง Discord
 
 ```bash
-npm run migrate
+npm run deploy
 npm run db:verify-roles
 npm run setup:preflight
-npm run register
 npm start
 ```
 
-Runtime จะตรวจ migration checksum และรัน Forward migration ที่ขาดตอน Startup เช่นกัน หาก Production
-มี schema เดิมและมี migration ใหม่ ระบบต้องสร้าง Pre-migration backup สำเร็จก่อน จึงจะ migration ต่อ
+`npm run deploy` เป็นเจ้าของ Migration และ Command registration เพียงทางเดียว หาก Production มี schema เดิม
+และมี Migration ใหม่ ขั้นตอนนี้ต้องสร้างและตรวจ Pre-migration backup สำเร็จก่อนจึงจะเขียน Schema ต่อ
+ส่วน `npm start` ใช้เฉพาะ Runtime pooled credential, ตรวจเพียง schema compatibility แบบ read-only และจะปฏิเสธ
+การเริ่มระบบหากยังไม่ได้รัน Deployment step
 
 Development mode:
 
@@ -156,7 +157,7 @@ npm run dev
 
 ### ค่าที่เจ้าของร้านต้องกรอก
 
-มีเพียง 7 ค่าใน [.env.example](.env.example):
+มี 6 ค่าบังคับใน [.env.example](.env.example):
 
 | ตัวแปร | หน้าที่ |
 |---|---|
@@ -166,7 +167,9 @@ npm run dev
 | `OWNER_ID` | Discord User ID ของเจ้าของร้าน |
 | `DATABASE_POOL_URL` | PostgreSQL pooled URL ของ Runtime role |
 | `DATABASE_DIRECT_URL` | PostgreSQL direct URL ของ Migration role |
-| `DATABASE_SSL_CA_INPUT` | พาธไฟล์ CA PEM หรือ Base64 จากผู้ให้บริการฐานข้อมูล |
+
+`DATABASE_SSL_CA_INPUT` เป็นค่าทางเลือก: ใส่พาธไฟล์ CA PEM หรือ Base64 เฉพาะเมื่อ certificate ของผู้ให้บริการ
+ไม่ได้ chain ไปยัง trusted root ของ Node โดยตรง
 
 รัน `npm run setup` แล้วระบบจะสร้างหรือกำหนดค่าต่อไปนี้เอง:
 
@@ -199,15 +202,22 @@ Setup ปิด Backup ไว้ก่อนเพื่อให้เปิด
 สำหรับ Docker ให้ Mount `.env` เป็น Secret file หรือย้ายค่าข้างในเข้า Secret manager ของ Platform;
 ไฟล์นี้ไม่ถูก Copy เข้า Image โดยตั้งใจ
 
-สำหรับ Host แบบ stateless สามารถสร้าง bundle แบบไม่แสดง Secret บนหน้าจอ แล้วนำเนื้อหาไฟล์ไปเก็บใน Secret
-manager เป็น `QUESTSHOP_SECRET_BUNDLE` ได้:
+สำหรับ Host แบบ stateless ให้สร้าง Runtime bundle ที่ตัด `DATABASE_DIRECT_URL` ออก แล้วนำเนื้อหาไฟล์ไปเก็บใน
+Secret manager เป็น `QUESTSHOP_SECRET_BUNDLE`:
 
 ```bash
 QUESTSHOP_SECRET_BUNDLE_FILE=/secure/questshop.bundle npm run setup:export-secret-bundle
 ```
 
-Runtime จะอ่าน bundle เฉพาะเมื่อไม่มี `.env`; environment variable ที่กำหนดโดย Platform มีสิทธิ์เหนือกว่า
-bundle เสมอ และ bundle ไม่ใช่ช่องทาง Rotate key อัตโนมัติ
+Deployment job ที่จบกระบวนการหลัง Migrate/Register ใช้ bundle แยกต่างหาก:
+
+```bash
+QUESTSHOP_SECRET_BUNDLE_SCOPE=deployment \
+QUESTSHOP_SECRET_BUNDLE_FILE=/secure/questshop-deployment.bundle npm run setup:export-secret-bundle
+```
+
+Runtime รับเฉพาะค่า allowlist และลบ shared bundle/`DATABASE_DIRECT_URL` ออกจาก process environment หลังโหลด;
+environment variable ที่ Platform กำหนดมีสิทธิ์เหนือกว่า bundle และ bundle ไม่ใช่ช่องทาง Rotate key อัตโนมัติ
 
 > [!IMPORTANT]
 > ระบบใหม่ที่ยังไม่มีข้อมูล Durable จะสร้าง Sentinel แบบอัตโนมัติครั้งแรก สำหรับฐานข้อมูลเก่าที่มีข้อมูลแล้ว

@@ -17,7 +17,7 @@ export async function runtimeEstimateMs(client, quest) {
   return remainingSeconds * 1000 + STATIC_OVERHEAD_MS;
 }
 
-export async function estimatedQueueWaitMs(client, runnerConcurrency = 3) {
+export async function estimatedQueueWaitMs(client, runnerConcurrency = 2) {
   const result = await client.query(`
     SELECT COALESCE(sum(
       GREATEST(0, COALESCE(q.task_target, 0) * (1 - i.progress_actual / 100)) * 1000
@@ -33,7 +33,7 @@ export async function estimatedQueueWaitMs(client, runnerConcurrency = 3) {
 
 export async function evaluateExpiryAdmission(client, {
   quest,
-  runnerConcurrency = 3,
+  runnerConcurrency = 2,
   now = null,
 }) {
   const expiresAt = Date.parse(quest.expires_at ?? quest.expiresAt);

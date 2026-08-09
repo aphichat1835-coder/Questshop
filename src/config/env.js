@@ -31,7 +31,7 @@ function jsonKeyring(value, ctx) {
   }
 }
 
-const schema = z.object({
+const environmentFields = {
   NODE_ENV: z.enum(['development', 'test', 'production']).default('production'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   TIMEZONE: z.literal('Asia/Bangkok').default('Asia/Bangkok'),
@@ -58,7 +58,7 @@ const schema = z.object({
   S3_ACCESS_KEY_ID: z.string().min(1).optional(),
   S3_SECRET_ACCESS_KEY: z.string().min(1).optional(),
   S3_FORCE_PATH_STYLE: booleanText.default('true'),
-  RUNNER_CONCURRENCY: z.coerce.number().int().min(1).max(5).default(3),
+  RUNNER_CONCURRENCY: z.coerce.number().int().min(1).max(5).default(2),
   RUNNER_CONCURRENCY_HARD_MAX: z.coerce.number().int().min(1).max(5).default(5),
   GIT_SHA: z.string().min(1).default('unknown'),
   DISCORD_CLIENT_VERSION: z.string().regex(/^\d+(?:\.\d+)+$/).default('1.0.9267'),
@@ -67,7 +67,12 @@ const schema = z.object({
   DISCORD_BUILD_NUMBER: z.coerce.number().int().nonnegative().default(572700),
   DISCORD_NATIVE_BUILD_NUMBER: z.coerce.number().int().nonnegative().default(47491),
   DISCORD_LOCALE: z.string().min(2).max(20).default('en-US'),
-}).superRefine((value, ctx) => {
+};
+
+function refineEnvironment(value, ctx, { requireDirect }) {
+  if (requireDirect && !value.DATABASE_DIRECT_URL) {
+    ctx.addIssue({ code: 'custom', path: ['DATABASE_DIRECT_URL'], message: 'DATABASE_DIRECT_URL is required' });
+  }
   if (value.RUNNER_CONCURRENCY > value.RUNNER_CONCURRENCY_HARD_MAX) {
     ctx.addIssue({ code: 'custom', message: 'RUNNER_CONCURRENCY exceeds hard max' });
   }
@@ -80,7 +85,7 @@ const schema = z.object({
   if (backupEnabled && backupKeys.some((key) => value[key] == null || value[key] === '')) {
     ctx.addIssue({ code: 'custom', message: 'BACKUP_ENABLED=true requires backup database, S3 and encryption settings' });
   }
-  for (const key of ['DATABASE_POOL_URL', 'DATABASE_DIRECT_URL', ...(backupEnabled
+  for (const key of ['DATABASE_POOL_URL', ...(requireDirect ? ['DATABASE_DIRECT_URL'] : []), ...(backupEnabled
     ? ['DATABASE_BACKUP_URL', 'DATABASE_RESTORE_URL'] : [])]) {
     if (!value[key]) continue;
     const url = new URL(value[key]);
@@ -88,9 +93,15 @@ const schema = z.object({
       ctx.addIssue({ code: 'custom', message: `${key} must use sslmode=verify-full` });
     }
   }
-});
+}
+
+const schema = z.object(environmentFields).superRefine((value, ctx) => refineEnvironment(value, ctx, { requireDirect: true }));
+const { DATABASE_DIRECT_URL: _deploymentOnlyDatabaseUrl, ...runtimeEnvironmentFields } = environmentFields;
+const runtimeSchema = z.object(runtimeEnvironmentFields)
+  .superRefine((value, ctx) => refineEnvironment(value, ctx, { requireDirect: false }));
 
 let cached;
+let runtimeCached;
 
 export function loadEnvironment(source = process.env) {
   if (source === process.env && cached) return cached;
@@ -99,6 +110,14 @@ export function loadEnvironment(source = process.env) {
   return parsed;
 }
 
+export function loadRuntimeEnvironment(source = process.env) {
+  if (source === process.env && runtimeCached) return runtimeCached;
+  const parsed = runtimeSchema.parse(source);
+  if (source === process.env) runtimeCached = Object.freeze(parsed);
+  return parsed;
+}
+
 export function clearEnvironmentCacheForTests() {
   cached = undefined;
+  runtimeCached = undefined;
 }

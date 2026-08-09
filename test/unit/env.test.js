@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { loadEnvironment } from '../../src/config/env.js';
+import { loadEnvironment, loadRuntimeEnvironment } from '../../src/config/env.js';
 import { parsePromotionBasisPoints } from '../../src/discord/interactions/router.js';
 
 const key = Buffer.alloc(32, 7).toString('base64');
@@ -18,6 +18,14 @@ test('backup settings can be explicitly disabled without requiring S3 and backup
   const env = loadEnvironment({ ...base, BACKUP_ENABLED: 'false' });
   assert.equal(env.BACKUP_ENABLED, false);
   assert.equal(env.DATABASE_BACKUP_URL, undefined);
+});
+
+test('runtime configuration neither requires nor retains the migration URL and defaults concurrency to two', () => {
+  const { DATABASE_DIRECT_URL: _migrationUrl, ...runtimeBase } = base;
+  const env = loadRuntimeEnvironment({ ...runtimeBase, BACKUP_ENABLED: 'false' });
+  assert.equal(env.DATABASE_DIRECT_URL, undefined);
+  assert.equal(env.RUNNER_CONCURRENCY, 2);
+  assert.equal(loadRuntimeEnvironment({ ...base, BACKUP_ENABLED: 'false' }).DATABASE_DIRECT_URL, undefined);
 });
 
 test('non-production defaults backups off when no backup settings are supplied', () => {

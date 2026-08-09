@@ -1,5 +1,5 @@
 import pg from 'pg';
-import { loadEnvironment } from '../config/env.js';
+import { loadEnvironment, loadRuntimeEnvironment } from '../config/env.js';
 
 const { Pool } = pg;
 let runtimePool;
@@ -23,7 +23,7 @@ function commonOptions(env, connectionString) {
   };
 }
 
-export function getRuntimePool(env = loadEnvironment()) {
+export function getRuntimePool(env = loadRuntimeEnvironment()) {
   runtimePool ??= new Pool({
     ...commonOptions(env, env.DATABASE_POOL_URL),
     connectionString: env.DATABASE_POOL_URL,

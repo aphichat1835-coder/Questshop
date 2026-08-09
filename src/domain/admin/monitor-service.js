@@ -3,6 +3,7 @@ import { decryptSecret, encryptSecret } from '../../adapters/crypto/keyring.js';
 import { createQuestApiClient, profileFromEnv } from '../../quest-engine/api/client.js';
 import { withTransaction } from '../../db/transaction.js';
 import { appendAdminAudit } from './audit.js';
+import { StaleStateError } from '../../shared/errors.js';
 
 const MONITOR_CAPABILITIES = Object.freeze(['SCAN', 'TEST']);
 
@@ -53,6 +54,7 @@ export async function rotateMonitorCredential({ monitorId, token, env }, context
       updated_at=transaction_timestamp() WHERE monitor_id=$1`, [monitorId, encrypted.keyVersion,
       encrypted.nonce, encrypted.ciphertext, encrypted.authTag]);
     const updated = (await client.query(`UPDATE monitor_accounts SET state='ACTIVE',consecutive_failures=0,
+      state_version=state_version+CASE WHEN state<>'ACTIVE' THEN 1 ELSE 0 END,
       cooldown_until=NULL,updated_at=transaction_timestamp() WHERE id=$1 RETURNING *`, [monitorId])).rows[0];
     await appendAdminAudit(client, { action: 'ROTATE_MONITOR_CREDENTIAL', targetType: 'MONITOR',
       targetId: monitorId, actorId: context.actorId,
@@ -63,16 +65,22 @@ export async function rotateMonitorCredential({ monitorId, token, env }, context
   });
 }
 
-export async function setMonitorState({ monitorId, state }, context, options = {}) {
+export async function setMonitorState({ monitorId, state, expectedState, expectedVersion }, context, options = {}) {
   if (!['ACTIVE', 'QUARANTINED', 'DISABLED'].includes(state)) {
     throw new TypeError('invalid monitor state change');
   }
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const before = (await client.query('SELECT * FROM monitor_accounts WHERE id=$1 FOR UPDATE', [monitorId])).rows[0];
     if (!before) throw new TypeError('monitor not found');
-    const updated = (await client.query(`UPDATE monitor_accounts SET state=$2,
+    if (before.state !== expectedState || Number(before.state_version) !== Number(expectedVersion)) {
+      throw new StaleStateError('Monitor', monitorId);
+    }
+    const updated = (await client.query(`UPDATE monitor_accounts SET state=$2,state_version=state_version+1,
       cooldown_until=CASE WHEN $2='ACTIVE' THEN NULL ELSE cooldown_until END,
-      updated_at=transaction_timestamp() WHERE id=$1 RETURNING *`, [monitorId, state])).rows[0];
+      updated_at=transaction_timestamp()
+      WHERE id=$1 AND state=$3 AND state_version=$4 RETURNING *`,
+    [monitorId, state, expectedState, expectedVersion])).rows[0];
+    if (!updated) throw new StaleStateError('Monitor', monitorId);
     await appendAdminAudit(client, { action: 'MONITOR_STATE_CHANGE', targetType: 'MONITOR',
       targetId: monitorId, actorId: context.actorId, before: { state: before.state },
       after: { state: updated.state }, reason: `Owner set Monitor ${state}`, context });
@@ -93,7 +101,9 @@ async function persistHealth({ monitor, outcome, context }, options) {
     const row = (await client.query(`UPDATE monitor_accounts m SET
       health_state=$2,last_health_checked_at=clock_timestamp(),last_health_error_code=$3,
       last_health_quest_count=$4,last_health_account_id=$5,
-      state=CASE WHEN $2='INVALID' THEN 'QUARANTINED' ELSE m.state END,
+      state=CASE WHEN $2='INVALID' AND m.state<>'DISABLED' THEN 'QUARANTINED' ELSE m.state END,
+      state_version=state_version+CASE
+        WHEN $2='INVALID' AND m.state NOT IN ('DISABLED','QUARANTINED') THEN 1 ELSE 0 END,
       consecutive_failures=CASE WHEN $2='INVALID' THEN m.consecutive_failures+1
         WHEN $2='READY' THEN 0 ELSE m.consecutive_failures END,
       updated_at=clock_timestamp()

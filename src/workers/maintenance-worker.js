@@ -14,7 +14,12 @@ import { releaseReservation } from '../domain/wallet/service.js';
 import { evaluateExpiryAdmission } from '../domain/catalog/expiry.js';
 import { resolvePrice } from '../domain/pricing/resolver.js';
 import { pauseQuestForRetest } from '../domain/catalog/service.js';
-import { advanceMonitorTestBatch, hasCurrentTestPass, reconcilePassedMonitorTestBatches } from '../domain/catalog/test-gate.js';
+import {
+  advanceMonitorTestBatch,
+  hasCurrentTestPass,
+  reconcileFailedMonitorTestBatches,
+  reconcilePassedMonitorTestBatches,
+} from '../domain/catalog/test-gate.js';
 import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
 import { openReview } from '../domain/reviews/service.js';
 import { acquireLease, releaseLease, renewLease } from '../db/leases.js';
@@ -197,7 +202,7 @@ async function recoverCrashedPayments(database, context) {
 }
 
 async function maintainMonitorsAndBlocks(database, context) {
-  await database.query(`UPDATE monitor_accounts SET state='ACTIVE',cooldown_until=NULL,
+  await database.query(`UPDATE monitor_accounts SET state='ACTIVE',state_version=state_version+1,cooldown_until=NULL,
       updated_at=clock_timestamp() WHERE state='COOLDOWN' AND cooldown_until<=clock_timestamp()`);
   const expiredBlocks = await database.query(`UPDATE blocklist_entries SET revoked_at=clock_timestamp(),
       revoked_by='SYSTEM' WHERE revoked_at IS NULL AND expires_at<=clock_timestamp() RETURNING *`);
@@ -229,6 +234,7 @@ async function runTransactionalMaintenance(pool, context) {
     await requeueDueRunnerJobsInTransaction(database, context, { includeExpired: true });
     await recoverCrashedQuestTests(database, context);
     await reconcilePassedMonitorTestBatches(database, context);
+    await reconcileFailedMonitorTestBatches(database, context);
     await recoverCrashedPayments(database, context);
     await maintainMonitorsAndBlocks(database, context);
     await queueMaintenanceNotifications(database, context);
@@ -263,7 +269,8 @@ async function releaseExpiredOrderItems(pool, context) {
 
 export async function reconcileSellableQuests(pool, context, runnerConcurrency) {
   const sellable = (await pool.query(`SELECT * FROM quests WHERE sale_state IN ('OPEN','PAUSED','CLOSED')
-    ORDER BY updated_at,quest_id LIMIT 100`)).rows;
+    ORDER BY CASE sale_state WHEN 'OPEN' THEN 0 WHEN 'PAUSED' THEN 1 ELSE 2 END,
+      expires_at NULLS LAST,updated_at,quest_id LIMIT 100`)).rows;
   for (const quest of sellable) {
     const admission = await withTransaction({ pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
       (database) => evaluateExpiryAdmission(database, { quest, runnerConcurrency }));

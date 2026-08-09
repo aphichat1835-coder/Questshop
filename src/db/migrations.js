@@ -25,6 +25,16 @@ export const listMigrations = async (directory = path.join(root, 'migrations')) 
   }));
 };
 
+export async function validateSchemaCompatibility(database) {
+  const current = Number((await database.query(
+    'SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations',
+  )).rows[0].version);
+  if (current < MIN_COMPATIBLE_SCHEMA_VERSION || current > MAX_COMPATIBLE_SCHEMA_VERSION) {
+    throw new Error(`Schema version ${current} is incompatible with this app; run the deployment migration step first`);
+  }
+  return current;
+}
+
 export const runMigrations = async ({ pool = getDirectPool(), gitSha = 'unknown', runtimeRole = null } = {}) => {
   const client = await pool.connect();
   try {
@@ -69,12 +79,7 @@ export const runMigrations = async ({ pool = getDirectPool(), gitSha = 'unknown'
       await client.query(`GRANT EXECUTE ON FUNCTION
         questshop_prune_operational_details(timestamptz, timestamptz, integer) TO ${quoteIdentifier(runtimeRole)}`);
     }
-    const current = (await client.query(
-      'SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations',
-    )).rows[0].version;
-    if (current < MIN_COMPATIBLE_SCHEMA_VERSION || current > MAX_COMPATIBLE_SCHEMA_VERSION) {
-      throw new Error(`Schema version ${current} is incompatible with this app`);
-    }
+    const current = await validateSchemaCompatibility(client);
     return { current, applied: migrations.length };
   } finally {
     try {

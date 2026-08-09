@@ -465,19 +465,24 @@ async function renderMonitorDetail(interaction, runtime, monitorId) {
     `**ผลตรวจล่าสุด:** ${lastHealthResult}`,
     '', 'ปุ่มเช็คบัญชีนี้อ่านข้อมูลบัญชี/Quest เท่านั้น ไม่ทำ Quest จริง',
   ].join('\n');
-  const toggle = monitor.state === 'DISABLED' ? 'เปิดใช้งาน' : 'พักบัญชี';
+  const intendedState = monitor.state === 'DISABLED' ? 'ACTIVE' : 'DISABLED';
+  const stateRoute = intendedState === 'ACTIVE' ? 'monitor_enable' : 'monitor_disable';
+  const stateOperation = intendedState === 'ACTIVE' ? 'MONITOR_ENABLE' : 'MONITOR_DISABLE';
+  const toggle = intendedState === 'ACTIVE' ? 'เปิดใช้งาน' : 'พักบัญชี';
   const session = (operation) => createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
     channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation,
-    payload: { monitorId: monitor.id }, configVersion: runtime.config.version },
+    payload: operation === stateOperation ? { monitorId: monitor.id, intendedState,
+      expectedState: monitor.state, expectedStateVersion: monitor.state_version } : { monitorId: monitor.id },
+    configVersion: runtime.config.version },
   contextFor(interaction, 'monitor_detail_session'), { pool: runtime.pool });
   const [check, rotate, state] = await Promise.all([
-    session('MONITOR_CHECK_ONE'), session('MONITOR_ROTATE'), session('MONITOR_TOGGLE'),
+    session('MONITOR_CHECK_ONE'), session('MONITOR_ROTATE'), session(stateOperation),
   ]);
   return adminReply(interaction, 'monitors', { embeds: [panelEmbed(0x5865f2, 'รายละเอียดบัญชีตรวจสอบ Quest', description)],
   components: [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(customId('monitor_check_one', check.id)).setLabel('เช็คบัญชีนี้').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(customId('monitor_rotate', rotate.id)).setLabel('เปลี่ยน Token').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(customId('monitor_toggle', state.id)).setLabel(toggle).setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(customId(stateRoute, state.id)).setLabel(toggle).setStyle(ButtonStyle.Danger),
     new ButtonBuilder().setCustomId(customId('monitor_list')).setLabel('กลับไปรายการ').setStyle(ButtonStyle.Secondary),
   )] });
 }
@@ -1528,20 +1533,30 @@ if (route.route === 'monitor_rotate_submit' && interaction.isModalSubmit()) {
 }
 }
 
-async function handleMonitorToggle({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'monitor_toggle' && interaction.isButton()) {
+async function handleMonitorState({ interaction, route, runtime, gates: _gates }) {
+if (['monitor_enable', 'monitor_disable'].includes(route.route) && interaction.isButton()) {
   ownerOnly(interaction, runtime, 'บัญชีตรวจสอบ Quest ใช้ได้เฉพาะเจ้าของร้าน');
   await interaction.deferReply({ ephemeral: true });
+  const intendedState = route.route === 'monitor_enable' ? 'ACTIVE' : 'DISABLED';
+  const operation = intendedState === 'ACTIVE' ? 'MONITOR_ENABLE' : 'MONITOR_DISABLE';
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, messageId: interaction.message?.id ?? null,
-    operation: 'MONITOR_TOGGLE' }, contextFor(interaction, 'monitor_toggle_load'), { pool: runtime.pool });
-  const monitor = (await runtime.pool.query('SELECT * FROM monitor_accounts WHERE id=$1', [session.payload.monitorId])).rows[0];
-  if (!monitor) throw new QuestshopError('MONITOR_NOT_FOUND', 'ไม่พบบัญชี Monitor');
-  const nextState = monitor.state === 'DISABLED' ? 'ACTIVE' : 'DISABLED';
-  const changed = await setMonitorState({ monitorId: monitor.id, state: nextState },
-    contextFor(interaction, 'monitor_toggle_execute'), { pool: runtime.pool });
+    operation }, contextFor(interaction, 'monitor_state_load'), { pool: runtime.pool });
+  if (session.payload.intendedState !== intendedState) {
+    throw new QuestshopError('MONITOR_STATE_COMMAND_INVALID', 'คำสั่งเปลี่ยนสถานะบัญชีไม่ตรงกับหน้าที่เปิดไว้');
+  }
+  const changed = await setMonitorState({ monitorId: session.payload.monitorId, state: intendedState,
+    expectedState: session.payload.expectedState, expectedVersion: session.payload.expectedStateVersion },
+  contextFor(interaction, 'monitor_state_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`${nextState === 'ACTIVE' ? 'เปิดใช้งาน' : 'พักใช้งาน'} **${changed.username ?? changed.account_id}** แล้ว`);
+  return interaction.editReply(`${intendedState === 'ACTIVE' ? 'เปิดใช้งาน' : 'พักใช้งาน'} **${changed.username ?? changed.account_id}** แล้ว`);
+}
+}
+
+async function handleLegacyMonitorToggle({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'monitor_toggle' && interaction.isButton()) {
+  ownerOnly(interaction, runtime, 'บัญชีตรวจสอบ Quest ใช้ได้เฉพาะเจ้าของร้าน');
+  return interaction.reply({ ephemeral: true, content: 'ปุ่มนี้เป็นหน้ารุ่นเก่า กรุณาเปิดรายละเอียดบัญชีใหม่ก่อนเปลี่ยนสถานะ' });
 }
 }
 
@@ -1816,7 +1831,9 @@ const ROUTE_HANDLERS = Object.freeze({
   "monitor_check_one": handleMonitorCheckOne,
   "monitor_rotate": handleMonitorRotate,
   "monitor_rotate_submit": handleMonitorRotateSubmit,
-  "monitor_toggle": handleMonitorToggle,
+  "monitor_enable": handleMonitorState,
+  "monitor_disable": handleMonitorState,
+  "monitor_toggle": handleLegacyMonitorToggle,
   "dlq_replay": handleDlqAction,
   "dlq_discard": handleDlqAction,
   "dlq_replay_submit": handleDlqSubmit,

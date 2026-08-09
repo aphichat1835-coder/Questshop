@@ -38,13 +38,13 @@ Monitor route handlers in `discord/interactions/router.js`, and
 
 ## Later Owner usability decision — First-run configuration
 
-The Owner only enters the seven external values the application cannot safely invent: Discord Bot/Application/
-Guild/Owner identity, PostgreSQL Runtime/Direct URLs, and the PostgreSQL CA. `npm run setup` creates the
+The Owner enters six required external values the application cannot safely invent: Discord Bot/Application/
+Guild/Owner identity and PostgreSQL Runtime/Direct URLs. A private PostgreSQL CA is optional. `npm run setup` creates the
 Status token and independent Data/Voucher/Backup keys once, normalizes the CA, writes `.env` atomically with
 mode `0600`, and defaults Backup off until external S3/Restore credentials exist. Re-running setup preserves
 the durable secrets and rejects conflicting process-level keys rather than silently rotating encrypted data.
-Runtime entrypoints load `.env` when present; stateless deployments must mount it from durable secret storage
-or transfer its values to a platform secret manager.
+Runtime loads only its scoped values and does not require the Migration URL; stateless deployments must use
+separate runtime and deployment secret bundles from durable secret storage.
 
 Implementation: `src/config/setup-environment.js`, `src/config/load-local-environment.js`,
 `scripts/setup.js`, the root package scripts, and `test/unit/setup-environment.test.js`.
@@ -57,7 +57,7 @@ or live check runs.  It does **not** replace the live evidence required for a pr
 
 | Evidence | Result |
 |---|---|
-| Package target Node `22.22.0`, local runtime Node `24.14.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | Passed: 96 tests; the local runtime is newer than the pinned production target and CI/Docker still pin Node 22.22.0. CI fails rather than silently skipping PostgreSQL contracts when `TEST_DATABASE_URL` is absent. |
+| Package target Node `22.22.0`, local runtime Node `24.14.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | CI/Docker pin Node 22.22.0. CI fails rather than silently skipping PostgreSQL contracts when `TEST_DATABASE_URL` is absent and emits LCOV evidence for the exact workflow SHA. |
 | `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
 | `git diff --check` | Passed |
 | Git tracked files | Neither legacy reference project is tracked; both are ignored locally |
@@ -91,7 +91,7 @@ contracts, not evidence for a managed production service.
 | 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. CI creates a disposable `questshop_loadtest` database and enforces the 200-user/100-order capacity gate. External alert delivery and monthly SLO evidence remain. |
 | 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
 | 22. Development sequence and feature gates | feature-gate config, Admin controls and pre-launch document | Source-confirmed. Owner must enable gates in the required live order. |
-| 23. Definition of Done and acceptance | definition-of-done, traceability and 96 automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
+| 23. Definition of Done and acceptance | definition-of-done, traceability and automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
 
 ## Technical Blueprint plan
 

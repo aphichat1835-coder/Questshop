@@ -29,6 +29,17 @@ test('quest-new projection does not expose internal sale state', async () => {
   assert.match(body.embeds[0].data.description, /ดู Quest ได้ที่นี่/);
 });
 
+test('refund and quest-new projections render safe fallbacks when their aggregate row disappeared', async () => {
+  const pool = { query: async () => ({ rows: [] }) };
+  const client = { users: { fetch: async () => { throw new Error('must not fetch a missing refund user'); } } };
+  const refund = await renderProjection(pool, { projection_type: 'REFUND_LOG', aggregate_id: 'missing' }, { client });
+  const quest = await renderProjection(pool, { projection_type: 'QUEST_NEW', aggregate_id: 'missing' });
+  assert.equal(refund.embeds[0].data.title, 'ไม่พบ Refund Log');
+  assert.equal(quest.embeds[0].data.title, 'ไม่พบข้อมูล Quest ใหม่');
+  assert.deepEqual(refund.allowedMentions, { parse: [] });
+  assert.deepEqual(quest.allowedMentions, { parse: [] });
+});
+
 test('order DM uses Discord link buttons instead of markdown action links', async () => {
   const pool = { query: async (sql) => {
     if (sql.includes('FROM order_aggregates')) return { rows: [{ id: 'order', account_username: 'Account',

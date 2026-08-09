@@ -1,62 +1,26 @@
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { v7 as uuidv7 } from 'uuid';
-import { loadEnvironment } from '../config/env.js';
+import { loadRuntimeEnvironment } from '../config/env.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
-import { closeDirectPool, closePools, getDirectPool, getRuntimePool } from '../db/pools.js';
-import { listMigrations, runMigrations } from '../db/migrations.js';
+import { closePools, getRuntimePool } from '../db/pools.js';
+import { validateSchemaCompatibility } from '../db/migrations.js';
 import { acquireLease, renewLease } from '../db/leases.js';
 import { createDiscordClient } from '../discord/client.js';
 import { routeInteraction } from '../discord/interactions/router.js';
 import { startWorkers } from '../workers/worker-manager.js';
 import { closeHealthServer, createHealthState, startHealthServer } from './health-server.js';
 import { createLogger } from '../shared/logger.js';
-import { createEncryptedBackup, validateBackupTools } from '../adapters/s3/backup.js';
 import { runMaintenance } from '../workers/maintenance-worker.js';
 import { validateKeyringCoverage } from './keyring-coverage.js';
 import { validateRuntimeRole } from '../db/role-contract.js';
 import { processOutbox } from '../workers/outbox-worker.js';
-import { validateOrInitializeKeyringSentinels } from './keyring-sentinels.js';
-
-async function migrateWithBackup(env, health) {
-  const backupEnabled = env.BACKUP_ENABLED ?? env.NODE_ENV === 'production';
-  if (env.NODE_ENV === 'production' && backupEnabled) {
-    await validateBackupTools(env);
-    health.checks.backupTools = 'OK';
-  } else {
-    health.checks.backupTools = env.NODE_ENV === 'production' ? 'DISABLED_BY_CONFIG' : 'SKIPPED_NON_PRODUCTION';
-  }
-  const directPool = getDirectPool(env);
-  const migrationTable = (await directPool.query("SELECT to_regclass('public.schema_migrations') AS value")).rows[0].value;
-  let preMigrationBackup = null;
-  if (migrationTable) {
-    const schemaVersion = Number((await directPool.query('SELECT COALESCE(max(version),0) AS value FROM schema_migrations')).rows[0].value);
-    const latestVersion = Math.max(...(await listMigrations()).map((migration) => migration.version));
-    if (schemaVersion < latestVersion && !backupEnabled && env.NODE_ENV === 'production') {
-      throw new Error('Production migrations require a verified pre-migration backup');
-    }
-    if (backupEnabled && schemaVersion < latestVersion) {
-      preMigrationBackup = await createEncryptedBackup({ env, schemaVersion, reason: 'pre-migration' });
-      health.checks.preMigrationBackup = 'VERIFIED';
-    } else health.checks.preMigrationBackup = backupEnabled ? 'NO_PENDING_MIGRATION' : 'DISABLED_BY_CONFIG';
-  } else health.checks.preMigrationBackup = 'FIRST_INSTALL_NOT_APPLICABLE';
-  await runMigrations({ pool: directPool, gitSha: env.GIT_SHA,
-    runtimeRole: decodeURIComponent(new URL(env.DATABASE_POOL_URL).username) });
-  await validateOrInitializeKeyringSentinels(directPool, env);
-  if (preMigrationBackup) {
-    await directPool.query(`INSERT INTO backup_runs(id,backup_type,state,object_key,checksum,size_bytes,schema_version,
-      git_sha,encryption_key_version,manifest,completed_at) VALUES($1,'PRE_MIGRATION','VERIFIED',$2,$3,$4,$5,$6,$7,$8,clock_timestamp())`,
-    [preMigrationBackup.id, preMigrationBackup.objectKey, preMigrationBackup.checksum,
-      preMigrationBackup.sizeBytes, preMigrationBackup.schemaVersion, env.GIT_SHA,
-      preMigrationBackup.encryptionKeyVersion, preMigrationBackup]);
-  }
-  await closeDirectPool();
-  health.checks.schema = 'OK';
-}
 
 async function openRuntimeDatabase(env, health) {
   const pool = getRuntimePool(env);
   await pool.query('SELECT 1');
+  await validateSchemaCompatibility(pool);
+  health.checks.schema = 'OK';
   await validateKeyringCoverage(pool, env);
   health.checks.keyrings = 'OK';
   const roleContract = await validateRuntimeRole(pool, { enforce: env.NODE_ENV === 'production' });
@@ -178,10 +142,8 @@ export async function startup({ health = createHealthState(), server: existingSe
   let client;
   let pool;
   try {
-    const env = loadEnvironment();
+    const env = loadRuntimeEnvironment();
     health.checks.config = 'OK';
-    assertStarting();
-    await migrateWithBackup(env, health);
     assertStarting();
     pool = await openRuntimeDatabase(env, health);
     assertStarting();

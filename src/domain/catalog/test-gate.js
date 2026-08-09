@@ -166,6 +166,29 @@ export async function reconcilePassedMonitorTestBatches(client, context) {
   return reconciled;
 }
 
+// Versions before the failed-run transaction fix could commit TEST_FAILED and
+// stop before advancing the owning batch. Reconcile only when that failed run
+// is still the latest attempt, so an already queued successor is never doubled.
+export async function reconcileFailedMonitorTestBatches(client, context) {
+  const candidates = (await client.query(`SELECT b.id AS batch_id,tr.*
+    FROM quest_test_batches b JOIN LATERAL (
+      SELECT * FROM quest_test_runs tr WHERE tr.batch_id=b.id
+      ORDER BY tr.created_at DESC,tr.id DESC LIMIT 1
+    ) tr ON true
+    WHERE b.state IN ('QUEUED','RUNNING') AND tr.state='TEST_FAILED'
+    ORDER BY b.updated_at,b.id FOR UPDATE OF b SKIP LOCKED`)).rows;
+  let reconciled = 0;
+  for (const run of candidates) {
+    const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [run.quest_id])).rows[0];
+    if (!quest) continue;
+    const advanced = await advanceMonitorTestBatch(client, { run, quest,
+      error: { code: run.error_class ?? 'TEST_FAILED', message: 'Recovered incomplete failed Monitor test batch' },
+      context: { ...context, traceId: run.trace_id } });
+    if (advanced) reconciled += 1;
+  }
+  return reconciled;
+}
+
 export async function retryFailedTestAlert(client, { alertId, context }) {
   const alert = (await client.query(`SELECT * FROM quest_test_failure_alerts WHERE id=$1 FOR UPDATE`, [alertId])).rows[0];
   if (alert?.state !== 'OPEN') return { alert, batch: null, idempotent: true };

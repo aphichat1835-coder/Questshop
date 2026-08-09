@@ -11,7 +11,7 @@ import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
 import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
 import { appendAdminAudit } from './audit.js';
 
-export async function setQuestSaleState({ questId, nextState, runnerConcurrency = 3,
+export async function setQuestSaleState({ questId, nextState, runnerConcurrency = 2,
   reason }, context, options = {}) {
   if (!['OPEN', 'PAUSED', 'EXPIRED'].includes(nextState) || !reason?.trim()) {
     throw new TypeError('invalid Quest sale change');
@@ -69,7 +69,7 @@ export async function forcePublishFailedMonitorTest({ alertId, reason }, context
     if (alert.state !== 'OPEN') throw new QuestshopError('QUEST_TEST_ALERT_NOT_OPEN', 'รายการนี้ไม่ได้รอการตัดสินใจ');
     const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [alert.quest_id])).rows[0];
     const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
-    const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency: 3 });
+    const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency: 2 });
     if (quest.analysis_state !== 'SUPPORTED' || !quest.executor_id || !price || !expiry.eligible) {
       throw new QuestshopError('QUEST_NOT_SALE_ELIGIBLE', 'Quest ยังมีข้อมูล ราคา หรือเวลาคงเหลือไม่พอสำหรับเปิดขาย');
     }

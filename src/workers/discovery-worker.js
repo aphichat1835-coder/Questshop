@@ -16,10 +16,12 @@ async function markMonitorFailure(pool, monitor, error, context) {
   let state = 'ACTIVE';
   if (error.fatalAuth || failures >= 5) state = 'QUARANTINED';
   else if (failures >= 3) state = 'COOLDOWN';
-  await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
+  const updated = (await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
+    state_version=state_version+CASE WHEN state<>$2 THEN 1 ELSE 0 END,
     cooldown_until=CASE WHEN $2='COOLDOWN' THEN clock_timestamp()+interval '15 minutes' ELSE cooldown_until END,
-    updated_at=clock_timestamp() WHERE id=$1`, [monitor.id, state, failures]);
-  if (state === 'QUARANTINED') await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
+    updated_at=clock_timestamp() WHERE id=$1 AND state<>'DISABLED' RETURNING state`,
+  [monitor.id, state, failures])).rows[0];
+  if (updated?.state === 'QUARANTINED') await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
     VALUES(gen_random_uuid(),'MONITOR_QUARANTINED',$1,'OPEN','ERROR',$2,$3)
     ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
     DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,

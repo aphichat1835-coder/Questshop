@@ -177,7 +177,7 @@ export async function ingestDiscovery({
   normalized,
   source,
   redactedRaw = null,
-  runnerConcurrency = 3,
+  runnerConcurrency = 2,
 }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const previousQuest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
@@ -208,7 +208,7 @@ function coreMetadataPresent(quest) {
 export async function resolveSaleEligibility({
   questId,
   progressActual = 0,
-  runnerConcurrency = 3,
+  runnerConcurrency = 2,
   allowCustomerAccount = false,
 }, _context, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {

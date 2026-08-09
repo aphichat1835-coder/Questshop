@@ -18,7 +18,7 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
   keyring/role/Discord Administrator โดยไม่พิมพ์ Secret ออกมา
 
 - Questshop runtime แบบ Single Guild บน Node.js 22, discord.js และ PostgreSQL 16+
-- First-run `npm run setup` ที่ถามเฉพาะ Discord/Database/CA จำนวน 7 ค่า แล้วสร้าง Status token,
+- First-run `npm run setup` ที่ถาม 6 ค่าบังคับสำหรับ Discord/Database และรับ CA เป็นค่าทางเลือก แล้วสร้าง Status token,
   keyrings สามชุด, normalized CA และค่าเริ่มต้นลง `.env` permission `0600` แบบ idempotent
 - Durable Wallet/Ledger, per-item reservation, Capture/Release, Refund และ Compensating adjustment
 - TrueMoney Gift Direct adapter พร้อม URL allowlist, Voucher HMAC, Receiver snapshot, exact-cent parsing,
@@ -44,6 +44,14 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 - Automated unit, PostgreSQL integration, concurrency, crash, security, contract, recovery และ load tests
 
 ### Changed
+
+- แยก Deployment migration ออกจาก Runtime: `npm run deploy` ตรวจและสร้าง Pre-migration backup ก่อนเขียน
+  Production schema ขณะที่ `npm start` ใช้เฉพาะ pooled Runtime configuration และตรวจ schema แบบ read-only
+- Monitor enable/disable ใช้คำสั่งเจาะจงพร้อม expected state/version; Health check และ worker ไม่เขียนทับ
+  สถานะ `DISABLED` ที่ Owner ตั้งเอง
+- Quest-test failure กับ batch advance/alert อยู่ใน Transaction เดียวและมี recovery สำหรับ failure gap เดิม
+- Maintenance ให้ Quest ที่เปิด/พักขายมาก่อนรายการปิด, Renderer มี missing-row fallback, Runner concurrency
+  เริ่มต้นเป็น 2 และ CI สร้าง LCOV artifact
 
 - Startup ตรวจ Discord Administrator ครั้งเดียวก่อนรับงาน; ห้องหลังบ้านไม่ทำ per-surface bot permission drift check
 - Payment Log ตรวจความเป็นส่วนตัวของมนุษย์ทุกครั้งก่อนถอดรหัสหรือส่งลิงก์ซองเต็ม; หากไม่ปลอดภัยจะปิด

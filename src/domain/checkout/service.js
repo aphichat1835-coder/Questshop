@@ -329,7 +329,7 @@ export async function selectAll({ sessionId, actorId, guildId, channelId = null,
 }
 
 export async function buildQuote({ sessionId, actorId, guildId, channelId = null,
-  messageId = null, runnerConcurrency = 3 }, _context, options = {}) {
+  messageId = null, runnerConcurrency = 2 }, _context, options = {}) {
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const session = await lockAuthorizedSession(client, { sessionId, actorId, guildId, channelId, messageId });
     const items = (await client.query(`

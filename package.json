@@ -27,6 +27,7 @@
     "check": "find src scripts test -type f -name '*.js' -print0 | xargs -0 -n1 node --check",
     "lint": "eslint src scripts test",
     "test": "node scripts/test-files.js",
+    "test:coverage": "node scripts/test-files.js --coverage",
     "test:unit": "node --test test/unit/*.test.js",
     "test:integration": "node scripts/test-files.js test/integration test/concurrency test/crash",
     "verify": "npm run check && npm run lint && npm test"

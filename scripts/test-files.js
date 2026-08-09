@@ -1,4 +1,4 @@
-import { readdir } from 'node:fs/promises';
+import { mkdir, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
@@ -13,25 +13,33 @@ async function filesUnder(root) {
   return files;
 }
 
-function run(file) {
+function run(args) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(process.execPath, ['--test', '--test-concurrency=1', file], {
+    const child = spawn(process.execPath, args, {
       stdio: 'inherit', env: process.env,
     });
     child.once('error', reject);
     child.once('exit', (code, signal) => {
-      if (signal) reject(new Error(`${file} terminated by ${signal}`));
-      else if (code !== 0) reject(new Error(`${file} exited with code ${code}`));
+      if (signal) reject(new Error(`test process terminated by ${signal}`));
+      else if (code !== 0) reject(new Error(`test process exited with code ${code}`));
       else resolveRun();
     });
   });
 }
 
-const roots = process.argv.slice(2).map((root) => resolve(root));
+const coverage = process.argv.includes('--coverage');
+const roots = process.argv.slice(2).filter((argument) => argument !== '--coverage').map((root) => resolve(root));
 const selectedRoots = roots.length ? roots : [resolve('test')];
 if (process.env.CI && !process.env.TEST_DATABASE_URL) {
   throw new Error('TEST_DATABASE_URL is required in CI; refusing to skip PostgreSQL contract tests');
 }
 const files = (await Promise.all(selectedRoots.map(filesUnder))).flat().sort();
 if (!files.length) throw new Error('No test files found');
-for (const file of files) await run(file);
+if (coverage) {
+  await mkdir(resolve('coverage'), { recursive: true });
+  await run(['--test', '--test-concurrency=1', '--experimental-test-coverage',
+    '--test-reporter=spec', '--test-reporter-destination=stdout',
+    '--test-reporter=lcov', '--test-reporter-destination=coverage/lcov.info', ...files]);
+} else {
+  for (const file of files) await run(['--test', '--test-concurrency=1', file]);
+}
