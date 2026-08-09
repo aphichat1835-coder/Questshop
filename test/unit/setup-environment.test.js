@@ -121,6 +121,11 @@ test('environment text upsert preserves unrelated comments and settings', () => 
   assert.match(result, /BACKUP_ENABLED=false/);
 });
 
+test('environment parsing preserves export-prefixed assignments', () => {
+  assert.deepEqual(parseEnvironmentText("export STATUS_TOKEN='stable'\n"), { STATUS_TOKEN: 'stable' });
+  assert.match(upsertEnvironmentText('export PORT=3000\n', { PORT: '4000' }), /^export PORT=4000$/m);
+});
+
 test('stateless secret bundle is decoded without accepting malformed data', () => {
   const bundle = Buffer.from(JSON.stringify({ STATUS_TOKEN: 'x'.repeat(32), PORT: '3000' })).toString('base64url');
   assert.deepEqual(decodeSecretBundle(bundle), { STATUS_TOKEN: 'x'.repeat(32), PORT: '3000' });

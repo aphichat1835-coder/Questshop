@@ -5,6 +5,7 @@ import {
   renderOrderConfirmation,
   renderQuote,
   renderSelection,
+  renderTopupProcessing,
   renderTopupResult,
 } from '../../src/discord/renderers/checkout.js';
 import { adminNavigationComponents } from '../../src/discord/renderers/admin.js';
@@ -77,6 +78,11 @@ test('top-up result distinguishes credited, review and failure without guessing'
   assert.doesNotMatch(review.embeds[0].data.title, /ไม่สำเร็จ/);
   const failed = renderTopupResult({ id: 'topup', status: 'ALREADY_REDEEMED' });
   assert.match(failed.embeds[0].data.title, /ไม่สำเร็จ/);
+});
+
+test('top-up processing preserves the intended Discord warning color', () => {
+  const body = renderTopupProcessing('topup');
+  assert.equal(body.embeds[0].data.color, 15774258);
 });
 
 test('admin navigation always includes category navigation and refresh controls', () => {

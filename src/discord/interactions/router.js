@@ -455,11 +455,14 @@ async function renderMonitorDetail(interaction, runtime, monitorId) {
   const health = monitorDetailHealthLabel(monitor.health_state);
   const checked = monitor.last_health_checked_at
     ? `<t:${Math.floor(new Date(monitor.last_health_checked_at).getTime() / 1000)}:R>` : 'ยังไม่เคยตรวจ';
+  const lastHealthResult = monitor.last_health_error_code
+    ? `พบปัญหา • รหัส \`${escapedText(monitor.last_health_error_code)}\``
+    : 'ไม่พบปัญหา';
   const description = [
     `**บัญชี:** ${escapedText(monitor.username)}`, `**Account ID:** \`${escapedText(monitor.account_id)}\``,
     `**สถานะบัญชี:** ${displayState(monitor.state)}`, `**สถานะ Token:** ${health}`,
     `**ตรวจล่าสุด:** ${checked}`, `**Quest ตอนตรวจ:** ${monitor.last_health_quest_count ?? 'ไม่ระบุ'}`,
-    `**ผลตรวจล่าสุด:** ${monitor.last_health_error_code ? `พบปัญหา • รหัส \`${monitor.last_health_error_code}\`` : 'ไม่พบปัญหา'}`,
+    `**ผลตรวจล่าสุด:** ${lastHealthResult}`,
     '', 'ปุ่มเช็คบัญชีนี้อ่านข้อมูลบัญชี/Quest เท่านั้น ไม่ทำ Quest จริง',
   ].join('\n');
   const toggle = monitor.state === 'DISABLED' ? 'เปิดใช้งาน' : 'พักบัญชี';

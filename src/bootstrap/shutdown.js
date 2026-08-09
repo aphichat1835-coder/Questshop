@@ -64,11 +64,11 @@ async function shutdownOnce(runtime, reason, { leaseLost, error }) {
         holder: runtime.runtimeHolder, fencingToken: runtime.runtimeLease.fencing_token }, { pool: runtime.pool }).catch(() => null),
       deadline, 'runtime lease release');
     }
-  } catch (caught) { failure ??= caught; }
+  } catch (error_) { failure ??= error_; }
   if (!leaseLost) {
     failure = await preserveCleanupFailure(async () => runtime.client?.destroy?.(), failure);
   }
-  await bounded(closePools().catch(() => null), deadline, 'database close').catch((caught) => { failure ??= caught; });
+  await bounded(closePools().catch(() => null), deadline, 'database close').catch((error_) => { failure ??= error_; });
   runtime.health.live = false;
   await bounded(closeHealthServer(runtime.server).catch(() => null), deadline, 'health close')
     .catch((error) => { failure ??= error; });

@@ -29,6 +29,8 @@ const OPTIONAL_RUNTIME_FIELDS = Object.freeze([
   'DISCORD_CLIENT_VERSION', 'DISCORD_CHROME_VERSION', 'DISCORD_ELECTRON_VERSION',
   'DISCORD_BUILD_NUMBER', 'DISCORD_NATIVE_BUILD_NUMBER', 'DISCORD_LOCALE',
 ]);
+const ENVIRONMENT_LINE = /^(?:export\s+)?([A-Z][A-Z0-9_]*)=(.*)$/;
+const ENVIRONMENT_ASSIGNMENT = /^(\s*(?:export\s+)?)([A-Z][A-Z0-9_]*)(\s*=).*$/;
 
 function unquote(value) {
   if (value.length < 2) return value;
@@ -45,7 +47,7 @@ export function parseEnvironmentText(text) {
   for (const rawLine of String(text ?? '').split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
-    const match = line.match(/^(?:export\s+)?([A-Z][A-Z0-9_]*)=(.*)$/);
+    const match = ENVIRONMENT_LINE.exec(line);
     if (match) values[match[1]] = unquote(match[2].trim());
   }
   return values;
@@ -63,7 +65,7 @@ function encodeEnvironmentValue(value) {
 export function upsertEnvironmentText(original, updates) {
   const pending = new Map(Object.entries(updates));
   const lines = String(original ?? '').split(/\r?\n/).map((line) => {
-    const match = line.match(/^(\s*(?:export\s+)?)([A-Z][A-Z0-9_]*)(\s*=).*$/);
+    const match = ENVIRONMENT_ASSIGNMENT.exec(line);
     if (!match || !pending.has(match[2])) return line;
     const value = pending.get(match[2]);
     pending.delete(match[2]);
