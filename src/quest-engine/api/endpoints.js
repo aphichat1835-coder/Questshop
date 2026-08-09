@@ -1,3 +1,5 @@
+export const QUEST_API_VERSION = 9;
+export const QUEST_API_PREFIX = `/api/v${QUEST_API_VERSION}`;
 export const QUEST_LIST_PATHS = Object.freeze(['/quests/@me', '/users/@me/quests']);
 const FIXED_QUEST_API_PATHS = new Set(['/users/@me', ...QUEST_LIST_PATHS]);
 const QUEST_ACTION_PATH = /^\/quests\/[A-Za-z0-9_-]+\/(?:enroll|video-progress|heartbeat)$/;
@@ -18,6 +20,22 @@ function questPath(questId, suffix) {
 // makes the fixed-host request boundary independently auditable.
 export function isAllowedQuestApiPath(path) {
   return FIXED_QUEST_API_PATHS.has(path) || QUEST_ACTION_PATH.test(path);
+}
+
+// This is deliberately stricter than URL parsing.  Quest callers may choose
+// only a documented path; they can never influence a host, protocol, query,
+// fragment, or path traversal sequence at the HTTP boundary.
+export function assertAllowedQuestApiPath(path) {
+  if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')
+    || path.includes('\\') || path.includes('?') || path.includes('#')
+    || /\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(path) || !isAllowedQuestApiPath(path)) {
+    throw new TypeError('unsafe Discord API path');
+  }
+  return path;
+}
+
+export function discordQuestRequestPath(path) {
+  return `${QUEST_API_PREFIX}${assertAllowedQuestApiPath(path)}`;
 }
 
 export const QUEST_ENDPOINT = Object.freeze({

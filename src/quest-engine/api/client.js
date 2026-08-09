@@ -3,10 +3,10 @@ import { secureJitter } from '../../shared/random.js';
 import { extractQuestArray, QuestCompatibilityError } from '../schema/compatibility.js';
 import { normalizeQuestPayload } from '../schema/normalizer.js';
 import { discordRateLimitCoordinator } from '../rate-limits/coordinator.js';
-import { FATAL_FORBIDDEN_PATHS, isAllowedQuestApiPath, QUEST_ENDPOINT, QUEST_LIST_PATHS } from './endpoints.js';
+import { fixedDiscordTransport } from './discord-transport.js';
+import { FATAL_FORBIDDEN_PATHS, QUEST_API_VERSION, QUEST_ENDPOINT, QUEST_LIST_PATHS } from './endpoints.js';
 
-export const QUEST_API_VERSION = 9;
-const API_BASE = new URL(`https://discord.com/api/v${QUEST_API_VERSION}`);
+export { QUEST_API_VERSION };
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
@@ -44,25 +44,6 @@ export function isCaptchaChallenge(data) {
     || data?.captcha_rqdata || data?.captcha_key);
 }
 
-function safePath(path) {
-  if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')
-    || path.includes('\\') || path.includes('?') || path.includes('#')
-    || /\/(?:\.{1,2}|%2e(?:%2e)?)(?:\/|$)/i.test(path) || !isAllowedQuestApiPath(path)) {
-    throw new TypeError('unsafe Discord API path');
-  }
-  return path;
-}
-
-function apiUrl(path) {
-  const url = new URL(API_BASE);
-  url.pathname = `${API_BASE.pathname}${safePath(path)}`;
-  if (url.protocol !== 'https:' || url.origin !== API_BASE.origin
-    || !url.pathname.startsWith(`${API_BASE.pathname}/`)) {
-    throw new TypeError('unsafe Discord API destination');
-  }
-  return url;
-}
-
 function headers(token, path, profile) {
   const userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/${profile.clientVersion} Chrome/${profile.chromeVersion} Electron/${profile.electronVersion} Safari/537.36`;
   const superProperties = Buffer.from(JSON.stringify({
@@ -82,7 +63,9 @@ function headers(token, path, profile) {
     'x-discord-timezone': 'Asia/Bangkok',
     accept: '*/*',
     'accept-language': `${profile.locale},en;q=0.9`,
-    'accept-encoding': 'gzip, deflate, br, zstd',
+    // The fixed native HTTPS transport intentionally does not auto-decompress
+    // responses, so ask Discord for a bounded identity response.
+    'accept-encoding': 'identity',
     'x-debug-options': 'bugReporterEnabled',
     origin: 'https://discord.com',
     referer: path.startsWith('/quests/') ? 'https://discord.com/quest-home' : 'https://discord.com/channels/@me',
@@ -158,11 +141,7 @@ async function waitForTransportRetry({ error, safeRead, attempt, maxAttempts, si
   return true;
 }
 
-async function dispatchQuestRequest({ coordinator, method, options, path, profile, safeRead, timeoutMs, token }) {
-  // Resolve and validate the destination before the request is admitted to the
-  // rate-limit queue. This keeps the HTTP boundary fixed even if an internal
-  // caller later passes an invalid path.
-  const destination = apiUrl(path);
+async function dispatchQuestRequest({ coordinator, method, options, path, profile, safeRead, timeoutMs, token, transport }) {
   const bounded = requestSignal(options.signal, timeoutMs);
   let dispatched = false;
   try {
@@ -170,10 +149,13 @@ async function dispatchQuestRequest({ coordinator, method, options, path, profil
       token, path, method, signal: bounded.signal,
       execute: () => {
         dispatched = true;
-        // nosemgrep: javascript.lang.security.audit.ssrf.node-ssrf -- destination is fixed to https://discord.com/api/v9 and path is allowlisted above.
-        return fetch(destination, {
-          ...options, signal: bounded.signal,
+        return transport({
+          path,
+          method,
+          body: options.body,
+          signal: bounded.signal,
           headers: { ...headers(token, path, profile), ...options.headers },
+          maxResponseBytes: MAX_RESPONSE_BYTES,
         });
       },
     });
@@ -206,14 +188,14 @@ function markMutationTransportUncertainty(error, { safeRead, dispatched }) {
 }
 
 export function createQuestApiClient({ token, profile, coordinator = discordRateLimitCoordinator,
-  timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  timeoutMs = DEFAULT_TIMEOUT_MS, transport = fixedDiscordTransport }) {
   async function request(path, options = {}, { safeRead = false, maxAttempts = safeRead ? 5 : 1 } = {}) {
     const method = String(options.method ?? 'GET').toUpperCase();
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let dispatched = false;
       try {
         const dispatchedRequest = await dispatchQuestRequest({
-          coordinator, method, options, path, profile, safeRead, timeoutMs, token,
+          coordinator, method, options, path, profile, safeRead, timeoutMs, token, transport,
         });
         dispatched = dispatchedRequest.dispatched;
         const result = await interpretQuestResponse({ coordinator, path, response: dispatchedRequest.response, token });

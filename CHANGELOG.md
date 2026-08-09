@@ -45,6 +45,11 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Changed
 
+- Quest API HTTP transport now has a literal `https://discord.com:443` destination, a strict v9 Quest-path
+  allowlist, no redirect following, identity-only response encoding and a streamed response-size ceiling. This
+  removes the dynamic URL sink while preserving injected test transport and the existing timeout/uncertainty rules.
+- CI now uses the Node-24-compatible checkout/setup actions while running Questshop itself on pinned Node 22.22.0;
+  it also uploads generated LCOV evidence even when the separate coverage threshold check fails.
 - Quest API requests now validate a strict fixed Discord v9 endpoint allowlist before entering the rate-limit
   queue, reject injected Quest identifiers before any HTTP call, and keep request timeout timers referenced so
   Node 22 cannot end a hung-request or rate-limit retry before its safety timer fires.
