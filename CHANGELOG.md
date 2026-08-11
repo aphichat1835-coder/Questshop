@@ -14,6 +14,11 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Added
 
+- Deployment migration now performs a fail-closed, transactional Runtime object-privilege synchronization after
+  every migration check (including `applied: 0`). It preserves provider-owned role/schema bootstrap boundaries,
+  enforces append-only Wallet/Audit/Release evidence access, and validates effective grants inherited through
+  `PUBLIC` or role membership.
+
 - Aiven-managed database-backup policy: first-run setup defaults to `BACKUP_MODE=AIVEN_MANAGED`, deployment records
   a SHA-bound `DEPLOYMENT_BACKUP_POLICY` audit without falsely claiming a local backup/restore verification, and
   Admin/health surfaces disclose the provider boundary.
@@ -51,6 +56,11 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 - Automated unit, PostgreSQL integration, concurrency, crash, security, contract, recovery และ load tests
 
 ### Changed
+
+- PostgreSQL pools now remove libpq SSL URL parameters only from the copy supplied to `pg`, preserving the original
+  `sslmode=verify-full` policy validation while retaining explicit Aiven CA and hostname/certificate verification.
+- Structured logs now serialize bounded, redacted Error diagnostics instead of emitting `{}`; Discord startup waits
+  for `Events.ClientReady` while retaining its `isReady()` guard.
 
 - inwcloud runtime no longer starts the Questshop `pg_dump`/S3 backup worker or local Backup alerts in
   Aiven-managed mode. Local S3 backup remains an explicit `BACKUP_MODE=LOCAL_S3` compatibility path. Key retirement

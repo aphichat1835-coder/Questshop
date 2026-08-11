@@ -4,15 +4,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDirectPool } from './pools.js';
 import { MAX_COMPATIBLE_SCHEMA_VERSION, MIN_COMPATIBLE_SCHEMA_VERSION } from '../config/versions.js';
+import { assertRuntimeRole, synchronizeRuntimeObjectPrivileges } from './role-privileges.js';
+import { validateRuntimeRole } from './role-contract.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const MIGRATION_LOCK_KEY = 7_448_173_001;
 
 function checksum(content) {
   return createHash('sha256').update(content).digest('hex');
-}
-function quoteIdentifier(value) {
-  return `"${String(value).replaceAll('"', '""')}"`;
 }
 
 export const listMigrations = async (directory = path.join(root, 'migrations')) => {
@@ -58,10 +57,12 @@ export async function validateMigrationChecksums(database, { migrations = null }
   return expected.length;
 }
 
-export const runMigrations = async ({ pool = getDirectPool(), gitSha = 'unknown', runtimeRole = null } = {}) => {
+export const runMigrations = async ({ pool = getDirectPool(), gitSha = 'unknown', runtimeRole } = {}) => {
   const client = await pool.connect();
   try {
     await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
+    const migratorRole = (await client.query('SELECT current_user AS role')).rows[0].role;
+    assertRuntimeRole(runtimeRole, migratorRole);
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
         version integer PRIMARY KEY,
@@ -98,20 +99,19 @@ export const runMigrations = async ({ pool = getDirectPool(), gitSha = 'unknown'
         throw error;
       }
     }
-    if (runtimeRole) {
-      // Hardened PostgreSQL installations may revoke the default PUBLIC
-      // schema access.  Table/function grants are unusable without USAGE,
-      // while USAGE alone does not permit DDL or data access.
-      await client.query(`GRANT USAGE ON SCHEMA public TO ${quoteIdentifier(runtimeRole)}`);
-      await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE
-        quest_api_rate_limit_blocks TO ${quoteIdentifier(runtimeRole)}`);
-      await client.query(`GRANT EXECUTE ON FUNCTION
-        questshop_prune_wallet_ledger(timestamptz, integer) TO ${quoteIdentifier(runtimeRole)}`);
-      await client.query(`GRANT EXECUTE ON FUNCTION
-        questshop_prune_operational_details(timestamptz, timestamptz, integer) TO ${quoteIdentifier(runtimeRole)}`);
+    await client.query('BEGIN');
+    let privilegeSynchronization;
+    try {
+      const details = await synchronizeRuntimeObjectPrivileges(client, { runtimeRole });
+      const contract = await validateRuntimeRole(client, { enforce: true, runtimeRole });
+      privilegeSynchronization = { status: 'PASS', ...details, violations: contract.violations };
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
     }
     const current = await validateSchemaCompatibility(client);
-    return { current, applied };
+    return { current, applied, privilegeSynchronization };
   } finally {
     try {
       await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]);

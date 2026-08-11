@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { openRuntimeDatabase, renewRuntimeLease } from '../../src/bootstrap/startup.js';
+import { EventEmitter } from 'node:events';
+import { Events } from 'discord.js';
+import { openRuntimeDatabase, renewRuntimeLease, waitForDiscordReady } from '../../src/bootstrap/startup.js';
 import { FencingLostError } from '../../src/shared/errors.js';
 
 test('runtime startup rejects changed key material before role validation or ingress', async () => {
@@ -17,6 +19,16 @@ test('runtime startup rejects changed key material before role validation or ing
   }), (error) => error.code === 'KEY_SENTINEL_MISMATCH');
   assert.deepEqual(calls, ['schema', 'checksums', 'coverage', 'sentinel']);
   assert.equal(health.checks.keyrings, undefined);
+});
+
+test('Discord readiness uses clientReady and does not wait when already ready', async () => {
+  const client = new EventEmitter();
+  client.isReady = () => false;
+  const waiting = waitForDiscordReady(client);
+  client.emit(Events.ClientReady, client);
+  await waiting;
+  client.isReady = () => true;
+  await waitForDiscordReady(client);
 });
 
 test('runtime lease retries a transient database failure but self-fences immediately when ownership is lost', async () => {

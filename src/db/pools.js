@@ -5,6 +5,20 @@ const { Pool } = pg;
 let runtimePool;
 let directPool;
 
+const PG_SSL_URL_PARAMETERS = Object.freeze([
+  'ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert', 'uselibpqcompat',
+]);
+
+// node-postgres parses connectionString after the explicit `ssl` option.  SSL
+// parameters in a libpq URL can therefore replace the verified CA object with
+// an empty object.  Keep the original URL for policy validation, but pass pg a
+// copy without the parameters that control SSL.
+export function sanitizePostgresConnectionString(connectionString) {
+  const url = new URL(connectionString);
+  for (const parameter of PG_SSL_URL_PARAMETERS) url.searchParams.delete(parameter);
+  return url.toString();
+}
+
 export function postgresSslOptions(env, connectionString) {
   const databaseUrl = new URL(connectionString);
   const sslDisabledForTest = env.NODE_ENV === 'test' && databaseUrl.searchParams.get('sslmode') === 'disable';
@@ -16,9 +30,10 @@ export function postgresSslOptions(env, connectionString) {
   };
 }
 
-function commonOptions(env, connectionString) {
+export function postgresPoolOptions(env, connectionString) {
   const ssl = postgresSslOptions(env, connectionString);
   return {
+    connectionString: sanitizePostgresConnectionString(connectionString),
     ssl,
     connectionTimeoutMillis: 5_000,
     idleTimeoutMillis: 30_000,
@@ -29,8 +44,7 @@ function commonOptions(env, connectionString) {
 
 export function getRuntimePool(env = loadRuntimeEnvironment()) {
   runtimePool ??= new Pool({
-    ...commonOptions(env, env.DATABASE_POOL_URL),
-    connectionString: env.DATABASE_POOL_URL,
+    ...postgresPoolOptions(env, env.DATABASE_POOL_URL),
     max: 8,
     application_name: 'questshop-runtime',
   });
@@ -39,8 +53,7 @@ export function getRuntimePool(env = loadRuntimeEnvironment()) {
 
 export function getDirectPool(env = loadEnvironment()) {
   directPool ??= new Pool({
-    ...commonOptions(env, env.DATABASE_DIRECT_URL),
-    connectionString: env.DATABASE_DIRECT_URL,
+    ...postgresPoolOptions(env, env.DATABASE_DIRECT_URL),
     max: 1,
     application_name: 'questshop-migrator',
   });

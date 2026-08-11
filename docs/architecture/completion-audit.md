@@ -64,6 +64,15 @@ separate runtime and deployment secret bundles from durable secret storage.
 Implementation: `src/config/setup-environment.js`, `src/config/load-local-environment.js`,
 `scripts/setup.js`, the root package scripts, and `test/unit/setup-environment.test.js`.
 
+## Owner-supplied live-bootstrap evidence — SHA `e45c80e`
+
+The Owner reported a live Aiven/inwcloud bootstrap attempt for source SHA `e45c80e`. It found that a `pg` connection
+URL carrying `sslmode=verify-full` could override the explicit Aiven CA object, requiring a temporary
+`NODE_EXTRA_CA_CERTS` workaround, and that Runtime object grants required manual repair. This is diagnostic evidence,
+not a Functional UAT pass. The following source revision adds URL sanitization, migration-time object privilege
+synchronization and effective-grant validation; it still requires a separate live retest before the workaround or
+manual grants can be considered removed.
+
 The Final Decision-Complete plan wins if the documents differ.  This record is a source and
 automated-test audit; release evidence must record `git rev-parse HEAD` at the time each command
 or live check runs.  It does **not** replace the live evidence required for a production release.
@@ -110,7 +119,7 @@ required and is not replaced by source tests.
 | 10. Wallet, price and promotion | wallet/ledger/pricing/promotion domains and settlement tests | Source-confirmed. Owner financial pre-launch compensation sign-off remains. |
 | 11. Interaction security and Discord rate limits | opaque component IDs, server sessions, outbox and security tests | Source-confirmed. Actual Discord REST/Gateway behaviour remains. |
 | 12. Correlation and PostgreSQL time | correlation, transition, transaction, PostgreSQL time modules and durable interaction-session traces | Source-confirmed. Managed database clock/role observation remains. |
-| 13. PostgreSQL production contract | pools, transaction wrapper, migrations, `postgresql-roles.md` | Source-confirmed. Deployment grants and Startup validates split Runtime-role access to durable Quest API cooldown state; managed PostgreSQL TLS and backup roles remain live evidence. |
+| 13. PostgreSQL production contract | pools, transaction wrapper, migrations, `postgresql-roles.md` | Source-confirmed. Deployment sanitizes libpq SSL URL overrides while preserving verified CA, synchronizes Migrator-owned object privileges even with `applied: 0`, and validates effective Runtime grants. Managed PostgreSQL TLS/role retest remains live evidence. |
 | 14. Startup, shutdown and health | bootstrap, shutdown, health server and worker manager | Source-confirmed. `/statusz` uses fixed-size digest comparison for its Bearer token and never returns operational detail to unauthorized requests. Deployment/restart drill remains. |
 | 15. Surface setup permissions | `src/bootstrap/startup.js`, `src/discord/surfaces/{setup,privacy}.js`, outbox worker and surface policy tests | Startup requires Bot Administrator once. Runtime Permission Drift detector/repair remains removed; private human-visibility checks remain at setup and `LOG_PAYMENTS` checks again before decrypt/render, with incident/DLQ/manual repair on exposure. |
 | 16. Engine/config versioning | versions, config service, runner pinning and compatibility test | Source-confirmed. N/N-1 deployment drain remains. |

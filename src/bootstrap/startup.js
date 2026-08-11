@@ -1,6 +1,7 @@
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { v7 as uuidv7 } from 'uuid';
+import { Events } from 'discord.js';
 import { loadRuntimeEnvironment } from '../config/env.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
 import { closePools, getRuntimePool } from '../db/pools.js';
@@ -43,6 +44,10 @@ async function acquireRuntimeOwnership(pool, env, health) {
   return { holder, runtimeLease };
 }
 
+export async function waitForDiscordReady(client) {
+  if (!client.isReady()) await once(client, Events.ClientReady);
+}
+
 async function connectDiscord(env, logger, health, runtime) {
   const client = createDiscordClient();
   client.questshop = runtime;
@@ -50,7 +55,7 @@ async function connectDiscord(env, logger, health, runtime) {
   client.on('error', (error) => logger.error({ error }, 'discord client error'));
   try {
     await client.login(env.DISCORD_BOT_TOKEN);
-    if (!client.isReady()) await once(client, 'ready');
+    await waitForDiscordReady(client);
     const guild = await client.guilds.fetch(env.DISCORD_GUILD_ID);
     const me = await guild.members.fetchMe();
     if (!me.permissions.has('Administrator')) {

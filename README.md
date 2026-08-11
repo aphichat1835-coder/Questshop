@@ -132,7 +132,10 @@ npm run setup
 `npm run setup` จะถามเฉพาะค่าภายนอกที่ระบบสร้างเองไม่ได้ แล้วสร้าง `.env`, Status token และ
 Encryption/HMAC keyrings ให้โดยอัตโนมัติ ไฟล์ถูกตั้ง permission เป็น `0600` และถูก Git ignore
 
-เตรียม PostgreSQL roles ตาม [postgresql-roles.md](docs/architecture/postgresql-roles.md) ก่อนรัน Migration
+เตรียม PostgreSQL roles และ schema bootstrap ตาม [postgresql-roles.md](docs/architecture/postgresql-roles.md)
+ก่อนรัน Migration: Aiven/Admin ให้ Migrator มี `USAGE, CREATE` และ Runtime มี `USAGE` แต่ไม่มี `CREATE`
+บน `public` ส่วน `npm run migrate` จะ synchronize สิทธิ์ของ tables, sequences และ Questshop functions ที่
+Migrator เป็นเจ้าของทุกครั้ง แม้ไม่มี migration SQL ใหม่
 
 ### เตรียมฐานข้อมูลและคำสั่ง Discord
 
