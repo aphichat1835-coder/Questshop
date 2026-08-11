@@ -14,7 +14,7 @@ Every incident follows: Detect → Contain → Preserve evidence → Recover →
 | Monitor token invalid | Quarantine account immediately | Owner rotates credential, then uses **เช็คระบบ Token** to verify login and Quest-list access |
 | Discord surface forbidden (403) | Preserve the outbox event and incident; do not change surface state automatically | Owner fixes the Discord channel permission manually, then replays the affected outbox event |
 | Discord outage / 429 | Retain outbox; obey Retry-After | Resume coalesced delivery after health recovers |
-| Backup / restore failure | Block migrations/deploy | Repair storage/key/role, then complete a verified drill |
+| Aiven database recovery | Keep store closed; preserve incident/ledger evidence | Owner restores or recovers through Aiven Console, then validates database/ledger before reopening |
 | Secret compromise | Disable affected feature; retain evidence | Activate new key version, resumable re-encryption, restore test |
 | Deploy rollback | Maintenance and drain | Roll app only if schema compatible; otherwise forward-fix |
 | Full voucher link exposure | Disable payment log surface | Restrict permissions, rotate access, preserve audit |
@@ -51,9 +51,9 @@ verification queries and reopening approval. Never paste tokens, cookies, databa
   proof of test completion.
 - Financial/Audit DLQ can be replayed but never discarded. Replay creates a new Outbox event and parent trace.
 - Surface permissions are configured and checked as a one-time precondition during setup. Runtime delivery failures are recorded as incidents; the bot never changes channel overwrites automatically.
-- Database restore is disaster-only for production. Stop the store, preserve the failed database and reconcile every credit.
-- If a migration fails after its pre-migration backup reached S3 but before `backup_runs` was written, do **not**
-  re-run DDL first. Use `npm run backup:reconcile` with deployment/backup credentials to verify the manifest and
-  object size, record the artifact, then select it for a restore drill or the forward-fix decision.
+- Database recovery is disaster-only for production. Stop the store, preserve the failed database and reconcile every credit.
+- Aiven-managed mode does not create S3 artifacts or a Questshop restore drill. Record the Aiven Console recovery
+  decision, the exact Git SHA and every ledger reconciliation before reopening. `backup:reconcile` applies only to
+  the optional `LOCAL_S3` compatibility mode.
 - Full voucher-link exposure requires disabling `LOG_PAYMENTS`, correcting access, preserving audit and reviewing viewers.
 - A user block never confiscates Wallet credit and never changes an active job unless Admin performs a separate audited action.

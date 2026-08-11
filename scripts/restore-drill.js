@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
 import pg from 'pg';
 import { v7 as uuidv7 } from 'uuid';
-import { loadEnvironment } from '../src/config/env.js';
+import { loadEnvironment, usesApplicationBackup } from '../src/config/env.js';
 import { downloadAndDecryptBackup } from '../src/adapters/s3/backup.js';
 import { withPostgresRootCertificate } from '../src/adapters/s3/postgres-tls.js';
 import { getRuntimePool, closePools, postgresSslOptions } from '../src/db/pools.js';
@@ -11,8 +11,8 @@ import { decryptSecret } from '../src/adapters/crypto/keyring.js';
 
 const { Pool } = pg;
 const env = loadEnvironment();
-if (env.BACKUP_ENABLED !== true) {
-  throw new Error('Backups are disabled; enable BACKUP_ENABLED before running scripts/restore-drill.js');
+if (!usesApplicationBackup(env)) {
+  throw new Error('Aiven-managed backup is active; Questshop cannot run a pg_restore drill');
 }
 const source = getRuntimePool(env);
 const backup = (await source.query("SELECT * FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1")).rows[0];

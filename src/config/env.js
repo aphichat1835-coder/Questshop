@@ -2,6 +2,10 @@ import { z } from 'zod';
 
 const snowflake = z.string().regex(/^\d{17,20}$/);
 const booleanText = z.enum(['true', 'false']).transform((value) => value === 'true');
+export const BACKUP_MODE = Object.freeze({
+  AIVEN_MANAGED: 'AIVEN_MANAGED',
+  LOCAL_S3: 'LOCAL_S3',
+});
 const keyringSchema = z.object({
   current: z.coerce.number().int().positive(),
   keys: z.record(z.string(), z.string().min(40)),
@@ -43,6 +47,9 @@ const environmentFields = {
   STATUS_TOKEN: z.string().min(32),
   DATABASE_POOL_URL: z.string().url(),
   DATABASE_DIRECT_URL: z.string().url(),
+  BACKUP_MODE: z.enum([BACKUP_MODE.AIVEN_MANAGED, BACKUP_MODE.LOCAL_S3]).optional(),
+  // BACKUP_ENABLED remains a compatibility switch for the legacy S3 backup
+  // path. New installs use Aiven-managed backups by default.
   BACKUP_ENABLED: booleanText.optional(),
   DATABASE_BACKUP_URL: z.string().url().optional(),
   DATABASE_RESTORE_URL: z.string().url().optional(),
@@ -78,8 +85,16 @@ function addEnvironmentIssue(ctx, message, path) {
   ctx.addIssue({ code: 'custom', ...(path ? { path } : {}), message });
 }
 
-function isBackupEnabled(value) {
-  return value.BACKUP_ENABLED ?? value.NODE_ENV === 'production';
+export function resolveBackupMode(value) {
+  const hasCompleteLocalBackupConfiguration = BACKUP_SETTING_KEYS
+    .every((key) => value[key] != null && value[key] !== '');
+  return value.BACKUP_MODE ?? (value.BACKUP_ENABLED === true || hasCompleteLocalBackupConfiguration
+    ? BACKUP_MODE.LOCAL_S3
+    : BACKUP_MODE.AIVEN_MANAGED);
+}
+
+export function usesApplicationBackup(value) {
+  return resolveBackupMode(value) === BACKUP_MODE.LOCAL_S3;
 }
 
 function validateRuntimeLimits(value, ctx) {
@@ -92,23 +107,31 @@ function validateRuntimeLimits(value, ctx) {
 }
 
 function validateBackupSettings(value, ctx, { requireRestore }) {
-  const backupEnabled = isBackupEnabled(value);
-  if (backupEnabled && BACKUP_SETTING_KEYS.some((key) => value[key] == null || value[key] === '')) {
-    addEnvironmentIssue(ctx, 'BACKUP_ENABLED=true requires backup database, S3 and encryption settings');
+  const backupMode = resolveBackupMode(value);
+  if (value.BACKUP_MODE === BACKUP_MODE.AIVEN_MANAGED && value.BACKUP_ENABLED === true) {
+    addEnvironmentIssue(ctx, 'BACKUP_MODE=AIVEN_MANAGED cannot be combined with BACKUP_ENABLED=true');
   }
-  if (requireRestore && backupEnabled && !value.DATABASE_RESTORE_URL) {
+  if (value.BACKUP_MODE === BACKUP_MODE.LOCAL_S3 && value.BACKUP_ENABLED === false) {
+    addEnvironmentIssue(ctx, 'BACKUP_MODE=LOCAL_S3 cannot be combined with BACKUP_ENABLED=false');
+  }
+  if (backupMode === BACKUP_MODE.LOCAL_S3 && BACKUP_SETTING_KEYS.some((key) => value[key] == null || value[key] === '')) {
+    addEnvironmentIssue(ctx, 'BACKUP_MODE=LOCAL_S3 requires backup database, S3 and encryption settings');
+  }
+  if (requireRestore && backupMode === BACKUP_MODE.LOCAL_S3 && !value.DATABASE_RESTORE_URL) {
     addEnvironmentIssue(ctx,
-      'DATABASE_RESTORE_URL is required for deployment and restore-drill tooling when backups are enabled',
+      'DATABASE_RESTORE_URL is required for deployment and restore-drill tooling with BACKUP_MODE=LOCAL_S3',
       ['DATABASE_RESTORE_URL']);
   }
-  return backupEnabled;
+  return backupMode;
 }
 
-function databaseUrlFields({ requireDirect, requireRestore, backupEnabled }) {
+function databaseUrlFields({ requireDirect, requireRestore, backupMode }) {
   return [
     'DATABASE_POOL_URL',
     ...(requireDirect ? ['DATABASE_DIRECT_URL'] : []),
-    ...(backupEnabled ? ['DATABASE_BACKUP_URL', ...(requireRestore ? ['DATABASE_RESTORE_URL'] : [])] : []),
+    ...(backupMode === BACKUP_MODE.LOCAL_S3
+      ? ['DATABASE_BACKUP_URL', ...(requireRestore ? ['DATABASE_RESTORE_URL'] : [])]
+      : []),
   ];
 }
 
@@ -127,8 +150,8 @@ function refineEnvironment(value, ctx, { requireDirect, requireRestore }) {
     addEnvironmentIssue(ctx, 'DATABASE_DIRECT_URL is required', ['DATABASE_DIRECT_URL']);
   }
   validateRuntimeLimits(value, ctx);
-  const backupEnabled = validateBackupSettings(value, ctx, { requireRestore });
-  validateDatabaseTls(value, ctx, { requireDirect, requireRestore, backupEnabled });
+  const backupMode = validateBackupSettings(value, ctx, { requireRestore });
+  validateDatabaseTls(value, ctx, { requireDirect, requireRestore, backupMode });
 }
 
 const schema = z.object(environmentFields)
@@ -144,16 +167,20 @@ const runtimeSchema = z.object(runtimeEnvironmentFields)
 let cached;
 let runtimeCached;
 
+function withResolvedBackupMode(parsed) {
+  return { ...parsed, BACKUP_MODE: resolveBackupMode(parsed) };
+}
+
 export function loadEnvironment(source = process.env) {
   if (source === process.env && cached) return cached;
-  const parsed = schema.parse(source);
+  const parsed = withResolvedBackupMode(schema.parse(source));
   if (source === process.env) cached = Object.freeze(parsed);
   return parsed;
 }
 
 export function loadRuntimeEnvironment(source = process.env) {
   if (source === process.env && runtimeCached) return runtimeCached;
-  const parsed = runtimeSchema.parse(source);
+  const parsed = withResolvedBackupMode(runtimeSchema.parse(source));
   if (source === process.env) runtimeCached = Object.freeze(parsed);
   return parsed;
 }

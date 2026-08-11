@@ -2,6 +2,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { createEncryptedBackup } from '../adapters/s3/backup.js';
 import { DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { createS3Client } from '../adapters/s3/client.js';
+import { usesApplicationBackup } from '../config/env.js';
 
 export async function pruneExpiredBackups({ env, pool }) {
   const expired = (await pool.query(`SELECT id,object_key,manifest FROM backup_runs
@@ -24,7 +25,7 @@ export async function pruneExpiredBackups({ env, pool }) {
 }
 
 export async function runScheduledBackup({ env, pool }) {
-  if (env.BACKUP_ENABLED === false || (env.BACKUP_ENABLED == null && env.NODE_ENV !== 'production')) return false;
+  if (!usesApplicationBackup(env)) return false;
   try { await pruneExpiredBackups({ env, pool }); }
   catch (error) {
     await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)

@@ -15,6 +15,7 @@ import { runRetention } from './retention-worker.js';
 import { rotateEncryptedRows } from './key-rotation-worker.js';
 import { evaluateAlerts } from './alert-worker.js';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { usesApplicationBackup } from '../config/env.js';
 
 async function gate(pool, name) {
   return (await pool.query('SELECT enabled FROM feature_gates WHERE gate = $1', [name])).rows[0]?.enabled === true;
@@ -117,10 +118,10 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
     start('quest-test', async () => (await gate(pool, 'QUEST_BACKGROUND_TESTING_ENABLED'))
       && testQuest({ env, pool, signal, holder: testHolder,
         runnerConcurrency: configuredRunnerConcurrency(client, env) }), 1_000);
-    start('backup', () => runScheduledBackup({ env, pool }), 60_000);
+    if (usesApplicationBackup(env)) start('backup', () => runScheduledBackup({ env, pool }), 60_000);
     start('retention', () => runRetention({ pool }), 60_000);
     start('key-rotation', async () => (await rotateEncryptedRows({ pool, env })) > 0, 60_000);
-    start('alerts', () => evaluateAlerts({ pool, health, eventLoopMonitor }), 60_000);
+    start('alerts', () => evaluateAlerts({ env, pool, health, eventLoopMonitor }), 60_000);
     start('maintenance', async () => {
       await runMaintenance({ env, holder: maintenanceHolder, client, pool,
         runnerConcurrency: configuredRunnerConcurrency(client, env) });

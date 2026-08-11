@@ -10,8 +10,9 @@ durable ใน PostgreSQL เพื่อให้กู้การทำงา
 
 > [!IMPORTANT]
 > สถานะปัจจุบันคือ **implemented-but-unverified**: โค้ดและ Automated tests มีหลักฐานครอบคลุม
-> แต่ยังห้ามเรียกว่า Production-ready จนกว่า Discord UAT, TrueMoney จริง, Managed PostgreSQL,
-> Backup/Restore drill และ Owner closeout จะผ่านบน Git SHA เดียวกัน
+> แต่ยังห้ามเรียกว่า Production-ready จนกว่า Discord UAT, TrueMoney จริง, Managed PostgreSQL
+> และ Owner closeout จะผ่านบน Git SHA เดียวกัน การกู้ข้อมูลของ Aiven เป็นขอบเขตภายนอกที่ Questshop
+> ไม่สามารถ Restore drill แทนผู้ให้บริการได้
 > [!WARNING]
 > ระบบ Quest ใช้ Discord user token/Self-bot behavior ซึ่งอาจขัดข้อกำหนดของ Discord และอาจทำให้
 > บัญชีถูกจำกัดหรือปิดใช้งาน เจ้าของระบบยอมรับความเสี่ยงนี้โดยชัดแจ้ง ผู้ติดตั้งต้องทบทวนข้อกำหนด
@@ -37,7 +38,7 @@ durable ใน PostgreSQL เพื่อให้กู้การทำงา
 - Admin panel แบบ Select menu สำหรับร้าน, ราคา, Promotion, Order, Wallet, Monitor, Receiver,
   Blocklist, Review, Backup และเหตุขัดข้อง
 - Transactional outbox, coalescing, bounded retry และ DLQ สำหรับการส่งข้อความ Discord
-- Health endpoints, encrypted S3-compatible backup, restore drill, retention และ key-version coverage
+- Health endpoints, Aiven-managed database-backup policy, retention และ key-version coverage
 
 ## พฤติกรรมที่ตั้งใจไว้
 
@@ -113,7 +114,7 @@ Discord handler มีหน้าที่ Validate/Acknowledge แล้วเ
 - PostgreSQL 16+
 - Discord application/bot และ Production Guild หนึ่งแห่ง
 - Production URL ต้องใช้ `sslmode=verify-full`; ระบุ TLS CA ได้เมื่อผู้ให้บริการใช้ private CA
-- S3-compatible storage และ `pg_dump`/`pg_restore` เมื่อเปิด Backup
+- Aiven for PostgreSQL (แผน Free รองรับ Backup โดยผู้ให้บริการ); S3/`pg_dump` ใช้เฉพาะโหมด Local S3 แบบ legacy
 - หน่วยความจำเป้าหมาย 512 MB; RSS gate ต่ำกว่า 400 MB
 
 Dependencies หลักถูก Pin ใน [package.json](package.json): `discord.js 14.27.0`, `pg 8.22.0`,
@@ -143,7 +144,8 @@ npm start
 ```
 
 `npm run deploy` เป็นเจ้าของ Migration และ Command registration เพียงทางเดียว หาก Production มี schema เดิม
-และมี Migration ใหม่ ขั้นตอนนี้ต้องสร้างและตรวจ Pre-migration backup สำเร็จก่อนจึงจะเขียน Schema ต่อ
+และมี Migration ใหม่ ระบบจะบันทึก Audit ว่าใช้ Aiven-managed backup พร้อม Git SHA โดยไม่กล่าวอ้างว่า
+Questshop ตรวจ Backup หรือ Restore สำเร็จ
 ส่วน `npm start` ใช้เฉพาะ Runtime pooled credential, ตรวจเพียง schema compatibility แบบ read-only และจะปฏิเสธ
 การเริ่มระบบหากยังไม่ได้รัน Deployment step
 
@@ -165,7 +167,7 @@ npm run dev
 | `DISCORD_CLIENT_ID` | Discord Application ID |
 | `DISCORD_GUILD_ID` | Server ID ที่ใช้เปิดร้าน |
 | `OWNER_ID` | Discord User ID ของเจ้าของร้าน |
-| `DATABASE_POOL_URL` | PostgreSQL pooled URL ของ Runtime role |
+| `DATABASE_POOL_URL` | URL ของ Runtime role สำหรับ Node `pg` pool ในบอท (บน Aiven Free ใช้ URL จาก Aiven โดยตรง ไม่ได้มี PgBouncer ของ Aiven) |
 | `DATABASE_DIRECT_URL` | PostgreSQL direct URL ของ Migration role |
 
 `DATABASE_SSL_CA_INPUT` เป็นค่าทางเลือก: ใส่พาธไฟล์ CA PEM หรือ Base64 เฉพาะเมื่อ certificate ของผู้ให้บริการ
@@ -176,9 +178,8 @@ npm run dev
 - `STATUS_TOKEN`
 - `DATA_ENCRYPTION_KEYS_JSON`
 - `VOUCHER_HMAC_KEYS_JSON`
-- `BACKUP_ENCRYPTION_KEYS_JSON`
 - `DATABASE_SSL_CA_BASE64`
-- `BACKUP_ENABLED=false` สำหรับการเริ่มติดตั้ง
+- `BACKUP_MODE=AIVEN_MANAGED` สำหรับการเริ่มติดตั้ง
 - Default ของ Port, Timezone, Pre-launch, Runner concurrency และ Discord client fingerprint
 
 Setup เป็น idempotent: การรันซ้ำจะใช้ Secret เดิม ไม่ Rotate หรือสร้าง Key ใหม่ทับข้อมูลที่เข้ารหัสไว้
@@ -191,11 +192,14 @@ Production deployment ต้องส่ง `GIT_SHA` ที่เป็น comm
 > `.env` คือ Secret ถาวรของร้าน ต้องสำรองเข้า Secret manager ที่ปลอดภัย ห้าม Commit, ส่งในแชต,
 > ใส่ Docker image หรือปล่อยหายเมื่อ Redeploy หาก Key สูญหาย Token/Receiver เดิมอาจถอดรหัสไม่ได้
 
-### เปิด Backup ภายหลัง
+### Backup ของ Aiven และ Local S3 แบบ legacy
 
-Setup ปิด Backup ไว้ก่อนเพื่อให้เปิดบอทได้โดยไม่ต้องมี S3 หากจะผ่าน Production gate ต้องเพิ่ม
+ค่าเริ่มต้นใช้ `BACKUP_MODE=AIVEN_MANAGED`: inwcloud ไม่ต้องมี PostgreSQL client, `pg_dump`, `pg_restore`, S3 หรือ
+Backup key เพิ่ม เพราะ Aiven เป็นผู้สำรองฐานข้อมูลอัตโนมัติเอง
+
+หากในอนาคตต้องการกลับไปใช้ Backup ของ Questshop เอง ให้เปลี่ยนเป็น `BACKUP_MODE=LOCAL_S3` และเพิ่ม
 `DATABASE_BACKUP_URL`, `DATABASE_RESTORE_URL`, `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`,
-`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` แล้วเปลี่ยน `BACKUP_ENABLED=true`
+`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` และ `BACKUP_ENCRYPTION_KEYS_JSON`
 
 ค่า S3 และ Database URL เหล่านี้สร้างอัตโนมัติไม่ได้ เพราะต้องมาจากผู้ให้บริการภายนอก
 
@@ -311,6 +315,11 @@ CI ตรวจ Syntax, ESLint, PostgreSQL tests, 2× capacity load test, `npm a
 
 ## Backup และ Restore
 
+ค่าเริ่มต้นของ Questshop คือ Aiven-managed backup: ระบบบอทไม่สร้างไฟล์ Backup เอง และหน้า Admin จะแสดง
+สถานะนี้อย่างชัดเจน การกู้คืนต้องทำผ่าน Aiven Console ตามขีดจำกัดของแผนที่ใช้งาน
+
+คำสั่งด้านล่างมีไว้เฉพาะ `BACKUP_MODE=LOCAL_S3`:
+
 ```bash
 npm run backup
 npm run backup:reconcile
@@ -325,8 +334,8 @@ Payment, Queue, Outbox และ Crypto แล้วลบฐานข้อม�
 `npm run backup:reconcile` จาก deployment/DR environment เพื่ออ่าน Manifest ที่ยืนยันแล้วบน S3 กลับเข้า
 `backup_runs` ก่อน Restore drill; Runtime bot ปกติไม่มี Restore credential.
 
-Migration จะไม่เริ่มเมื่อ Pre-migration backup ที่จำเป็นล้มเหลว อ่านขั้นตอนเหตุฉุกเฉินได้ที่
-[docs/runbooks/README.md](docs/runbooks/README.md)
+ใน Aiven-managed mode Migration จะมี Audit ว่าไม่ได้สร้าง Local backup; จึงห้ามตีความว่า Questshop
+ยืนยันความพร้อมกู้คืนของ Aiven แล้ว
 
 ## ขอบเขต v1
 

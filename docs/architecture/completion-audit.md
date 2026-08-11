@@ -55,8 +55,8 @@ Monitor route handlers in `discord/interactions/router.js`, and
 
 The Owner enters six required external values the application cannot safely invent: Discord Bot/Application/
 Guild/Owner identity and PostgreSQL Runtime/Direct URLs. A private PostgreSQL CA is optional. `npm run setup` creates the
-Status token and independent Data/Voucher/Backup keys once, normalizes the CA, writes `.env` atomically with
-mode `0600`, and defaults Backup off until external S3/Restore credentials exist. Re-running setup preserves
+Status token and independent Data/Voucher keys once, normalizes the CA, writes `.env` atomically with
+mode `0600`, and defaults to Aiven-managed backup. Re-running setup preserves
 the durable secrets and rejects conflicting process-level keys rather than silently rotating encrypted data.
 Runtime loads only its scoped values and does not require the Migration URL; stateless deployments must use
 separate runtime and deployment secret bundles from durable secret storage.
@@ -81,6 +81,20 @@ The test database was a disposable local PostgreSQL container.  It is evidence f
 contracts, not evidence for a managed production service.
 
 ## Final Decision-Complete plan
+
+### Later Owner infrastructure decision — Aiven-managed database backup
+
+Production runs the Node.js bot on inwcloud and PostgreSQL on Aiven Free. Aiven owns database backup and
+disaster-recovery behavior; Questshop must not invoke `pg_dump`, `pg_restore`, S3 backup upload, or claim that it
+performed a restore drill. `BACKUP_MODE=AIVEN_MANAGED` is the setup default. A pending production migration records
+an append-only `DEPLOYMENT_BACKUP_POLICY` audit tied to the Git SHA with `NOT_APP_VERIFIED`, then proceeds.
+Backup-stale/restore-drill alerts and the local backup worker are disabled only in this mode. Since a provider backup
+can contain ciphertext from an earlier snapshot that Questshop cannot inspect, Data/Voucher key retirement remains
+blocked; retain old key versions rather than pretending they are safe to remove.
+
+Implementation: `src/config/env.js`, deployment migrations, worker manager/alerts, Admin backup panel,
+`scripts/verify-key-retirement.js`, and Aiven-policy regression tests. Live Aiven Console verification remains
+required and is not replaced by source tests.
 
 | Plan section | Source/test evidence | Status and remaining boundary |
 |---|---|---|

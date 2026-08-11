@@ -17,6 +17,7 @@ function databaseUrl(role) {
 function backupSettings() {
   return {
     BACKUP_ENABLED: 'true', DATABASE_BACKUP_URL: databaseUrl('backup'),
+    DATABASE_RESTORE_URL: databaseUrl('restore'),
     S3_ENDPOINT: new URL('/questshop-backups', 'https://s3.example.invalid').toString(),
     S3_BUCKET: 'questshop-backups', S3_ACCESS_KEY_ID: ['access', 'key'].join('-'),
     S3_SECRET_ACCESS_KEY: ['test', 'secret'].join('-'),
@@ -34,15 +35,17 @@ const base = {
   VOUCHER_HMAC_KEYS_JSON: JSON.stringify({ current: 1, keys: { 1: key } }),
 };
 
-test('backup settings can be explicitly disabled without requiring S3 and backup database secrets', () => {
+test('Aiven-managed backup is the default and does not require pg_dump, S3, or restore secrets', () => {
   const env = loadEnvironment({ ...base, BACKUP_ENABLED: 'false' });
   assert.equal(env.BACKUP_ENABLED, false);
+  assert.equal(env.BACKUP_MODE, 'AIVEN_MANAGED');
   assert.equal(env.DATABASE_BACKUP_URL, undefined);
 });
 
 test('runtime configuration neither requires nor retains deployment/restore credentials and defaults concurrency to two', () => {
   const { DATABASE_DIRECT_URL: _migrationUrl, DATABASE_RESTORE_URL: _restoreUrl, ...runtimeBase } = base;
   const env = loadRuntimeEnvironment({ ...runtimeBase, BACKUP_ENABLED: 'false' });
+  assert.equal(env.BACKUP_MODE, 'AIVEN_MANAGED');
   assert.equal(env.DATABASE_DIRECT_URL, undefined);
   assert.equal(env.DATABASE_RESTORE_URL, undefined);
   assert.equal(env.RUNNER_CONCURRENCY, 2);
@@ -50,18 +53,31 @@ test('runtime configuration neither requires nor retains deployment/restore cred
 });
 
 test('runtime backup needs no restore credential while deployment tooling does', () => {
-  const backup = backupSettings();
+  const { DATABASE_RESTORE_URL: _restore, ...backup } = backupSettings();
   assert.equal(loadRuntimeEnvironment({ ...base, ...backup }).DATABASE_RESTORE_URL, undefined);
   assert.throws(() => loadEnvironment({ ...base, ...backup }), /DATABASE_RESTORE_URL/);
 });
 
-test('non-production defaults backups off when no backup settings are supplied', () => {
+test('legacy BACKUP_ENABLED=true selects the local S3 backup compatibility mode', () => {
+  const env = loadEnvironment({ ...base, ...backupSettings() });
+  assert.equal(env.BACKUP_MODE, 'LOCAL_S3');
+});
+
+test('complete legacy S3 settings remain local even when the old boolean was omitted', () => {
+  const { BACKUP_ENABLED: _enabled, ...legacySettings } = backupSettings();
+  const env = loadEnvironment({ ...base, ...legacySettings });
+  assert.equal(env.BACKUP_MODE, 'LOCAL_S3');
+});
+
+test('non-production defaults to Aiven-managed backups when no local settings are supplied', () => {
   const env = loadEnvironment({ ...base, NODE_ENV: 'development' });
   assert.equal(env.BACKUP_ENABLED, undefined);
+  assert.equal(env.BACKUP_MODE, 'AIVEN_MANAGED');
 });
 
 test('enabled backup settings fail as configuration validation when incomplete', () => {
-  assert.throws(() => loadEnvironment({ ...base, BACKUP_ENABLED: 'true' }), /BACKUP_ENABLED=true requires/);
+  assert.throws(() => loadEnvironment({ ...base, BACKUP_MODE: 'LOCAL_S3' }), /BACKUP_MODE=LOCAL_S3 requires/);
+  assert.throws(() => loadEnvironment({ ...base, BACKUP_MODE: 'AIVEN_MANAGED', BACKUP_ENABLED: 'true' }), /cannot be combined/);
 });
 
 test('boolean configuration rejects typos instead of silently disabling a safety feature', () => {

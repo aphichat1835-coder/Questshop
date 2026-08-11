@@ -1,12 +1,12 @@
 import '../src/config/load-local-environment.js';
 import { GetObjectCommand, HeadObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
-import { loadEnvironment } from '../src/config/env.js';
+import { loadEnvironment, usesApplicationBackup } from '../src/config/env.js';
 import { createS3Client } from '../src/adapters/s3/client.js';
 import { closeDirectPool, getDirectPool } from '../src/db/pools.js';
 
 const env = loadEnvironment();
-if (env.BACKUP_ENABLED !== true) {
-  throw new Error('Backups are disabled; enable BACKUP_ENABLED before running scripts/reconcile-backups.js');
+if (!usesApplicationBackup(env)) {
+  throw new Error('Aiven-managed backup is active; Questshop S3 backup reconciliation is unavailable');
 }
 
 function validManifest(value) {

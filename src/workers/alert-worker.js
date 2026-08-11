@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { v7 as uuidv7 } from 'uuid';
 import { RUNNER_VERSION_COMPATIBILITY, isRunnerVersionCompatible } from '../config/versions.js';
+import { usesApplicationBackup } from '../config/env.js';
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -45,7 +46,18 @@ async function collectRuntimeMetrics(pool, eventLoopMonitor) {
   return { rssBytes, memoryLimit, memoryPercent, eventLoopLagMs };
 }
 
-async function collectAlertSnapshot(pool) {
+async function collectAlertSnapshot(pool, { applicationBackupEnabled }) {
+  const noApplicationBackupQuery = Promise.resolve({ rows: [] });
+  const [backupResult, restoreResult, backupCorruptionResult, restoreFailureResult] = applicationBackupEnabled
+    ? [
+      pool.query("SELECT EXTRACT(EPOCH FROM clock_timestamp()-completed_at)*1000 AS age_ms FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
+      pool.query("SELECT EXTRACT(EPOCH FROM clock_timestamp()-completed_at)*1000 AS age_ms FROM restore_drills WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
+      pool.query(`SELECT count(*)::integer AS count FROM backup_runs WHERE state='FAILED'
+        AND error_code~*'(checksum|auth|corrupt)' AND completed_at>=clock_timestamp()-interval '30 days'`),
+      pool.query(`SELECT count(*)::integer AS count FROM restore_drills WHERE state='FAILED'
+        AND completed_at>=clock_timestamp()-interval '35 days'`),
+    ]
+    : [noApplicationBackupQuery, noApplicationBackupQuery, noApplicationBackupQuery, noApplicationBackupQuery];
   const [financial, queue, scheduler, outbox, errors, backup, restore, backupCorruption, restoreFailure,
     counts, gates, activeVersions, slo] = await Promise.all([
     pool.query(`SELECT (SELECT count(*)::integer FROM wallets WHERE available_cents<0 OR reserved_cents<0) AS negative,
@@ -68,12 +80,7 @@ async function collectAlertSnapshot(pool) {
       AND GREATEST(created_at,available_at)<clock_timestamp()-interval '5 minutes'`),
     pool.query(`SELECT count(*)::integer AS total,count(*) FILTER (WHERE outcome<>'SUCCESS')::integer AS failed
       FROM operation_metrics WHERE created_at>=clock_timestamp()-interval '5 minutes'`),
-    pool.query("SELECT EXTRACT(EPOCH FROM clock_timestamp()-completed_at)*1000 AS age_ms FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
-    pool.query("SELECT EXTRACT(EPOCH FROM clock_timestamp()-completed_at)*1000 AS age_ms FROM restore_drills WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
-    pool.query(`SELECT count(*)::integer AS count FROM backup_runs WHERE state='FAILED'
-      AND error_code~*'(checksum|auth|corrupt)' AND completed_at>=clock_timestamp()-interval '30 days'`),
-    pool.query(`SELECT count(*)::integer AS count FROM restore_drills WHERE state='FAILED'
-      AND completed_at>=clock_timestamp()-interval '35 days'`),
+    backupResult, restoreResult, backupCorruptionResult, restoreFailureResult,
     pool.query(`SELECT (SELECT count(*)::integer FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')) AS queue,
       (SELECT count(*)::integer FROM outbox_events WHERE state IN ('PENDING','LEASED','RETRY_WAIT')) AS outbox,
       (SELECT count(*)::integer FROM manual_reviews WHERE state<>'RESOLVED') AS reviews,
@@ -99,9 +106,10 @@ async function collectAlertSnapshot(pool) {
       FROM operation_metrics`),
   ]);
   return { invariant: financial.rows[0], queue: queue.rows[0], scheduler: scheduler.rows[0], outbox: outbox.rows[0], errors: errors.rows[0],
-    backupAgeMs: backup.rows[0]?.age_ms == null ? Infinity : Number(backup.rows[0].age_ms),
-    restoreAgeMs: restore.rows[0]?.age_ms == null ? Infinity : Number(restore.rows[0].age_ms),
-    backupCorruption: Number(backupCorruption.rows[0].count), restoreFailure: Number(restoreFailure.rows[0].count),
+    applicationBackupEnabled,
+    backupAgeMs: backup.rows[0]?.age_ms == null ? null : Number(backup.rows[0].age_ms),
+    restoreAgeMs: restore.rows[0]?.age_ms == null ? null : Number(restore.rows[0].age_ms),
+    backupCorruption: Number(backupCorruption.rows[0]?.count ?? 0), restoreFailure: Number(restoreFailure.rows[0]?.count ?? 0),
     counts: counts.rows[0], gates: gates.rows, activeVersions: activeVersions.rows, slo: slo.rows[0] };
 }
 
@@ -155,13 +163,14 @@ async function applyOperationalAlerts(pool, snapshot, health, runtime) {
   await setIncident(pool, { code: 'OUTBOX_STUCK', scope: 'DISCORD', active: snapshot.outbox.stuck > 0, severity: 'ERROR', evidence: snapshot.outbox });
   const errorRateHigh = snapshot.errors.total >= 20 && snapshot.errors.failed / snapshot.errors.total >= 0.05;
   await setIncident(pool, { code: 'ERROR_RATE_HIGH', scope: 'OPERATIONS', active: errorRateHigh, severity: 'ERROR', evidence: snapshot.errors });
-  await setIncident(pool, { code: 'BACKUP_STALE', scope: 'DATABASE', active: snapshot.backupAgeMs > 26 * HOUR_MS,
-    severity: 'ERROR', evidence: { ageMs: Number.isFinite(snapshot.backupAgeMs) ? snapshot.backupAgeMs : null } });
-  await setIncident(pool, { code: 'RESTORE_DRILL_STALE', scope: 'DATABASE', active: snapshot.restoreAgeMs > 35 * DAY_MS,
-    severity: 'ERROR', evidence: { ageMs: Number.isFinite(snapshot.restoreAgeMs) ? snapshot.restoreAgeMs : null } });
-  await setIncident(pool, { code: 'BACKUP_CORRUPTION', scope: 'DATABASE', active: snapshot.backupCorruption > 0,
+  const backupChecks = snapshot.applicationBackupEnabled;
+  await setIncident(pool, { code: 'BACKUP_STALE', scope: 'DATABASE', active: backupChecks && snapshot.backupAgeMs > 26 * HOUR_MS,
+    severity: 'ERROR', evidence: { ageMs: snapshot.backupAgeMs } });
+  await setIncident(pool, { code: 'RESTORE_DRILL_STALE', scope: 'DATABASE', active: backupChecks && snapshot.restoreAgeMs > 35 * DAY_MS,
+    severity: 'ERROR', evidence: { ageMs: snapshot.restoreAgeMs } });
+  await setIncident(pool, { code: 'BACKUP_CORRUPTION', scope: 'DATABASE', active: backupChecks && snapshot.backupCorruption > 0,
     severity: 'CRITICAL', evidence: { count: snapshot.backupCorruption } });
-  await setIncident(pool, { code: 'RESTORE_DRILL_FAILED', scope: 'DATABASE', active: snapshot.restoreFailure > 0,
+  await setIncident(pool, { code: 'RESTORE_DRILL_FAILED', scope: 'DATABASE', active: backupChecks && snapshot.restoreFailure > 0,
     severity: 'CRITICAL', evidence: { count: snapshot.restoreFailure } });
   const staleWorkers = Object.entries(health.workers).filter(([, worker]) => worker.lastTick
     && Date.now() - Date.parse(worker.lastTick) > 120_000).map(([name]) => name);
@@ -203,16 +212,17 @@ function resolveHealthStatus({ financialBroken, health, snapshot }) {
   return 'HEALTHY';
 }
 
-export async function evaluateAlerts({ pool, health, eventLoopMonitor = null }) {
+export async function evaluateAlerts({ pool, health, env = { BACKUP_ENABLED: true }, eventLoopMonitor = null }) {
   const runtime = await collectRuntimeMetrics(pool, eventLoopMonitor);
-  const snapshot = await collectAlertSnapshot(pool);
+  const snapshot = await collectAlertSnapshot(pool, { applicationBackupEnabled: usesApplicationBackup(env) });
   await protectVersionCompatibility(pool, snapshot);
   const financialBroken = await applyFinancialAlerts(pool, snapshot.invariant);
   await applyOperationalAlerts(pool, snapshot, health, runtime);
   health.overview = { ...snapshot.counts, queueSoftLimit: 400, queueHardLimit: 500,
     gates: Object.fromEntries(snapshot.gates.map((row) => [row.gate, { enabled: row.enabled, version: Number(row.version) }])),
-    backupAgeMs: Number.isFinite(snapshot.backupAgeMs) ? snapshot.backupAgeMs : null,
-    restoreAgeMs: Number.isFinite(snapshot.restoreAgeMs) ? snapshot.restoreAgeMs : null,
+    backupMode: snapshot.applicationBackupEnabled ? 'LOCAL_S3' : 'AIVEN_MANAGED',
+    backupAgeMs: snapshot.backupAgeMs,
+    restoreAgeMs: snapshot.restoreAgeMs,
     memoryRssBytes: runtime.rssBytes, memoryLimitBytes: runtime.memoryLimit, memoryPercent: runtime.memoryPercent,
     eventLoopLagP99Ms: runtime.eventLoopLagMs,
     slo: {

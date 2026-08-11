@@ -17,12 +17,11 @@ const GENERATED_FIELDS = Object.freeze([
   'STATUS_TOKEN',
   'DATA_ENCRYPTION_KEYS_JSON',
   'VOUCHER_HMAC_KEYS_JSON',
-  'BACKUP_ENCRYPTION_KEYS_JSON',
 ]);
 
 const SETUP_ONLY_FIELDS = Object.freeze(['DATABASE_SSL_CA_INPUT', 'DATABASE_SSL_CA_PATH']);
 const OPTIONAL_RUNTIME_FIELDS = Object.freeze([
-  'NODE_ENV', 'PORT', 'TIMEZONE', 'PRELAUNCH',
+  'NODE_ENV', 'PORT', 'TIMEZONE', 'PRELAUNCH', 'BACKUP_MODE', 'BACKUP_ENABLED',
   'DATABASE_BACKUP_URL', 'DATABASE_RESTORE_URL', 'PG_DUMP_PATH', 'PG_RESTORE_PATH',
   'S3_ENDPOINT', 'S3_REGION', 'S3_BUCKET', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY',
   'S3_FORCE_PATH_STYLE', 'RUNNER_CONCURRENCY', 'RUNNER_CONCURRENCY_HARD_MAX', 'GIT_SHA',
@@ -89,7 +88,6 @@ export function createAutomaticValues({ randomBytesFunction = randomBytes } = {}
     STATUS_TOKEN: randomBytesFunction(32).toString('hex'),
     DATA_ENCRYPTION_KEYS_JSON: createKeyring(randomBytesFunction),
     VOUCHER_HMAC_KEYS_JSON: createKeyring(randomBytesFunction),
-    BACKUP_ENCRYPTION_KEYS_JSON: createKeyring(randomBytesFunction),
   };
 }
 
@@ -159,7 +157,8 @@ export async function completeSetupValues({ fileValues = {}, processValues = pro
   if (certificateInput) {
     updates.DATABASE_SSL_CA_BASE64 = await resolveCertificateBase64(certificateInput, { readFileFunction });
   }
-  updates.BACKUP_ENABLED = pickNonempty(effective.BACKUP_ENABLED, 'false');
+  updates.BACKUP_MODE = pickNonempty(effective.BACKUP_MODE,
+    effective.BACKUP_ENABLED === 'true' ? 'LOCAL_S3' : 'AIVEN_MANAGED');
 
   const candidate = { ...fileValues, ...processValues, ...updates };
   for (const key of SETUP_ONLY_FIELDS) delete candidate[key];

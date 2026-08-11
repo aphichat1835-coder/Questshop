@@ -14,6 +14,10 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Added
 
+- Aiven-managed database-backup policy: first-run setup defaults to `BACKUP_MODE=AIVEN_MANAGED`, deployment records
+  a SHA-bound `DEPLOYMENT_BACKUP_POLICY` audit without falsely claiming a local backup/restore verification, and
+  Admin/health surfaces disclose the provider boundary.
+
 - Forward-only migration guard สำหรับ active Monitor test batch ที่ยังไม่มี contract hash, คำสั่งตรวจความพร้อม
   retire Data/Voucher/Backup Key version และ regression coverage สำหรับ Quest start window/Payment Log privacy
 
@@ -22,7 +26,7 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 - Questshop runtime แบบ Single Guild บน Node.js 22, discord.js และ PostgreSQL 16+
 - First-run `npm run setup` ที่ถาม 6 ค่าบังคับสำหรับ Discord/Database และรับ CA เป็นค่าทางเลือก แล้วสร้าง Status token,
-  keyrings สามชุด, normalized CA และค่าเริ่มต้นลง `.env` permission `0600` แบบ idempotent
+  Data/Voucher keyrings, normalized CA และค่าเริ่มต้นลง `.env` permission `0600` แบบ idempotent
 - Durable Wallet/Ledger, per-item reservation, Capture/Release, Refund และ Compensating adjustment
 - TrueMoney Gift Direct adapter พร้อม URL allowlist, Voucher HMAC, Receiver snapshot, exact-cent parsing,
   bounded retry, circuit breaker และ Owner-only ambiguous review
@@ -47,6 +51,11 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 - Automated unit, PostgreSQL integration, concurrency, crash, security, contract, recovery และ load tests
 
 ### Changed
+
+- inwcloud runtime no longer starts the Questshop `pg_dump`/S3 backup worker or local Backup alerts in
+  Aiven-managed mode. Local S3 backup remains an explicit `BACKUP_MODE=LOCAL_S3` compatibility path. Key retirement
+  is deliberately blocked in Aiven-managed mode because provider snapshots cannot be inspected or restore-drilled by
+  Questshop.
 
 - Hardened Runtime credential loading, Discord startup/shutdown cleanup, Quest response-body deadlines,
   Runner retry evidence, Monitor fencing, backup reconciliation และ destructive test-database safeguards

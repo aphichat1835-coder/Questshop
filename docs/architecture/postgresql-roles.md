@@ -8,8 +8,8 @@
   Grant only `EXECUTE` on `questshop_prune_wallet_ledger(timestamptz, integer)` and
   `questshop_prune_operational_details(timestamptz, timestamptz, integer)` for controlled retention;
   both `SECURITY DEFINER` functions cap each batch at 500, and Ledger pruning creates a checkpoint first.
-- `questshop_backup`: read-only access required by `pg_dump`, with no application writes.
-- `questshop_restore`: direct administrative connection restricted to restore drills and disaster recovery.
+- `questshop_backup` and `questshop_restore` are required only for the optional `BACKUP_MODE=LOCAL_S3`
+  compatibility path. The default Aiven-managed deployment does not provide these credentials to Questshop.
 
-All four URLs require TLS `verify-full`. Provision grants outside application migrations because managed
+Runtime and Migration URLs require TLS `verify-full`. Provision grants outside application migrations because managed
 providers own role creation. Verify effective grants before opening any feature gate and after role rotation.

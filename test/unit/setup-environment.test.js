@@ -42,19 +42,19 @@ function deterministicRandom() {
   return (size) => Buffer.alloc(size, ++value);
 }
 
-test('first-run setup creates distinct persistent secrets and safe defaults', async () => {
+test('first-run setup creates the persistent secrets it needs and selects Aiven-managed backups', async () => {
   const result = await completeSetupValues({
     fileValues: external,
     processValues: {},
     randomBytesFunction: deterministicRandom(),
   });
   assert.deepEqual(result.missing, []);
-  assert.equal(result.validated.BACKUP_ENABLED, false);
+  assert.equal(result.validated.BACKUP_MODE, 'AIVEN_MANAGED');
   assert.equal(result.generated.STATUS_TOKEN.length, 64);
   const data = JSON.parse(result.generated.DATA_ENCRYPTION_KEYS_JSON).keys['1'];
   const voucher = JSON.parse(result.generated.VOUCHER_HMAC_KEYS_JSON).keys['1'];
-  const backup = JSON.parse(result.generated.BACKUP_ENCRYPTION_KEYS_JSON).keys['1'];
-  assert.equal(new Set([data, voucher, backup]).size, 3);
+  assert.equal(new Set([data, voucher]).size, 2);
+  assert.equal(result.generated.BACKUP_ENCRYPTION_KEYS_JSON, undefined);
   assert.equal(Buffer.from(result.generated.DATABASE_SSL_CA_BASE64, 'base64').toString(), certificate.trim());
 });
 
@@ -75,7 +75,6 @@ test('re-running setup preserves existing secret values without generating repla
   assert.equal(second.generated.STATUS_TOKEN, first.generated.STATUS_TOKEN);
   assert.equal(second.generated.DATA_ENCRYPTION_KEYS_JSON, first.generated.DATA_ENCRYPTION_KEYS_JSON);
   assert.equal(second.generated.VOUCHER_HMAC_KEYS_JSON, first.generated.VOUCHER_HMAC_KEYS_JSON);
-  assert.equal(second.generated.BACKUP_ENCRYPTION_KEYS_JSON, first.generated.BACKUP_ENCRYPTION_KEYS_JSON);
 });
 
 test('setup rejects a process-level key conflict instead of rotating durable secrets', async () => {
@@ -97,7 +96,6 @@ function createOverrideValues() {
     STATUS_TOKEN: 'f'.repeat(64),
     DATA_ENCRYPTION_KEYS_JSON: keyring,
     VOUCHER_HMAC_KEYS_JSON: keyring,
-    BACKUP_ENCRYPTION_KEYS_JSON: keyring,
   };
 }
 
@@ -127,10 +125,10 @@ test('environment writer updates keys atomically with owner-only permissions', a
 
 test('environment text upsert preserves unrelated comments and settings', () => {
   const result = upsertEnvironmentText('# keep\nPORT=4000\n', {
-    BACKUP_ENABLED: 'false',
+    BACKUP_MODE: 'AIVEN_MANAGED',
   });
   assert.match(result, /^# keep\nPORT=4000/m);
-  assert.match(result, /BACKUP_ENABLED=false/);
+  assert.match(result, /BACKUP_MODE=AIVEN_MANAGED/);
 });
 
 test('environment parsing preserves export-prefixed assignments', () => {

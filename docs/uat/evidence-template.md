@@ -23,7 +23,7 @@ migration or configuration deployment changes it.
 ## Preconditions
 
 - [ ] Customer feature gates are closed; only Owner/Admin may use UAT routes.
-- [ ] Managed PostgreSQL TLS uses `verify-full`; direct/runtime/backup/restore
+- [ ] Managed PostgreSQL TLS uses `verify-full`; direct/runtime Aiven URLs and roles
       roles are distinct and runtime has no DDL privilege.
 - [ ] Private log rooms deny `@everyone`; the bot has the expected permissions.
 - [ ] Receiver version, monitor account and keyring health are valid; record
@@ -65,7 +65,7 @@ code.  Do not record a Discord user token.
 
 | Case | Backup / Incident / Trace ID | Expected outcome | Observed outcome | Owner approval |
 |---|---|---|---|---|
-| Encrypted S3 backup | | upload + manifest verification | | |
+| Aiven provider-managed backup | | Aiven Console status + plan limitation recorded | | |
 | Restore drill to temporary managed DB | | schema/ledger/reservation/payment/queue/outbox/crypto checks pass | | |
 | Runtime restart recovery | | leases, queue, runner, payment, outbox and reviews recover | | |
 | Alert delivery | | financial and infrastructure alert reaches Owner | | |

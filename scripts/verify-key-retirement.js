@@ -14,8 +14,17 @@ if (dataVersion === env.DATA_ENCRYPTION_KEYS_JSON.current || voucherVersion === 
   throw new Error('The active key version cannot be retired');
 }
 
-const pool = getDirectPool(env);
-try {
+if (env.BACKUP_MODE === 'AIVEN_MANAGED') {
+  // Aiven owns backups that Questshop cannot enumerate or restore-test. A
+  // provider snapshot can still contain rows encrypted/HMACed by an older
+  // version, so removing any old key would make an emergency restore unsafe.
+  console.log(JSON.stringify({ ok: false, backupMode: env.BACKUP_MODE,
+    next: 'Keep retired key versions: Aiven-managed backups cannot be inspected or restore-drilled by Questshop.' }));
+  process.exitCode = 2;
+} else {
+
+  const pool = getDirectPool(env);
+  try {
   const [dataReferences, voucherReferences, backupReferences, restore] = await Promise.all([
     Number.isInteger(dataVersion) ? pool.query(`SELECT count(*)::integer AS count FROM (
       SELECT key_version AS version FROM checkout_credentials
@@ -50,6 +59,7 @@ try {
       ? 'Remove the retired version from durable secret storage, redeploy, then run setup-preflight.'
       : 'Re-encrypt remaining data, wait for voucher retention/reviews and old backups to clear, then complete a restore drill.' }));
   if (!ready) process.exitCode = 2;
-} finally {
-  await closeDirectPool();
+  } finally {
+    await closeDirectPool();
+  }
 }

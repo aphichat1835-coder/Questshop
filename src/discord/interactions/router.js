@@ -114,13 +114,14 @@ function normalizedChoice(value, aliases) {
   const normalized = String(value).trim().toUpperCase();
   return aliases[normalized] ?? normalized;
 }
-function latestBackupTime(rows) {
-  const completedAt = rows[0]?.completed_at;
-  return typeof completedAt?.toISOString === 'function' ? completedAt.toISOString() : 'ยังไม่มี';
-}
 function websocketPing(client) {
   const ping = client.ws?.ping;
   return Number.isFinite(ping) && ping >= 0 ? `${ping} ms` : 'กำลังเชื่อมต่อ';
+}
+function displayedBackupStatus(overview) {
+  if (overview.backupMode === 'AIVEN_MANAGED') return 'Aiven ดูแล Backup อัตโนมัติ';
+  if (overview.backupAgeMs == null) return 'สำรองล่าสุด: ยังไม่มี';
+  return `สำรองล่าสุด: ${Math.floor(overview.backupAgeMs / 3_600_000)} ชม. ก่อน`;
 }
 function overviewRuntimeMetrics(interaction, runtime) {
   const health = runtime.health ?? {};
@@ -133,13 +134,13 @@ function overviewRuntimeMetrics(interaction, runtime) {
     workers,
     healthyWorkers,
     uptimeMinutes: Math.floor(uptimeMs / 60_000),
-    backupAge: overview.backupAgeMs == null ? 'ยังไม่มี' : `${Math.floor(overview.backupAgeMs / 3_600_000)} ชม.`,
+    backupStatus: displayedBackupStatus(overview),
     rssMb: overview.memoryRssBytes == null ? 'ยังไม่มี' : `${Math.round(overview.memoryRssBytes / 1024 / 1024)} MB`,
     ping: websocketPing(interaction.client),
   };
 }
-function overviewDescription({ backup, incidents, metrics, queue, reviews, row }) {
-  const { workers, healthyWorkers, uptimeMinutes, backupAge, ping } = metrics;
+function overviewDescription({ incidents, metrics, queue, reviews, row }) {
+  const { workers, healthyWorkers, uptimeMinutes, backupStatus, ping } = metrics;
   return [
     '**ภาพรวมการเงิน**',
     `ลูกค้าที่มีเครดิต: **${row.users} คน**`, `เครดิตพร้อมใช้รวม: **${money(row.available)}**`, `เครดิตที่จองรวม: **${money(row.reserved)}**`,
@@ -147,7 +148,7 @@ function overviewDescription({ backup, incidents, metrics, queue, reviews, row }
     `งานในคิว: **${queue.rows[0].count}** • รอตรวจสอบ: **${reviews.rows[0].count}** • เหตุขัดข้อง: **${incidents.rows[0].count}**`,
     '', '**สุขภาพระบบ**',
     `Worker พร้อมทำงาน: **${healthyWorkers}/${workers.length}** • Ping: **${ping}** • เปิดมาแล้ว: **${uptimeMinutes} นาที**`,
-    `สำรองข้อมูลล่าสุด: **${latestBackupTime(backup.rows)}** • อายุไฟล์สำรอง: **${backupAge}**`,
+    `การสำรองข้อมูล: **${backupStatus}**`,
   ].join('\n');
 }
 function runnerConcurrency(runtime) {
@@ -233,6 +234,16 @@ function backupSummary(backups, drills) {
   const backupRows = listRows(backups, (row) => `• ${row.backup_type === 'PRE_MIGRATION' ? 'ก่อนอัปเดตฐานข้อมูล' : 'สำรองข้อมูลประจำวัน'} • ${displayState(row.state)} • <t:${Math.floor(new Date(row.completed_at ?? row.started_at).getTime() / 1000)}:R>`);
   const drillRows = listRows(drills, (row) => `• ${displayState(row.state)} • <t:${Math.floor(new Date(row.completed_at ?? row.started_at).getTime() / 1000)}:R>`);
   return `**ไฟล์สำรองล่าสุด**\n${backupRows}\n\n**ผลทดสอบกู้ข้อมูลล่าสุด**\n${drillRows}\n\nการทดสอบกู้ข้อมูลทำในฐานข้อมูลชั่วคราวและไม่กระทบร้านที่กำลังเปิดอยู่`;
+}
+
+function aivenBackupSummary() {
+  return [
+    '**การสำรองข้อมูล: Aiven-managed**',
+    'Aiven เป็นผู้สำรอง PostgreSQL อัตโนมัติ ระบบบอทจึงไม่เรียก `pg_dump`, `pg_restore` หรือ S3 จาก inwcloud',
+    '',
+    'สถานะนี้ไม่ใช่ผลการทดสอบกู้ข้อมูลของ Questshop และแผน Aiven Free มีข้อจำกัดด้านประวัติ/การกู้คืน',
+    'ตรวจและกู้ข้อมูลผ่าน Aiven Console เมื่อเกิดเหตุฉุกเฉิน',
+  ].join('\n');
 }
 
 function brandingSummary(runtime) {
@@ -506,6 +517,9 @@ async function renderOrdersPanel(interaction, runtime) {
 }
 
 async function renderBackupPanel(interaction, runtime) {
+  if (runtime.env.BACKUP_MODE === 'AIVEN_MANAGED') {
+    return adminReply(interaction, 'backup', { embeds: [panelEmbed(0x5865f2, 'สำรองและกู้ข้อมูล', aivenBackupSummary())] });
+  }
   const [backups, drills] = await Promise.all([
     runtime.pool.query('SELECT * FROM backup_runs ORDER BY started_at DESC LIMIT 5'),
     runtime.pool.query('SELECT * FROM restore_drills ORDER BY started_at DESC LIMIT 5'),
@@ -532,7 +546,7 @@ function renderSecretsPanel(interaction, runtime) {
     `กุญแจตรวจซองซ้ำ: **รุ่น ${keys.VOUCHER_HMAC_KEYS_JSON.current}** • เก็บรุ่นเดิม ${Object.keys(keys.VOUCHER_HMAC_KEYS_JSON.keys).length} รุ่น`,
     backupKeyring
       ? `กุญแจสำรองข้อมูล: **รุ่น ${backupKeyring.current}** • เก็บรุ่นเดิม ${Object.keys(backupKeyring.keys).length} รุ่น`
-      : 'กุญแจสำรองข้อมูล: **ไม่ได้ตั้งค่า** เพราะปิดระบบสำรองข้อมูลไว้',
+      : 'กุญแจสำรองข้อมูล: **ไม่ต้องใช้** เพราะ Aiven ดูแล Backup ของฐานข้อมูล',
     'หน้านี้แสดงเฉพาะสถานะและหมายเลขรุ่น ไม่สามารถเปิดดูค่ากุญแจจริงได้',
   ].join('\n');
   return adminReply(interaction, 'secrets', { embeds: [panelEmbed(0x5865f2, 'สถานะกุญแจระบบ', description)] });
@@ -552,16 +566,15 @@ async function renderDlqPanel(interaction, runtime) {
 }
 
 async function renderOverviewPanel(interaction, runtime) {
-  const [wallets, queue, reviews, incidents, backup] = await Promise.all([
+  const [wallets, queue, reviews, incidents] = await Promise.all([
     runtime.pool.query('SELECT count(*)::integer AS users,COALESCE(sum(available_cents),0)::bigint AS available,COALESCE(sum(reserved_cents),0)::bigint AS reserved FROM wallets'),
     runtime.pool.query("SELECT count(*)::integer AS count FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')"),
     runtime.pool.query("SELECT count(*)::integer AS count FROM manual_reviews WHERE state<>'RESOLVED'"),
     runtime.pool.query("SELECT count(*)::integer AS count FROM incidents WHERE state<>'RESOLVED'"),
-    runtime.pool.query("SELECT completed_at FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1"),
   ]);
   const row = wallets.rows[0];
   const metrics = overviewRuntimeMetrics(interaction, runtime);
-  const description = overviewDescription({ backup, incidents, metrics, queue, reviews, row });
+  const description = overviewDescription({ incidents, metrics, queue, reviews, row });
   return adminReply(interaction, 'overview', { embeds: [panelEmbed(0x5865f2, 'ภาพรวมร้าน', description)] });
 }
 

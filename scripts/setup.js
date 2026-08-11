@@ -77,7 +77,9 @@ try {
   const result = await collectMissing(original, prompter);
   if (result.missing.length) throw new Error('Setup is missing: ' + result.missing.join(', '));
   const written = await writeEnvironmentFile(target, original, result.generated);
-  const backupState = result.validated.BACKUP_ENABLED ? 'เปิด' : 'ปิดไว้จนกว่าจะตั้งค่า S3/Restore';
+  const backupState = result.validated.BACKUP_MODE === 'AIVEN_MANAGED'
+    ? 'Aiven ดูแลอัตโนมัติ (ไม่มี pg_dump/S3 ใน inwcloud)'
+    : 'สำรองด้วย S3 ภายใน Questshop';
   stdout.write([
     '',
     'Questshop setup สำเร็จ',

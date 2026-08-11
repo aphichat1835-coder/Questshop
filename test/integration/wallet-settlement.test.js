@@ -155,6 +155,21 @@ test('financial invariant alert opens and resolves without mutating ledger evide
     AND scope='WALLET_LEDGER' ORDER BY opened_at DESC LIMIT 1`)).rows[0].state, 'RESOLVED');
 });
 
+test('Aiven-managed alert evaluation skips local backup tables and clears no backup health requirement', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const queries = [];
+  const aivenPool = {
+    query(sql, values) {
+      queries.push(String(sql));
+      return pool.query(sql, values);
+    },
+  };
+  const health = { ready: true, status: 'HEALTHY', workers: {} };
+  await evaluateAlerts({ pool: aivenPool, health, env: { BACKUP_MODE: 'AIVEN_MANAGED' } });
+  assert.equal(health.overview.backupMode, 'AIVEN_MANAGED');
+  assert.equal(queries.some((sql) => /backup_runs|restore_drills/.test(sql)), false);
+});
+
 test('scheduler lag opens a scoped incident without changing queued work', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7(); const rule = uuidv7(); const order = uuidv7(); const item = uuidv7(); const job = uuidv7();

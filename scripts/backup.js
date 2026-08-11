@@ -1,12 +1,12 @@
 import '../src/config/load-local-environment.js';
-import { loadEnvironment } from '../src/config/env.js';
+import { loadEnvironment, usesApplicationBackup } from '../src/config/env.js';
 import { getRuntimePool, closePools } from '../src/db/pools.js';
 import { createEncryptedBackup } from '../src/adapters/s3/backup.js';
 import { v7 as uuidv7 } from 'uuid';
 
 const env = loadEnvironment();
-if (env.BACKUP_ENABLED !== true) {
-  throw new Error('Backups are disabled; enable BACKUP_ENABLED before running scripts/backup.js');
+if (!usesApplicationBackup(env)) {
+  throw new Error('Aiven-managed backup is active; Questshop pg_dump/S3 backup is not available');
 }
 const pool = getRuntimePool(env);
 const runId = uuidv7();
