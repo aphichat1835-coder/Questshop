@@ -123,32 +123,33 @@ function pickNonempty(...values) {
   return values.find((value) => value != null && String(value).trim() !== '');
 }
 
-export async function completeSetupValues({ fileValues = {}, processValues = process.env,
-  randomBytesFunction = randomBytes, readFileFunction = readFile } = {}) {
-  const effective = { ...fileValues, ...processValues };
-  const updates = {};
-  let automatic;
+function copyConfiguredValues(updates, effective, fileValues, fields) {
+  for (const key of fields) {
+    const value = pickNonempty(effective[key], fileValues[key]);
+    if (value) updates[key] = value;
+  }
+}
 
-  for (const key of EXTERNAL_SETUP_FIELDS) {
-    const value = pickNonempty(effective[key], fileValues[key]);
-    if (value) updates[key] = value;
+function assertNoImplicitSecretRotation(key, fileValues, processValues) {
+  if (pickNonempty(fileValues[key]) && pickNonempty(processValues[key])
+    && fileValues[key] !== processValues[key]) {
+    throw new Error(key + ' conflicts with the durable .env value; refusing implicit secret rotation');
   }
-  for (const key of OPTIONAL_RUNTIME_FIELDS) {
-    const value = pickNonempty(effective[key], fileValues[key]);
-    if (value) updates[key] = value;
-  }
+}
+
+function populateGeneratedValues(updates, fileValues, processValues, randomBytesFunction) {
+  let automatic;
   for (const key of GENERATED_FIELDS) {
     // Once generated into the durable file, local key material wins over an
     // accidental process-level override. Rotation is a separate audited flow.
-    if (pickNonempty(fileValues[key]) && pickNonempty(processValues[key])
-      && fileValues[key] !== processValues[key]) {
-      throw new Error(key + ' conflicts with the durable .env value; refusing implicit secret rotation');
-    }
+    assertNoImplicitSecretRotation(key, fileValues, processValues);
     const existing = pickNonempty(fileValues[key], processValues[key]);
     automatic ??= existing ? null : createAutomaticValues({ randomBytesFunction });
     updates[key] = existing ?? automatic[key];
   }
+}
 
+async function populateCertificateValue(updates, effective, readFileFunction) {
   const certificateInput = pickNonempty(
     effective.DATABASE_SSL_CA_BASE64,
     effective.DATABASE_SSL_CA_INPUT,
@@ -157,13 +158,27 @@ export async function completeSetupValues({ fileValues = {}, processValues = pro
   if (certificateInput) {
     updates.DATABASE_SSL_CA_BASE64 = await resolveCertificateBase64(certificateInput, { readFileFunction });
   }
+}
+
+function finalizeSetupCandidate(fileValues, processValues, updates) {
+  const candidate = { ...fileValues, ...processValues, ...updates };
+  for (const key of SETUP_ONLY_FIELDS) delete candidate[key];
+  const missing = [...EXTERNAL_SETUP_FIELDS].filter((key) => !pickNonempty(candidate[key]));
+  return { candidate, missing };
+}
+
+export async function completeSetupValues({ fileValues = {}, processValues = process.env,
+  randomBytesFunction = randomBytes, readFileFunction = readFile } = {}) {
+  const effective = { ...fileValues, ...processValues };
+  const updates = {};
+  copyConfiguredValues(updates, effective, fileValues, EXTERNAL_SETUP_FIELDS);
+  copyConfiguredValues(updates, effective, fileValues, OPTIONAL_RUNTIME_FIELDS);
+  populateGeneratedValues(updates, fileValues, processValues, randomBytesFunction);
+  await populateCertificateValue(updates, effective, readFileFunction);
   updates.BACKUP_MODE = pickNonempty(effective.BACKUP_MODE,
     effective.BACKUP_ENABLED === 'true' ? 'LOCAL_S3' : 'AIVEN_MANAGED');
 
-  const candidate = { ...fileValues, ...processValues, ...updates };
-  for (const key of SETUP_ONLY_FIELDS) delete candidate[key];
-  const missing = [...EXTERNAL_SETUP_FIELDS]
-    .filter((key) => !pickNonempty(candidate[key]));
+  const { candidate, missing } = finalizeSetupCandidate(fileValues, processValues, updates);
   if (missing.length) return { candidate, generated: updates, missing, validated: null };
   const validated = loadEnvironment(candidate);
   return { candidate, generated: updates, missing: [], validated };
