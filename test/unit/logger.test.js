@@ -36,6 +36,6 @@ test('logger redacts every secret class from bindings, fields and message text',
   const output = destination.chunks.join('');
   assert.match(output, /REDACTED/);
   for (const value of [token, databaseUrl, password, authorization, apiKey, encryptionKey, hmacKey]) {
-    assert.doesNotMatch(output, new RegExp(value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.equal(output.includes(value), false, `log output must not include ${value}`);
   }
 });
