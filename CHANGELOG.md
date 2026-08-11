@@ -64,6 +64,9 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 - TLS and startup regression coverage now proves the raw libpq `sslmode` override failure, production
   `verify-full` rejection, redacted circular Error serialization, `Events.ClientReady`, and Discord login cleanup.
 
+- CI now uses `actions/upload-artifact@v7`, removing the GitHub-hosted runner warning caused by that action's
+  deprecated Node 20 runtime while keeping Questshop's own runtime pinned to Node 22.22.0.
+
 - PostgreSQL pools now remove libpq SSL URL parameters only from the copy supplied to `pg`, preserving the original
   `sslmode=verify-full` policy validation while retaining explicit Aiven CA and hostname/certificate verification.
 - Structured logs now serialize bounded, redacted Error diagnostics instead of emitting `{}`; Discord startup waits

@@ -186,10 +186,13 @@ test('current Questshop functions deny PUBLIC while provider functions remain un
   ]) {
     assert.equal(await publicFunctionExecute(signature), false);
   }
-  assert.equal(await publicFunctionExecute('public.provider_extension_probe()'), true);
+  // The surrounding test suite can change the admin role's default ACLs. The
+  // contract is that synchronization never changes provider-owned functions,
+  // whatever their pre-existing PUBLIC policy happens to be.
+  const providerPublicExecuteBefore = await publicFunctionExecute('public.provider_extension_probe()');
   const result = await runMigrations({ pool: migratorPool, gitSha: 'role-contract-test', runtimeRole: roles.runtime });
   assert.equal(result.privilegeSynchronization.status, 'PASS');
-  assert.equal(await publicFunctionExecute('public.provider_extension_probe()'), true);
+  assert.equal(await publicFunctionExecute('public.provider_extension_probe()'), providerPublicExecuteBefore);
 });
 
 test('missing or differently owned retention functions fail closed before privilege sync commits', async (t) => {

@@ -6,8 +6,8 @@ const MFA_DISCORD_TOKEN = /\bmfa\.[A-Za-z0-9_-]{20,}\b/g;
 const DISCORD_TOKEN = /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b/g;
 const DATABASE_URL = /postgres(?:ql)?:\/\/[^\s]+/gi;
 const SENSITIVE_ASSIGNMENTS = [
-  /(\b(?:token|authorization|cookie|password|secret|credential|session)\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
-  /(\b(?:api|encryption|hmac)[_-]?key\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+  /(\b(?:token|authorization|cookie|password|secret|credential|session)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+  /(\b(?:api|encryption|hmac)[_-]?key\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
 ];
 const MAX_ERROR_MESSAGE = 1_000;
 const MAX_ERROR_STACK = 12_000;

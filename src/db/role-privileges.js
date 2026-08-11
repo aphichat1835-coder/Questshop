@@ -6,7 +6,7 @@ export const ALLOWED_RUNTIME_FUNCTIONS = Object.freeze([
   'public.questshop_prune_operational_details(timestamp with time zone,timestamp with time zone,integer)',
 ]);
 
-const ALLOWED_FUNCTION_OIDS_SQL = String.raw`p.oid = ANY (ARRAY[
+const ALLOWED_FUNCTION_OIDS_SQL = `p.oid = ANY (ARRAY[
   to_regprocedure('public.questshop_prune_wallet_ledger(timestamp with time zone,integer)'),
   to_regprocedure('public.questshop_prune_operational_details(timestamp with time zone,timestamp with time zone,integer)')
 ])`;
