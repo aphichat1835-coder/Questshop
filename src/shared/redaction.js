@@ -1,18 +1,34 @@
-const SECRET_KEYS = /(?:token|authorization|cookie|password|secret|credential|session|database_url|api[_-]?key|ciphertext|auth_tag)/i;
+const SECRET_KEYS = new Set([
+  'token', 'authorization', 'cookie', 'password', 'secret', 'credential', 'session',
+  'database_url', 'api_key', 'ciphertext', 'auth_tag', 'encryption_key', 'hmac_key',
+]);
 const MFA_DISCORD_TOKEN = /\bmfa\.[A-Za-z0-9_-]{20,}\b/g;
 const DISCORD_TOKEN = /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b/g;
 const DATABASE_URL = /postgres(?:ql)?:\/\/[^\s]+/gi;
-const SENSITIVE_ASSIGNMENT = /((?:token|authorization|cookie|password|secret|credential|session|api[_-]?key|encryption[_-]?key|hmac[_-]?key)\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
+const SENSITIVE_ASSIGNMENTS = [
+  /(\b(?:token|authorization|cookie|password|secret|credential|session)\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+  /(\b(?:api|encryption|hmac)[_-]?key\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+];
 const MAX_ERROR_MESSAGE = 1_000;
 const MAX_ERROR_STACK = 12_000;
 const MAX_CAUSE_DEPTH = 3;
 
 export function redactText(value) {
-  return String(value)
+  let text = String(value)
     .replace(MFA_DISCORD_TOKEN, '[REDACTED_DISCORD_TOKEN]')
     .replace(DISCORD_TOKEN, '[REDACTED_DISCORD_TOKEN]')
-    .replace(DATABASE_URL, '[REDACTED_DATABASE_URL]')
-    .replace(SENSITIVE_ASSIGNMENT, '$1[REDACTED]');
+    .replace(DATABASE_URL, '[REDACTED_DATABASE_URL]');
+  for (const assignment of SENSITIVE_ASSIGNMENTS) text = text.replace(assignment, '$1[REDACTED]');
+  return text;
+}
+
+function normalizedKey(key) {
+  return String(key).toLowerCase().replaceAll('-', '_');
+}
+
+function isSecretKey(key) {
+  const normalized = normalizedKey(key);
+  return SECRET_KEYS.has(normalized) || normalized.endsWith('_token') || normalized.endsWith('_secret');
 }
 
 export function redact(value, seen = new WeakSet()) {
@@ -24,7 +40,7 @@ export function redact(value, seen = new WeakSet()) {
   if (Array.isArray(value)) return value.map((item) => redact(item, seen));
   const result = {};
   for (const [key, child] of Object.entries(value)) {
-    result[key] = SECRET_KEYS.test(key) ? '[REDACTED]' : redact(child, seen);
+    result[key] = isSecretKey(key) ? '[REDACTED]' : redact(child, seen);
   }
   return result;
 }
@@ -34,14 +50,17 @@ function truncate(value, maximum) {
   return text.length > maximum ? `${text.slice(0, maximum)}…[TRUNCATED]` : text;
 }
 
+function errorMarker(code, message) {
+  return { name: 'Error', code, message };
+}
+
 function serializeCause(cause, depth, seen) {
-  if (cause == null) return null;
-  if (depth >= MAX_CAUSE_DEPTH) return '[CAUSE_DEPTH_LIMIT]';
-  if (typeof cause !== 'object') return truncate(cause, MAX_ERROR_MESSAGE);
-  if (seen.has(cause)) return '[CIRCULAR]';
+  if (depth >= MAX_CAUSE_DEPTH) return errorMarker('CAUSE_DEPTH_LIMIT', 'Error cause depth limit reached');
+  if (typeof cause !== 'object') return errorMarker('NON_ERROR_CAUSE', truncate(cause, MAX_ERROR_MESSAGE));
+  if (seen.has(cause)) return errorMarker('CIRCULAR_CAUSE', 'Circular Error cause');
   if (cause instanceof Error) return serializeError(cause, { depth: depth + 1, seen });
   seen.add(cause);
-  return truncate(String(cause), MAX_ERROR_MESSAGE);
+  return errorMarker('NON_ERROR_CAUSE', truncate(String(cause), MAX_ERROR_MESSAGE));
 }
 
 // Error instances have no enumerable own properties in JavaScript, which used
@@ -49,7 +68,7 @@ function serializeCause(cause, depth, seen) {
 // redacted diagnostic allowlist and never copy provider config/payload fields.
 export function serializeError(error, { depth = 0, seen = new WeakSet() } = {}) {
   if (error && typeof error === 'object') {
-    if (seen.has(error)) return '[CIRCULAR]';
+    if (seen.has(error)) return errorMarker('CIRCULAR_ERROR', 'Circular Error cause');
     seen.add(error);
   }
   const result = {
@@ -58,8 +77,7 @@ export function serializeError(error, { depth = 0, seen = new WeakSet() } = {}) 
     code: truncate(error?.code ?? 'UNKNOWN', 100),
   };
   if (error?.stack) result.stack = truncate(error.stack, MAX_ERROR_STACK);
-  const cause = serializeCause(error?.cause, depth, seen);
-  if (cause != null) result.cause = cause;
+  if (error?.cause != null) result.cause = serializeCause(error.cause, depth, seen);
   return result;
 }
 

@@ -16,6 +16,15 @@ test('pool URL sanitization preserves verified CA while retaining non-SSL option
   assert.equal(parsed.ssl.rejectUnauthorized, true);
 });
 
+test('a raw libpq sslmode URL replaces explicit pg SSL options before sanitization', () => {
+  const rawUrl = VERIFIED_URL.replace('&sslrootcert=ignored', '');
+  const raw = new pg.Client({ connectionString: rawUrl, ssl: { ca: CA, rejectUnauthorized: true } }).connectionParameters;
+  assert.deepEqual(raw.ssl, {});
+  const fixed = new pg.Client(postgresPoolOptions({ NODE_ENV: 'production', DATABASE_SSL_CA_BASE64: Buffer.from(CA).toString('base64') }, rawUrl)).connectionParameters;
+  assert.equal(fixed.ssl.ca, CA);
+  assert.equal(fixed.ssl.rejectUnauthorized, true);
+});
+
 test('sanitized URL removes every pg SSL override without changing endpoint identity', () => {
   const original = `${VERIFIED_URL}&ssl=1&sslcert=cert&sslkey=key&uselibpqcompat=true`;
   const clean = new URL(sanitizePostgresConnectionString(original));

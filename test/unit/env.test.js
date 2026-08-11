@@ -89,6 +89,17 @@ test('production refuses an unknown deployment revision', () => {
   assert.throws(() => loadEnvironment({ ...base, GIT_SHA: 'unknown' }), /GIT_SHA/);
 });
 
+test('production requires verify-full on every configured database URL', () => {
+  for (const sslmode of ['disable', 'allow', 'prefer', 'require', 'verify-ca']) {
+    const poolUrl = new URL(base.DATABASE_POOL_URL);
+    poolUrl.searchParams.set('sslmode', sslmode);
+    assert.throws(() => loadEnvironment({ ...base, DATABASE_POOL_URL: poolUrl.toString() }), /DATABASE_POOL_URL must use sslmode=verify-full/);
+  }
+  const poolUrl = new URL(base.DATABASE_POOL_URL);
+  poolUrl.searchParams.delete('sslmode');
+  assert.throws(() => loadEnvironment({ ...base, DATABASE_POOL_URL: poolUrl.toString() }), /DATABASE_POOL_URL must use sslmode=verify-full/);
+});
+
 test('promotion percentages are parsed as exact basis points without floating point', () => {
   assert.equal(parsePromotionBasisPoints('12'), 1200);
   assert.equal(parsePromotionBasisPoints('12.3'), 1230);

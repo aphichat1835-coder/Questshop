@@ -73,6 +73,12 @@ not a Functional UAT pass. The following source revision adds URL sanitization, 
 synchronization and effective-grant validation; it still requires a separate live retest before the workaround or
 manual grants can be considered removed.
 
+The later source revision additionally makes privilege synchronization deterministic for future objects: it revokes
+old Runtime default ACLs before applying the minimum table/sequence/function defaults. PostgreSQL 16 tests now use
+separate Admin/Migrator/Runtime roles, force a synchronization rollback, and prove that an `applied: 0` retry repairs
+the stale defaults. This is still automated evidence only. A live Aiven retest must independently show no
+`NODE_EXTRA_CA_CERTS`, no `/tmp/aiven-ca.pem`, no manual `GRANT`, and a passing `privilegeSynchronization: PASS`.
+
 The Final Decision-Complete plan wins if the documents differ.  This record is a source and
 automated-test audit; release evidence must record `git rev-parse HEAD` at the time each command
 or live check runs.  It does **not** replace the live evidence required for a production release.

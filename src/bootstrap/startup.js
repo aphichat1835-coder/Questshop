@@ -48,10 +48,10 @@ export async function waitForDiscordReady(client) {
   if (!client.isReady()) await once(client, Events.ClientReady);
 }
 
-async function connectDiscord(env, logger, health, runtime) {
-  const client = createDiscordClient();
+export async function connectDiscord(env, logger, health, runtime, dependencies = {}) {
+  const client = (dependencies.createDiscordClient ?? createDiscordClient)();
   client.questshop = runtime;
-  client.on('interactionCreate', routeInteraction);
+  client.on('interactionCreate', dependencies.routeInteraction ?? routeInteraction);
   client.on('error', (error) => logger.error({ error }, 'discord client error'));
   try {
     await client.login(env.DISCORD_BOT_TOKEN);

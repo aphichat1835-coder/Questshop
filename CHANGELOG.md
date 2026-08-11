@@ -57,6 +57,13 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Changed
 
+- PostgreSQL object-privilege synchronization now revokes stale Runtime default ACLs before granting the minimum
+  future table/sequence/function policy. Its catalog-derived DDL is assembled inside PostgreSQL with a parameterized
+  Runtime role, and PostgreSQL 16 regression tests cover separate effective roles, rollback, `applied: 0` repair,
+  inherited/Public privilege detection, retention-function ownership, and provider-function isolation.
+- TLS and startup regression coverage now proves the raw libpq `sslmode` override failure, production
+  `verify-full` rejection, redacted circular Error serialization, `Events.ClientReady`, and Discord login cleanup.
+
 - PostgreSQL pools now remove libpq SSL URL parameters only from the copy supplied to `pg`, preserving the original
   `sslmode=verify-full` policy validation while retaining explicit Aiven CA and hostname/certificate verification.
 - Structured logs now serialize bounded, redacted Error diagnostics instead of emitting `{}`; Discord startup waits

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { Events } from 'discord.js';
-import { openRuntimeDatabase, renewRuntimeLease, waitForDiscordReady } from '../../src/bootstrap/startup.js';
+import { connectDiscord, openRuntimeDatabase, renewRuntimeLease, waitForDiscordReady } from '../../src/bootstrap/startup.js';
 import { FencingLostError } from '../../src/shared/errors.js';
 
 test('runtime startup rejects changed key material before role validation or ingress', async () => {
@@ -27,8 +27,21 @@ test('Discord readiness uses clientReady and does not wait when already ready', 
   const waiting = waitForDiscordReady(client);
   client.emit(Events.ClientReady, client);
   await waiting;
+  assert.equal(client.listenerCount(Events.ClientReady), 0);
   client.isReady = () => true;
   await waitForDiscordReady(client);
+  assert.equal(client.listenerCount(Events.ClientReady), 0);
+});
+
+test('Discord login failure destroys its client and stops before Guild/Admin validation', async () => {
+  const calls = [];
+  const client = new EventEmitter();
+  client.login = async () => { calls.push('login'); throw new Error('fixture login failure'); };
+  client.destroy = () => { calls.push('destroy'); };
+  client.guilds = { fetch: async () => { calls.push('guild'); } };
+  await assert.rejects(() => connectDiscord({ DISCORD_BOT_TOKEN: 'fixture-token', DISCORD_GUILD_ID: 'guild' },
+    { error: () => null }, { checks: {} }, {}, { createDiscordClient: () => client }), /fixture login failure/);
+  assert.deepEqual(calls, ['login', 'destroy']);
 });
 
 test('runtime lease retries a transient database failure but self-fences immediately when ownership is lost', async () => {
