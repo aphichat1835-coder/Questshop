@@ -4,9 +4,9 @@ import { extractQuestArray, QuestCompatibilityError } from '../schema/compatibil
 import { normalizeQuestPayload } from '../schema/normalizer.js';
 import { discordRateLimitCoordinator } from '../rate-limits/coordinator.js';
 import { fixedDiscordTransport } from './discord-transport.js';
-import { FATAL_FORBIDDEN_PATHS, QUEST_API_VERSION, QUEST_ENDPOINT, QUEST_LIST_PATHS } from './endpoints.js';
+import { FATAL_FORBIDDEN_PATHS, QUEST_ENDPOINT, QUEST_LIST_PATHS } from './endpoints.js';
 
-export { QUEST_API_VERSION };
+export { QUEST_API_VERSION } from './endpoints.js';
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
@@ -184,33 +184,51 @@ function markMutationTransportUncertainty(error, { safeRead, dispatched }) {
   return error;
 }
 
+async function makeQuestRequestAttempt({ coordinator, method, options, path, profile, safeRead, timeoutMs, token, transport }) {
+  let dispatched = false;
+  const bounded = requestSignal(options.signal, timeoutMs);
+  try {
+    const dispatchedRequest = await dispatchQuestRequest({
+      bounded, coordinator, method, options, path, profile, safeRead, token, transport,
+    });
+    dispatched = dispatchedRequest.dispatched;
+    const result = await interpretQuestResponse({ coordinator, path, response: dispatchedRequest.response, token });
+    return result.complete ? { kind: 'SUCCESS', value: result.value } : { kind: 'RESPONSE_ERROR', result };
+  } catch (error) {
+    return { kind: 'TRANSPORT_ERROR', error, dispatched, timedOut: bounded.timedOut() };
+  } finally {
+    bounded.dispose();
+  }
+}
+
+async function resolveResponseError({ attempt, maxAttempts, path, result, safeRead, signal, coordinator }) {
+  if (await waitForSafeRetry({ ...result, safeRead, attempt, maxAttempts, coordinator, signal })) return true;
+  throw new DiscordApiError(result.response.status, path, result.data);
+}
+
+async function resolveTransportError({ attempt, error, maxAttempts, path, safeRead, signal, dispatched, timedOut }) {
+  if (error instanceof DiscordApiTimeoutError) throw error;
+  if (timedOut) throw new DiscordApiTimeoutError(path, { possiblySent: dispatched });
+  if (error instanceof DiscordApiError || error?.name === 'AbortError') throw error;
+  if (await waitForTransportRetry({ error, safeRead, attempt, maxAttempts, signal })) return true;
+  throw markMutationTransportUncertainty(error, { safeRead, dispatched });
+}
+
 export function createQuestApiClient({ token, profile, coordinator = discordRateLimitCoordinator,
   timeoutMs = DEFAULT_TIMEOUT_MS, transport = fixedDiscordTransport }) {
   async function request(path, options = {}, { safeRead = false, maxAttempts = safeRead ? 5 : 1 } = {}) {
     const method = String(options.method ?? 'GET').toUpperCase();
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      let dispatched = false;
-      const bounded = requestSignal(options.signal, timeoutMs);
-      try {
-        const dispatchedRequest = await dispatchQuestRequest({
-          bounded, coordinator, method, options, path, profile, safeRead, token, transport,
-        });
-        dispatched = dispatchedRequest.dispatched;
-        const result = await interpretQuestResponse({ coordinator, path, response: dispatchedRequest.response, token });
-        if (result.complete) return result.value;
-        if (await waitForSafeRetry({ ...result, safeRead, attempt, maxAttempts, coordinator, signal: options.signal })) continue;
-        throw new DiscordApiError(result.response.status, path, result.data);
-      } catch (error) {
-        if (error instanceof DiscordApiTimeoutError) throw error;
-        if (bounded.timedOut()) {
-          throw new DiscordApiTimeoutError(path, { possiblySent: dispatched });
-        }
-        if (error instanceof DiscordApiError || error?.name === 'AbortError') throw error;
-        if (await waitForTransportRetry({ error, safeRead, attempt, maxAttempts, signal: options.signal })) continue;
-        throw markMutationTransportUncertainty(error, { safeRead, dispatched });
-      } finally {
-        bounded.dispose();
-      }
+      const outcome = await makeQuestRequestAttempt({
+        coordinator, method, options, path, profile, safeRead, timeoutMs, token, transport,
+      });
+      if (outcome.kind === 'SUCCESS') return outcome.value;
+      const retry = outcome.kind === 'RESPONSE_ERROR'
+        ? await resolveResponseError({ attempt, maxAttempts, path, result: outcome.result, safeRead,
+          signal: options.signal, coordinator })
+        : await resolveTransportError({ attempt, error: outcome.error, maxAttempts, path, safeRead,
+          signal: options.signal, dispatched: outcome.dispatched, timedOut: outcome.timedOut });
+      if (retry) continue;
     }
     throw new Error(`${method} ${path} retry budget exhausted`);
   }

@@ -2,7 +2,10 @@ import pg from 'pg';
 import { readFile, readdir } from 'node:fs/promises';
 
 const { Pool } = pg;
-const TEST_SCHEMA_LOCK_KEY = 8_481_701_225;
+// Keep this as a decimal string: node-postgres sends it to PostgreSQL as a
+// bigint without relying on JavaScript numeric precision or analyzer-specific
+// integer-width assumptions.
+const TEST_SCHEMA_LOCK_KEY = '8481701225';
 
 export function assertDisposableTestDatabase(url = process.env.TEST_DATABASE_URL) {
   if (!url) return;
@@ -23,7 +26,7 @@ export async function createIsolatedTestPool({ max = 12, applyMigrations = true 
   const releaseLock = async () => {
     if (closed) return;
     closed = true;
-    try { await lock.query('SELECT pg_advisory_unlock($1)', [TEST_SCHEMA_LOCK_KEY]); }
+    try { await lock.query('SELECT pg_advisory_unlock($1::bigint)', [TEST_SCHEMA_LOCK_KEY]); }
     finally { lock.release(); }
   };
   const originalEnd = pool.end.bind(pool);
@@ -32,7 +35,7 @@ export async function createIsolatedTestPool({ max = 12, applyMigrations = true 
     return originalEnd(...argumentsList);
   };
   try {
-    await lock.query('SELECT pg_advisory_lock($1)', [TEST_SCHEMA_LOCK_KEY]);
+    await lock.query('SELECT pg_advisory_lock($1::bigint)', [TEST_SCHEMA_LOCK_KEY]);
     await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
     if (applyMigrations) {
       const directory = new URL('../../migrations/', import.meta.url);

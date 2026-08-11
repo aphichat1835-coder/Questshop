@@ -7,7 +7,7 @@ const dataVersion = Number(process.env.QUESTSHOP_RETIRE_DATA_KEY_VERSION);
 const voucherVersion = Number(process.env.QUESTSHOP_RETIRE_VOUCHER_KEY_VERSION);
 const backupVersion = Number(process.env.QUESTSHOP_RETIRE_BACKUP_KEY_VERSION);
 if (!Number.isInteger(dataVersion) && !Number.isInteger(voucherVersion) && !Number.isInteger(backupVersion)) {
-  throw new Error('Set QUESTSHOP_RETIRE_DATA_KEY_VERSION, QUESTSHOP_RETIRE_VOUCHER_KEY_VERSION and/or QUESTSHOP_RETIRE_BACKUP_KEY_VERSION');
+  throw new TypeError('Set QUESTSHOP_RETIRE_DATA_KEY_VERSION, QUESTSHOP_RETIRE_VOUCHER_KEY_VERSION and/or QUESTSHOP_RETIRE_BACKUP_KEY_VERSION');
 }
 if (dataVersion === env.DATA_ENCRYPTION_KEYS_JSON.current || voucherVersion === env.VOUCHER_HMAC_KEYS_JSON.current
   || backupVersion === env.BACKUP_ENCRYPTION_KEYS_JSON?.current) {

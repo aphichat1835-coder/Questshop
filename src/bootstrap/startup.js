@@ -68,25 +68,38 @@ async function connectDiscord(env, logger, health, runtime) {
   }
 }
 
+function isRuntimeLeaseLost(error) {
+  return error instanceof FencingLostError || error?.code === 'FENCING_LOST';
+}
+
+async function waitForRuntimeLeaseRetry({ abortController, attempt, wait }) {
+  try {
+    await wait(1_000 * (2 ** attempt), undefined, { signal: abortController.signal, ref: false });
+    return !abortController.signal.aborted;
+  } catch (error) {
+    if (abortController.signal.aborted || error?.name === 'AbortError') return false;
+    throw error;
+  }
+}
+
+function runtimeLeaseRenewalInput({ env, holder, lease }) {
+  return {
+    resourceType: 'RUNTIME', resourceId: env.DISCORD_GUILD_ID,
+    holder, fencingToken: lease.fencing_token, ttlSeconds: 60,
+  };
+}
+
 export async function renewRuntimeLease({ abortController, env, holder, pool, lease, renew = renewLease, wait = delay }) {
   let lastError;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      return await renew({ resourceType: 'RUNTIME', resourceId: env.DISCORD_GUILD_ID,
-        holder, fencingToken: lease.fencing_token, ttlSeconds: 60 }, { pool });
+      return await renew(runtimeLeaseRenewalInput({ env, holder, lease }), { pool });
     } catch (error) {
-      if (error instanceof FencingLostError || error?.code === 'FENCING_LOST') throw error;
+      if (isRuntimeLeaseLost(error)) throw error;
       if (abortController.signal.aborted) return null;
       lastError = error;
-      if (attempt < 2) {
-        try {
-          await wait(1_000 * (2 ** attempt), undefined, {
-            signal: abortController.signal, ref: false,
-          });
-        } catch (waitError) {
-          if (abortController.signal.aborted || waitError?.name === 'AbortError') return null;
-          throw waitError;
-        }
+      if (attempt < 2 && !await waitForRuntimeLeaseRetry({ abortController, attempt, wait })) {
+        return null;
       }
     }
   }

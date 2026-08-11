@@ -16,19 +16,25 @@ function minimumFor(metric) {
   return number;
 }
 
+function coverageCounter(line) {
+  const separator = line.indexOf(':');
+  if (separator < 0) return null;
+  const prefix = line.slice(0, separator);
+  const metricDefinition = METRICS.find(([, hitKey, foundKey]) => prefix === hitKey || prefix === foundKey);
+  if (!metricDefinition) return null;
+  const count = Number(line.slice(separator + 1));
+  if (!Number.isSafeInteger(count) || count < 0) {
+    throw new TypeError(`Invalid ${prefix} counter`);
+  }
+  const [metric, hitKey] = metricDefinition;
+  return { metric, field: prefix === hitKey ? 'hit' : 'found', count };
+}
+
 function totals(lcov) {
   const result = new Map(METRICS.map(([metric]) => [metric, { hit: 0, found: 0 }]));
   for (const line of lcov.split('\n')) {
-    const [prefix, raw] = line.split(':', 2);
-    for (const [metric, hitKey, foundKey] of METRICS) {
-      if (prefix !== hitKey && prefix !== foundKey) continue;
-      const count = Number(raw);
-      if (!Number.isSafeInteger(count) || count < 0) {
-        throw new TypeError(`Invalid ${prefix} counter`);
-      }
-      if (prefix === hitKey) result.get(metric).hit += count;
-      if (prefix === foundKey) result.get(metric).found += count;
-    }
+    const counter = coverageCounter(line);
+    if (counter) result.get(counter.metric)[counter.field] += counter.count;
   }
   return result;
 }

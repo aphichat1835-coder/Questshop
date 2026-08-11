@@ -88,6 +88,33 @@ function questUrl(id, config) {
   return `https://discord.com/quests/${encodeURIComponent(id)}`;
 }
 
+function compatibilityIssues({ entries, target, taskConfig }) {
+  const issues = [];
+  if (!entries.length) issues.push(questCompatibilityIssue('TASK_DEFINITIONS_MISSING', 'Task definitions are missing'));
+  if (target <= 0) issues.push(questCompatibilityIssue('TASK_TARGET_INVALID', 'Task target is invalid'));
+  const joinOperator = taskConfig?.join_operator ?? 'or';
+  if (joinOperator === 'and' && entries.length > 1) {
+    issues.push(questCompatibilityIssue('MULTI_TASK_AND', 'Multi-task AND is unsupported'));
+  }
+  return { issues, joinOperator };
+}
+
+function normalizeProgress(status, task, target) {
+  const progressSecs = readProgress(status, task, target);
+  return {
+    progressSecs,
+    progress: target > 0 ? Math.min(100, (progressSecs / target) * 100) : 0,
+  };
+}
+
+function questVersions(options) {
+  return options.versions ?? {
+    engineVersion: ENGINE_VERSION,
+    executorVersion: EXECUTOR_VERSION,
+    contractVersion: QUEST_CONTRACT_VERSION,
+  };
+}
+
 export function normalizeQuest(raw, options = {}) {
   assertQuestObject(raw);
   const id = String(raw.id);
@@ -97,18 +124,12 @@ export function normalizeQuest(raw, options = {}) {
   const configuredTasks = taskEntries(taskConfig);
   const { task, entries } = chooseTask(configuredTasks, status, options);
   const target = finite(task.definition?.target);
-  const issues = [];
-  if (!entries.length) issues.push(questCompatibilityIssue('TASK_DEFINITIONS_MISSING', 'Task definitions are missing'));
-  if (target <= 0) issues.push(questCompatibilityIssue('TASK_TARGET_INVALID', 'Task target is invalid'));
-  const joinOperator = taskConfig?.join_operator ?? 'or';
-  if (joinOperator === 'and' && entries.length > 1) {
-    issues.push(questCompatibilityIssue('MULTI_TASK_AND', 'Multi-task AND is unsupported'));
-  }
-  const progressSecs = readProgress(status, task, target);
-  const progress = target > 0 ? Math.min(100, (progressSecs / target) * 100) : 0;
+  const { issues, joinOperator } = compatibilityIssues({ entries, target, taskConfig });
+  const { progress, progressSecs } = normalizeProgress(status, task, target);
   const executor = selectQuestExecutor({ eventName: task.type, autoSupported: issues.length === 0 });
   const startsAt = config.starts_at ?? null;
   const expiresAt = config.expires_at ?? null;
+  const url = questUrl(id, config);
   const normalized = {
     id,
     name: config.messages?.quest_name ?? config.messages?.quest_title ?? id,
@@ -129,17 +150,13 @@ export function normalizeQuest(raw, options = {}) {
     claimed: Boolean(status.claimed_at) || status.orb_quantity_claimed != null,
     orbs: rewardOrbs(config),
     artworkUrl: artwork(config),
-    url: questUrl(id, config),
+    url,
     schemaIssues: issues.map((issue) => issue.message),
     compatibilityIssues: issues,
-    coreComplete: Boolean(id && task.type && target > 0 && startsAt && expiresAt && questUrl(id, config)),
+    coreComplete: Boolean(id && task.type && target > 0 && startsAt && expiresAt && url),
     joinOperator,
   };
-  const contract = questContractHash(normalized, options.versions ?? {
-    engineVersion: ENGINE_VERSION,
-    executorVersion: EXECUTOR_VERSION,
-    contractVersion: QUEST_CONTRACT_VERSION,
-  });
+  const contract = questContractHash(normalized, questVersions(options));
   return { ...normalized, contractHash: contract.hash, contractCanonical: contract.canonical,
     contractComplete: contract.complete && issues.length === 0 && executor.supportsAutomaticProgress };
 }
