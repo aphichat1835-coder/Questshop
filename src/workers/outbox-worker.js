@@ -4,7 +4,6 @@ import { renderProjection } from '../discord/renderers/projections.js';
 import { FencingLostError } from '../shared/errors.js';
 import { recordTransition } from '../domain/shared/transition.js';
 import { setTimeout as delay } from 'node:timers/promises';
-import { inspectPrivateSurface } from '../discord/surfaces/privacy.js';
 
 const BACKOFF = [1, 5, 15, 60, 300, 900];
 
@@ -15,7 +14,6 @@ function errorDetails(error) {
     forbidden: status === 403 || code === 50013,
     missing: status === 404 || error.code === 'DISCORD_404' || [10003, 10008].includes(code),
     missingChannel: error.code === 'DISCORD_404' || code === 10003,
-    privacyUnsafe: error.code === 'LOG_PAYMENTS_PRIVACY_UNSAFE',
   };
 }
 
@@ -36,7 +34,7 @@ function deadLetterCategory(event, projection) {
 function deliveryDisposition(event, projection, details) {
   const terminalDmFailure = projection?.projection_type === 'ORDER_DM'
     && projection.surface_key.startsWith('DM:');
-  const dead = !terminalDmFailure && (details.forbidden || details.privacyUnsafe || event.attempt_count > BACKOFF.length);
+  const dead = !terminalDmFailure && (details.forbidden || event.attempt_count > BACKOFF.length);
   if (terminalDmFailure) return { terminalDmFailure, dead, nextState: 'DELIVERED' };
   return { terminalDmFailure, dead, nextState: dead ? 'DEAD_LETTER' : 'RETRY_WAIT' };
 }
@@ -70,15 +68,6 @@ async function recordSurfaceFailure(client, event, projection, error, details) {
   if (details.missingChannel) {
     await client.query(`UPDATE surfaces SET state='RECONCILING',state_version=state_version+1,
       updated_at=clock_timestamp() WHERE surface_key=$1`, [projection.surface_key]);
-  }
-  if (details.privacyUnsafe) {
-    await client.query(`UPDATE surfaces SET state='DISABLED',state_version=state_version+1,
-      updated_at=clock_timestamp() WHERE surface_key='LOG_PAYMENTS'`);
-    await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-      VALUES(gen_random_uuid(),'LOG_PAYMENTS_PRIVACY_UNSAFE','LOG_PAYMENTS','OPEN','CRITICAL',$1,$2)
-      ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-        evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-    [{ reason: error.privacy?.reason ?? 'UNKNOWN', subjectId: error.privacy?.subjectId ?? null }, event.trace_id]);
   }
 }
 
@@ -181,31 +170,6 @@ async function resolveChannel(client, projection, surface) {
   return channel;
 }
 
-async function assertPaymentLogPrivacy({ client, channel, env, pool }) {
-  const guild = await client.guilds.fetch(env.DISCORD_GUILD_ID);
-  const botMember = await guild.members.fetchMe();
-  const config = (await pool.query('SELECT payload FROM config_versions ORDER BY version DESC LIMIT 1')).rows[0]?.payload ?? {};
-  const privacy = inspectPrivateSurface({ channel, guild, botMember, adminRoleId: config.adminRoleId,
-    ownerId: env.OWNER_ID });
-  if (!privacy.safe) {
-    throw Object.assign(new Error('LOG_PAYMENTS is not private; encrypted voucher payload was not rendered'), {
-      code: 'LOG_PAYMENTS_PRIVACY_UNSAFE', privacy,
-    });
-  }
-}
-
-async function notifyOwnerOfPaymentPrivacyIncident(client, env) {
-  try {
-    const owner = await client.users.fetch(env.OWNER_ID);
-    const dm = await owner.createDM();
-    await dm.send({ content: '⚠️ Questshop หยุดส่ง Payment Log เพราะห้อง LOG_PAYMENTS อาจถูกคนที่ไม่เกี่ยวข้องมองเห็นได้ กรุณาซ่อมสิทธิ์ห้องแล้ว Replay รายการจาก DLQ',
-      allowedMentions: { parse: [] } });
-  } catch {
-    // The durable incident and financial DLQ remain the authoritative alert if
-    // the Owner's DM is unavailable.
-  }
-}
-
 async function applyQuestAnnouncementPing(pool, projection, body) {
   if (projection.projection_type !== 'QUEST_NEW' || projection.ping_sent_at) return false;
   const config = (await pool.query('SELECT payload FROM config_versions ORDER BY version DESC LIMIT 1')).rows[0]?.payload;
@@ -257,12 +221,6 @@ export async function processOutbox({ holder, client, pool, env, renderProjectio
     }
     const surface = await loadActiveSurface(pool, projection);
     const channel = await resolveChannel(client, projection, surface);
-    // This must remain before renderProjection: PAYMENT_LOG is the only
-    // renderer allowed to decrypt a full voucher URL, and only after the
-    // destination's human visibility has been checked at send time.
-    if (projection.projection_type === 'PAYMENT_LOG' && projection.surface_key === 'LOG_PAYMENTS') {
-      await assertPaymentLogPrivacy({ client, channel, env, pool });
-    }
     const body = await renderProjectionFunction(pool, projection, { env, client });
     const pingSent = await applyQuestAnnouncementPing(pool, projection, body);
     const message = await publishProjection(channel, projection, body);
@@ -272,7 +230,6 @@ export async function processOutbox({ holder, client, pool, env, renderProjectio
   } catch (error) {
     if (!(error instanceof FencingLostError)) {
       await failDelivery(event, error, pool);
-      if (error.code === 'LOG_PAYMENTS_PRIVACY_UNSAFE') await notifyOwnerOfPaymentPrivacyIncident(client, env);
     }
   } finally {
     await heartbeat.stop();

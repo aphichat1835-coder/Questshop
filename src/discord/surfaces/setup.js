@@ -2,9 +2,6 @@ import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
 import { appendAdminAudit } from '../../domain/admin/audit.js';
-import { assertPrivateSurface } from './privacy.js';
-
-const PRIVATE = new Set(['LOG_PAYMENTS', 'LOG_QUEST_OPERATIONS', 'LOG_ADMIN', 'LOG_SYSTEM', 'ADMIN_PANEL']);
 
 function surfacePayload(surfaceKey, config) {
   const body = renderSurfaceAnchor(surfaceKey, config?.values ?? config);
@@ -22,16 +19,6 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
   const channel = interaction.options.getChannel('channel') ?? interaction.channel;
   if (!channel?.isTextBased() || channel.isDMBased()) {
     throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ต้องเลือกห้องข้อความในเซิร์ฟเวอร์');
-  }
-  const member = await interaction.guild.members.fetchMe();
-  if (PRIVATE.has(surfaceKey)) {
-    const adminRoleId = config?.values?.adminRoleId;
-    try {
-      assertPrivateSurface({ channel, guild: interaction.guild, botMember: member, adminRoleId,
-        ownerId: interaction.client.questshop?.env?.OWNER_ID ?? interaction.guild.ownerId });
-    } catch (error) {
-      throw new QuestshopError(error.code ?? 'PRIVATE_SURFACE_EXPOSED', 'ห้องหลังบ้านยังไม่ปลอดภัยสำหรับข้อมูลร้าน');
-    }
   }
   const existing = (await options.pool.query('SELECT * FROM surfaces WHERE surface_key = $1', [surfaceKey])).rows[0];
   let message = null;

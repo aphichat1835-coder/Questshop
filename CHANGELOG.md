@@ -57,6 +57,12 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Changed
 
+- Owner-only surface installation and `LOG_PAYMENTS` delivery no longer inspect human channel visibility. The Owner
+  is responsible for keeping backoffice channels private, including a channel that receives full voucher links.
+
+- Logger bindings, structured fields and string messages now pass through central secret redaction before Pino
+  receives them. CI also validates whitespace against the actual pull-request or push diff range.
+
 - PostgreSQL object-privilege synchronization now revokes stale Runtime default ACLs before granting the minimum
   future table/sequence/function policy. Its catalog-derived DDL is assembled inside PostgreSQL with a parameterized
   Runtime role, and PostgreSQL 16 regression tests cover separate effective roles, rollback, `applied: 0` repair,

@@ -13,11 +13,12 @@ test('runtime has no Permission Drift detector or repair route', async () => {
   assert.doesNotMatch(sources, /perm_repair/);
 });
 
-test('startup requires Administrator once while private surfaces retain human privacy checks', async () => {
+test('startup requires Administrator once and no Payment Log privacy guard remains', async () => {
   const startup = await readFile(new URL('../../src/bootstrap/startup.js', import.meta.url), 'utf8');
-  const source = await readFile(new URL('../../src/discord/surfaces/setup.js', import.meta.url), 'utf8');
+  const setup = await readFile(new URL('../../src/discord/surfaces/setup.js', import.meta.url), 'utf8');
+  const outbox = await readFile(new URL('../../src/workers/outbox-worker.js', import.meta.url), 'utf8');
   assert.match(startup, /Administrator/);
-  assert.match(source, /PRIVATE_SURFACE_EXPOSED/);
-  assert.doesNotMatch(source, /SURFACE_PERMISSION_MISSING/);
-  assert.doesNotMatch(source, /checkPermissionDrift|repairPermissionDrift/);
+  assert.doesNotMatch(setup, /assertPrivateSurface|PRIVATE_SURFACE_EXPOSED/);
+  assert.doesNotMatch(outbox, /inspectPrivateSurface|LOG_PAYMENTS_PRIVACY_UNSAFE/);
+  assert.doesNotMatch(setup, /SURFACE_PERMISSION_MISSING|checkPermissionDrift|repairPermissionDrift/);
 });

@@ -89,7 +89,7 @@ or live check runs.  It does **not** replace the live evidence required for a pr
 |---|---|
 | Package target Node `22.22.0`, local runtime Node `24.14.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | CI/Docker pin Node 22.22.0. CI fails rather than silently skipping PostgreSQL contracts when `TEST_DATABASE_URL` is absent and emits LCOV evidence for the exact workflow SHA. |
 | `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
-| `git diff --check` | Passed |
+| Patch whitespace | Local `git diff --check` passed; the PR workflow also validates the explicit Base-to-Head diff range. |
 | Git tracked files | Neither legacy reference project is tracked; both are ignored locally |
 
 The test database was a disposable local PostgreSQL container.  It is evidence for the database
@@ -127,7 +127,7 @@ required and is not replaced by source tests.
 | 12. Correlation and PostgreSQL time | correlation, transition, transaction, PostgreSQL time modules and durable interaction-session traces | Source-confirmed. Managed database clock/role observation remains. |
 | 13. PostgreSQL production contract | pools, transaction wrapper, migrations, `postgresql-roles.md` | Source-confirmed. Deployment sanitizes libpq SSL URL overrides while preserving verified CA, synchronizes Migrator-owned object privileges even with `applied: 0`, and validates effective Runtime grants. Managed PostgreSQL TLS/role retest remains live evidence. |
 | 14. Startup, shutdown and health | bootstrap, shutdown, health server and worker manager | Source-confirmed. `/statusz` uses fixed-size digest comparison for its Bearer token and never returns operational detail to unauthorized requests. Deployment/restart drill remains. |
-| 15. Surface setup permissions | `src/bootstrap/startup.js`, `src/discord/surfaces/{setup,privacy}.js`, outbox worker and surface policy tests | Startup requires Bot Administrator once. Runtime Permission Drift detector/repair remains removed; private human-visibility checks remain at setup and `LOG_PAYMENTS` checks again before decrypt/render, with incident/DLQ/manual repair on exposure. |
+| 15. Surface setup permissions | `src/bootstrap/startup.js`, `src/discord/surfaces/setup.js`, outbox worker and surface policy tests | Startup requires Bot Administrator once. Surface setup and payment-log delivery do not inspect human channel visibility; Runtime Permission Drift detector/repair remains removed. Owner accepts responsibility for private-channel configuration. |
 | 16. Engine/config versioning | versions, config service, runner pinning and compatibility test | Source-confirmed. N/N-1 deployment drain remains. |
 | 17. Retention and secrets | keyring, retention/key workers, migrations and coverage tests | Source-confirmed. Confirmed checkout sessions (including their selected Quest data) are pruned after seven days; checkout credentials are deleted at confirmation and cascade on session deletion. Expiry and cleanup use `FOR UPDATE SKIP LOCKED` bounded to 500 sessions per batch. Live key rotation plus restore test remains. |
 | 18. Backup and restore | encrypted S3 adapter, backup/restore scripts and fake-S3 contract tests | Source-confirmed. The configured database CA is materialized mode `0600` only while `pg_dump`/`pg_restore` run, then removed; an S3 failure terminates an in-flight dump. Real S3 upload and temporary managed-DB restore drill remain. |
