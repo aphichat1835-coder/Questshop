@@ -141,8 +141,7 @@ async function waitForTransportRetry({ error, safeRead, attempt, maxAttempts, si
   return true;
 }
 
-async function dispatchQuestRequest({ coordinator, method, options, path, profile, safeRead, timeoutMs, token, transport }) {
-  const bounded = requestSignal(options.signal, timeoutMs);
+async function dispatchQuestRequest({ bounded, coordinator, method, options, path, profile, safeRead, token, transport }) {
   let dispatched = false;
   try {
     const response = await coordinator.schedule({
@@ -163,8 +162,6 @@ async function dispatchQuestRequest({ coordinator, method, options, path, profil
   } catch (error) {
     if (bounded.timedOut()) throw new DiscordApiTimeoutError(path, { possiblySent: dispatched });
     throw markMutationTransportUncertainty(error, { safeRead, dispatched });
-  } finally {
-    bounded.dispose();
   }
 }
 
@@ -193,9 +190,10 @@ export function createQuestApiClient({ token, profile, coordinator = discordRate
     const method = String(options.method ?? 'GET').toUpperCase();
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       let dispatched = false;
+      const bounded = requestSignal(options.signal, timeoutMs);
       try {
         const dispatchedRequest = await dispatchQuestRequest({
-          coordinator, method, options, path, profile, safeRead, timeoutMs, token, transport,
+          bounded, coordinator, method, options, path, profile, safeRead, token, transport,
         });
         dispatched = dispatchedRequest.dispatched;
         const result = await interpretQuestResponse({ coordinator, path, response: dispatchedRequest.response, token });
@@ -203,9 +201,15 @@ export function createQuestApiClient({ token, profile, coordinator = discordRate
         if (await waitForSafeRetry({ ...result, safeRead, attempt, maxAttempts, coordinator, signal: options.signal })) continue;
         throw new DiscordApiError(result.response.status, path, result.data);
       } catch (error) {
+        if (error instanceof DiscordApiTimeoutError) throw error;
+        if (bounded.timedOut()) {
+          throw new DiscordApiTimeoutError(path, { possiblySent: dispatched });
+        }
         if (error instanceof DiscordApiError || error?.name === 'AbortError') throw error;
         if (await waitForTransportRetry({ error, safeRead, attempt, maxAttempts, signal: options.signal })) continue;
         throw markMutationTransportUncertainty(error, { safeRead, dispatched });
+      } finally {
+        bounded.dispose();
       }
     }
     throw new Error(`${method} ${path} retry budget exhausted`);

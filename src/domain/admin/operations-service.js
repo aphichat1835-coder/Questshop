@@ -68,6 +68,7 @@ export async function forcePublishFailedMonitorTest({ alertId, reason }, context
     if (alert.state === 'OVERRIDDEN') return { alert, idempotent: true };
     if (alert.state !== 'OPEN') throw new QuestshopError('QUEST_TEST_ALERT_NOT_OPEN', 'รายการนี้ไม่ได้รอการตัดสินใจ');
     const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [alert.quest_id])).rows[0];
+    if (!quest) throw new QuestshopError('QUEST_NOT_FOUND', 'ไม่พบ Quest');
     const batch = (await client.query('SELECT contract_hash FROM quest_test_batches WHERE id=$1 FOR SHARE',
       [alert.batch_id])).rows[0];
     if (!batch || batch.contract_hash !== quest.current_contract_hash) {

@@ -227,6 +227,12 @@ environment variable ที่ Platform กำหนดมีสิทธิ์�
 > เพื่อเดา/แก้ปัญหา key ที่สูญหาย คำสั่งเดียวกันนี้ใช้เพิ่ม Key version ใหม่หลัง Owner ตรวจค่าใน
 > Secret manager แล้วได้ แต่ไม่ยอมลบหรือแทนที่ Sentinel ของ Key เดิม
 
+หลัง Worker re-encrypt ข้อมูลด้วย Key ใหม่และ Restore drill ผ่านแล้ว ให้ตรวจความพร้อมก่อนนำ Key เก่าออกจาก
+Secret manager ด้วย `QUESTSHOP_RETIRE_DATA_KEY_VERSION=<version> npm run keys:retire:verify`,
+`QUESTSHOP_RETIRE_VOUCHER_KEY_VERSION=<version> npm run keys:retire:verify` หรือ
+`QUESTSHOP_RETIRE_BACKUP_KEY_VERSION=<version> npm run keys:retire:verify` คำสั่งนี้ไม่แก้ Secret เอง
+เพื่อป้องกันการลบ Key ที่ยังมีข้อมูลหรือรายการ Review อ้างอิงอยู่
+
 ## Health endpoints
 
 ```bash

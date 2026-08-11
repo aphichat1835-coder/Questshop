@@ -124,7 +124,10 @@ async function checkpointRetryJob(job, context, options, reasonCode = 'GRACEFUL_
 
 function retryDelay(error) {
   const retryAfter = retryAfterMs(error);
-  if (retryAfter != null) return retryAfter + secureJitter(Math.min(1_000, retryAfter));
+  if (retryAfter != null) {
+    const capped = Math.min(60_000, retryAfter);
+    return capped + secureJitter(Math.min(1_000, capped));
+  }
   const seconds = Number(error?.data?.retry_after ?? error?.retryAfter);
   const cap = Number.isFinite(seconds) ? Math.min(60_000, seconds * 1000) : 1000;
   return secureJitter(cap);
@@ -697,6 +700,12 @@ export async function settleRunnerRelease(job, { terminalState, reason, orderId 
 // serializable transaction so a crash cannot strand later order items.
 export async function releaseExpiredOrderItem({ orderItemId, reason = 'QUEST_EXPIRED_BEFORE_START' }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const expired = (await client.query(`SELECT 1 FROM order_items
+      WHERE id=$1 AND deadline_at<=clock_timestamp() FOR UPDATE`, [orderItemId])).rowCount;
+    if (!expired) {
+      throw new QuestshopError('ORDER_ITEM_NOT_EXPIRED',
+        `Order item ${orderItemId} has not passed its deadline`);
+    }
     const job = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [orderItemId])).rows[0];
     const item = await releaseReservationInTransaction(client, {
       orderItemId, terminalState: 'EXPIRED_RELEASED', reason,
@@ -944,7 +953,7 @@ async function moveRunnerReviewTransaction(client, { job, context, error, contra
     aggregateId: updatedJob.id, aggregateVersion: updatedJob.state_version,
     surfaceKey: 'LOG_QUEST_OPERATIONS', context });
   await openReview(client, { subjectType: 'ORDER_ITEM', subjectId: job.order_item_id,
-    reason: error.code, financial: true, ownerOnly: false, context });
+    reason: error.code ?? error.name ?? 'RUNNER_MANUAL_REVIEW', financial: true, ownerOnly: false, context });
   if (!contractFailure) return;
   await pauseQuestAfterContractFailure(client, job, error, context);
   await recordQuestContractIncident(client, job, error, context);
@@ -971,10 +980,12 @@ async function resolveRunnerFailure({ state, job, context, options, error }) {
   }
   if (error?.status === 429) {
     if (Number(state.runningJob.attempt_count) < 10) {
-      await checkpointRetryJob(state.runningJob, context, options, 'RATE_LIMITED', {
-        stateOverride: 'WAITING_RATE_LIMIT', delayMs: retryAfterMs(error) ?? 1_000,
+      const canWaitForRateLimit = ['LEASED', 'RUNNING'].includes(state.runningJob.state);
+      const checkpointed = await checkpointRetryJob(state.runningJob, context, options, 'RATE_LIMITED', {
+        stateOverride: canWaitForRateLimit ? 'WAITING_RATE_LIMIT' : null,
+        delayMs: retryAfterMs(error) ?? 1_000,
       });
-      return { outcome: 'WAITING_RATE_LIMIT', error };
+      return { outcome: checkpointed.state, error };
     }
     const exhausted = Object.assign(new QuestshopError('RATE_LIMIT_BUDGET_EXHAUSTED',
       'Quest API rate limit budget exhausted', { category: 'TRANSIENT' }), { status: 429 });
@@ -982,8 +993,8 @@ async function resolveRunnerFailure({ state, job, context, options, error }) {
     return { outcome: 'MANUAL_REVIEW', error: exhausted };
   }
   if (isRunnerTransient(error) && Number(state.runningJob.attempt_count) < 3) {
-    await checkpointRetryJob(state.runningJob, context, options, 'TRANSIENT_RETRY');
-    return { outcome: 'WAITING_RETRY', error };
+    const checkpointed = await checkpointRetryJob(state.runningJob, context, options, 'TRANSIENT_RETRY');
+    return { outcome: checkpointed.state, error };
   }
   const review = needsManualReview(error);
   if (review.manualReview) {

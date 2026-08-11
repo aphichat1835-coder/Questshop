@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { inspectPrivateSurface } from '../../src/discord/surfaces/privacy.js';
 
 function subject(id, visible) { return { id, visible }; }
-function channel({ everyone = false, admin = true, unexpectedRole = false, unexpectedMember = false } = {}) {
+function channel({ everyone = false, admin = true, unexpectedRole = false, unexpectedManagedRole = false,
+  unexpectedMember = false } = {}) {
   const roles = new Map([
     ['everyone', subject('everyone', everyone)], ['admin', subject('admin', admin)],
     ['bot-role', { id: 'bot-role', managed: true, visible: true }],
+    ['managed-human-role', { id: 'managed-human-role', managed: true, visible: unexpectedManagedRole }],
     ['other', subject('other', unexpectedRole)],
   ]);
   return {
@@ -19,7 +21,8 @@ function channel({ everyone = false, admin = true, unexpectedRole = false, unexp
 
 function inspect(options) {
   const value = channel(options);
-  return inspectPrivateSurface({ channel: value, guild: value.guild, botMember: { id: 'bot', roles: { cache: new Map() } },
+  return inspectPrivateSurface({ channel: value, guild: value.guild, botMember: { id: 'bot',
+    roles: { cache: new Map([['bot-role', value.guild.roles.cache.get('bot-role')]]) } },
     adminRoleId: 'admin', ownerId: 'owner' });
 }
 
@@ -27,5 +30,6 @@ test('private payment surface allows only the configured human access set', () =
   assert.deepEqual(inspect(), { safe: true });
   assert.equal(inspect({ everyone: true }).reason, 'EVERYONE_CAN_VIEW');
   assert.equal(inspect({ unexpectedRole: true }).reason, 'UNEXPECTED_ROLE_CAN_VIEW');
+  assert.equal(inspect({ unexpectedManagedRole: true }).reason, 'UNEXPECTED_ROLE_CAN_VIEW');
   assert.equal(inspect({ unexpectedMember: true }).reason, 'UNEXPECTED_MEMBER_CAN_VIEW');
 });

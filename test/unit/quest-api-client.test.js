@@ -72,6 +72,17 @@ test('Quest client aborts a hung request with a bounded timeout', async () => {
   });
 });
 
+test('Quest client keeps its deadline while an accepted response body stalls', async () => {
+  const transport = async ({ signal }) => response(new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+  }), 200);
+  await assert.rejects(api({ timeoutMs: 5, transport }).enroll('quest-1'), (error) => {
+    assert.ok(error instanceof DiscordApiTimeoutError);
+    assert.equal(error.possiblySent, true);
+    return true;
+  });
+});
+
 test('Quest client marks a mutation timeout before dispatch as safe to retry', async () => {
   const failingCoordinator = coordinator({ schedule: async () => { throw new Error('queue unavailable'); } });
   await assert.rejects(createQuestApiClient({ token: 'test-token', profile, coordinator: failingCoordinator }).enroll('quest-1'), (error) => {

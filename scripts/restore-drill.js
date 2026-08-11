@@ -11,7 +11,7 @@ import { decryptSecret } from '../src/adapters/crypto/keyring.js';
 
 const { Pool } = pg;
 const env = loadEnvironment();
-if (env.BACKUP_ENABLED === false || (env.BACKUP_ENABLED == null && env.NODE_ENV !== 'production')) {
+if (env.BACKUP_ENABLED !== true) {
   throw new Error('Backups are disabled; enable BACKUP_ENABLED before running scripts/restore-drill.js');
 }
 const source = getRuntimePool(env);
@@ -34,6 +34,7 @@ try {
   const targetUrl = new URL(direct); targetUrl.pathname = `/${databaseName}`;
   await withPostgresRootCertificate(env, async (rootCertificatePath) => {
     const processEnv = { ...process.env, PGPASSWORD: password };
+    delete processEnv.PGSSLROOTCERT;
     if (rootCertificatePath) processEnv.PGSSLROOTCERT = rootCertificatePath;
     const child = spawn(env.PG_RESTORE_PATH ?? 'pg_restore', ['--no-owner', '--no-acl', `--dbname=${targetUrl}`], {
       env: processEnv,

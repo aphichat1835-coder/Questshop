@@ -48,17 +48,24 @@ async function connectDiscord(env, logger, health, runtime) {
   client.questshop = runtime;
   client.on('interactionCreate', routeInteraction);
   client.on('error', (error) => logger.error({ error }, 'discord client error'));
-  await client.login(env.DISCORD_BOT_TOKEN);
-  if (!client.isReady()) await once(client, 'ready');
-  const guild = await client.guilds.fetch(env.DISCORD_GUILD_ID);
-  const me = await guild.members.fetchMe();
-  if (!me.permissions.has('Administrator')) {
-    throw Object.assign(new Error('Questshop bot must have Discord Administrator permission'), {
-      code: 'DISCORD_ADMINISTRATOR_REQUIRED',
-    });
+  try {
+    await client.login(env.DISCORD_BOT_TOKEN);
+    if (!client.isReady()) await once(client, 'ready');
+    const guild = await client.guilds.fetch(env.DISCORD_GUILD_ID);
+    const me = await guild.members.fetchMe();
+    if (!me.permissions.has('Administrator')) {
+      throw Object.assign(new Error('Questshop bot must have Discord Administrator permission'), {
+        code: 'DISCORD_ADMINISTRATOR_REQUIRED',
+      });
+    }
+    health.checks.discord = 'OK';
+    return client;
+  } catch (error) {
+    // The outer startup cleanup receives a client only after this function
+    // returns, so this is the sole owner for failures after Discord login.
+    await Promise.resolve(client.destroy?.()).catch(() => null);
+    throw error;
   }
-  health.checks.discord = 'OK';
-  return client;
 }
 
 export async function renewRuntimeLease({ abortController, env, holder, pool, lease, renew = renewLease, wait = delay }) {
@@ -69,10 +76,18 @@ export async function renewRuntimeLease({ abortController, env, holder, pool, le
         holder, fencingToken: lease.fencing_token, ttlSeconds: 60 }, { pool });
     } catch (error) {
       if (error instanceof FencingLostError || error?.code === 'FENCING_LOST') throw error;
+      if (abortController.signal.aborted) return null;
       lastError = error;
-      if (attempt < 2) await wait(1_000 * (2 ** attempt), undefined, {
-        signal: abortController.signal, ref: false,
-      });
+      if (attempt < 2) {
+        try {
+          await wait(1_000 * (2 ** attempt), undefined, {
+            signal: abortController.signal, ref: false,
+          });
+        } catch (waitError) {
+          if (abortController.signal.aborted || waitError?.name === 'AbortError') return null;
+          throw waitError;
+        }
+      }
     }
   }
   throw lastError;
@@ -86,7 +101,9 @@ export function startRuntimeHeartbeat({ abortController, env, holder, pool, runt
       await wait(15_000, undefined, { signal: abortController.signal, ref: false });
       if (abortController.signal.aborted) break;
       try {
-        lease = await renewRuntimeLease({ abortController, env, holder, pool, lease, renew, wait });
+        const renewed = await renewRuntimeLease({ abortController, env, holder, pool, lease, renew, wait });
+        if (!renewed) break;
+        lease = renewed;
       } catch (error) {
         health.ready = false; health.status = 'INCIDENT'; health.lastError = error;
         abortController.abort(error);

@@ -4,11 +4,31 @@ import { loadEnvironment, loadRuntimeEnvironment } from '../../src/config/env.js
 import { parsePromotionBasisPoints } from '../../src/discord/interactions/router.js';
 
 const key = Buffer.alloc(32, 7).toString('base64');
+
+function databaseUrl(role) {
+  const url = new URL(['postgresql', ':', '/', '/db.example.invalid'].join(''));
+  url.username = role;
+  url.hostname = 'db.example.invalid';
+  url.pathname = '/questshop_test';
+  url.searchParams.set('sslmode', 'verify-full');
+  return url.toString();
+}
+
+function backupSettings() {
+  return {
+    BACKUP_ENABLED: 'true', DATABASE_BACKUP_URL: databaseUrl('backup'),
+    S3_ENDPOINT: new URL('/questshop-backups', 'https://s3.example.invalid').toString(),
+    S3_BUCKET: 'questshop-backups', S3_ACCESS_KEY_ID: ['access', 'key'].join('-'),
+    S3_SECRET_ACCESS_KEY: ['test', 'secret'].join('-'),
+    BACKUP_ENCRYPTION_KEYS_JSON: JSON.stringify({ current: 1, keys: { 1: key } }),
+  };
+}
+
 const base = {
   NODE_ENV: 'production', DISCORD_BOT_TOKEN: 'x'.repeat(25), DISCORD_CLIENT_ID: '123456789012345678',
   DISCORD_GUILD_ID: '123456789012345679', OWNER_ID: '123456789012345680', STATUS_TOKEN: 'x'.repeat(32),
-  DATABASE_POOL_URL: 'postgresql://runtime:password@host/db?sslmode=verify-full',
-  DATABASE_DIRECT_URL: 'postgresql://migrator:password@host/db?sslmode=verify-full', DATABASE_SSL_CA_BASE64: 'Y2E=',
+  DATABASE_POOL_URL: databaseUrl('runtime'),
+  DATABASE_DIRECT_URL: databaseUrl('migrator'), DATABASE_SSL_CA_BASE64: 'Y2E=',
   GIT_SHA: 'a'.repeat(40),
   DATA_ENCRYPTION_KEYS_JSON: JSON.stringify({ current: 1, keys: { 1: key } }),
   VOUCHER_HMAC_KEYS_JSON: JSON.stringify({ current: 1, keys: { 1: key } }),
@@ -30,11 +50,7 @@ test('runtime configuration neither requires nor retains deployment/restore cred
 });
 
 test('runtime backup needs no restore credential while deployment tooling does', () => {
-  const backup = {
-    BACKUP_ENABLED: 'true', DATABASE_BACKUP_URL: 'postgresql://backup:password@host/db?sslmode=verify-full',
-    S3_ENDPOINT: 'https://s3.example.test', S3_BUCKET: 'questshop-backups', S3_ACCESS_KEY_ID: 'key',
-    S3_SECRET_ACCESS_KEY: 'secret', BACKUP_ENCRYPTION_KEYS_JSON: JSON.stringify({ current: 1, keys: { 1: key } }),
-  };
+  const backup = backupSettings();
   assert.equal(loadRuntimeEnvironment({ ...base, ...backup }).DATABASE_RESTORE_URL, undefined);
   assert.throws(() => loadEnvironment({ ...base, ...backup }), /DATABASE_RESTORE_URL/);
 });

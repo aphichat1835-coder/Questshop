@@ -82,6 +82,7 @@ export async function createEncryptedBackup({
     cipher.setAAD(header);
     const connection = dumpConnection(env.DATABASE_BACKUP_URL);
     const processEnv = { ...process.env, PGPASSWORD: connection.password };
+    delete processEnv.PGSSLROOTCERT;
     if (rootCertificatePath) processEnv.PGSSLROOTCERT = rootCertificatePath;
     const child = spawnProcess(pgDumpPath, ['--format=custom', '--no-owner', '--no-acl', `--dbname=${connection.url}`], {
       env: processEnv,

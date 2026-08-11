@@ -14,6 +14,7 @@
     "setup:preflight": "node scripts/setup-preflight.js",
     "setup:export-secret-bundle": "node scripts/export-secret-bundle.js",
     "keys:adopt": "node scripts/adopt-keyring-sentinels.js",
+    "keys:retire:verify": "node scripts/verify-key-retirement.js",
     "db:verify-roles": "node scripts/verify-postgres-roles.js",
     "deploy": "npm run setup:verify && npm run migrate && npm run register",
     "start": "node src/index.js",

@@ -36,9 +36,17 @@ async function preserveCleanupFailure(action, failure) {
   return failure;
 }
 
-export async function shutdown(runtime, reason = 'shutdown', { leaseLost = false, error = null } = {}) {
+export function shutdown(runtime, reason = 'shutdown', { leaseLost = false, error = null } = {}) {
   if (runtime.shutdownPromise) return runtime.shutdownPromise;
-  runtime.shutdownPromise = shutdownOnce(runtime, reason, { leaseLost, error });
+  let resolve;
+  let reject;
+  runtime.shutdownPromise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  // Install the promise before abort() can synchronously trigger a listener
+  // that calls shutdown again.
+  void Promise.resolve().then(() => shutdownOnce(runtime, reason, { leaseLost, error })).then(resolve, reject);
   return runtime.shutdownPromise;
 }
 

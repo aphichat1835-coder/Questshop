@@ -14,6 +14,9 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 ### Added
 
+- Forward-only migration guard สำหรับ active Monitor test batch ที่ยังไม่มี contract hash, คำสั่งตรวจความพร้อม
+  retire Data/Voucher/Backup Key version และ regression coverage สำหรับ Quest start window/Payment Log privacy
+
 - Owner-only `keys:adopt`, `db:verify-roles`, `setup:preflight` และ secret-bundle export สำหรับตรวจ
   keyring/role/Discord Administrator โดยไม่พิมพ์ Secret ออกมา
 
@@ -44,6 +47,9 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 - Automated unit, PostgreSQL integration, concurrency, crash, security, contract, recovery และ load tests
 
 ### Changed
+
+- Hardened Runtime credential loading, Discord startup/shutdown cleanup, Quest response-body deadlines,
+  Runner retry evidence, Monitor fencing, backup reconciliation และ destructive test-database safeguards
 
 - Quest API HTTP transport now has a literal `https://discord.com:443` destination, a strict v9 Quest-path
   allowlist, no redirect following, identity-only response encoding and a streamed response-size ceiling. This

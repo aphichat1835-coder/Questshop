@@ -38,6 +38,12 @@ async function recordPreMigrationBackup(database, env, backup) {
     backup.encryptionKeyVersion, backup]);
 }
 
+async function canRecordBackup(database) {
+  return Boolean((await database.query(
+    "SELECT to_regclass('public.backup_runs') AS value",
+  )).rows[0].value);
+}
+
 export async function runDeploymentMigrations(env, options = {}) {
   const backupEnabled = env.BACKUP_ENABLED ?? env.NODE_ENV === 'production';
   const database = options.pool ?? getDirectPool(env);
@@ -53,10 +59,17 @@ export async function runDeploymentMigrations(env, options = {}) {
     const preMigrationBackup = await preparePreMigrationBackup({
       database, env, backupEnabled, list, backup,
     });
+    // Old schema versions may not have backup_runs yet. When it already
+    // exists, persist the verified artifact before migration; otherwise the
+    // manifest remains the evidence until the expanded schema can record it.
+    const recordBeforeMigration = preMigrationBackup.artifact && await canRecordBackup(database);
+    if (recordBeforeMigration) await recordPreMigrationBackup(database, env, preMigrationBackup.artifact);
     const migration = await migrate({ pool: database, gitSha: env.GIT_SHA,
       runtimeRole: decodeURIComponent(new URL(env.DATABASE_POOL_URL).username) });
     await validateSentinels(database, env);
-    await recordPreMigrationBackup(database, env, preMigrationBackup.artifact);
+    if (preMigrationBackup.artifact && !recordBeforeMigration) {
+      await recordPreMigrationBackup(database, env, preMigrationBackup.artifact);
+    }
     return { migration, preMigrationBackup: preMigrationBackup.status };
   } finally {
     await close?.();

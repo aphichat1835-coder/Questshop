@@ -167,8 +167,8 @@ export async function pauseQuestForRetest(client, quest, context) {
 
 async function queueDiscoveryProjections(client, quest, revision, context, source) {
   // Monitor discovery waits for a verified test gate. Customer checkout
-  // discovery is announced after analysis, but remains account-scoped and
-  // does not open public sale.
+  // discovery may be announced after analysis, but it never opens public
+  // sale or identifies the customer in the public projection.
   const shouldPublish = source === 'CUSTOMER_CHECKOUT'
     || quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN';
   const announcementNotBefore = quest.announcement_state === 'ANNOUNCED'
@@ -198,9 +198,9 @@ export async function ingestDiscovery({
     let quest = await upsertQuest(client, merged);
     const metadata = await recordMetadataRevision(client, quest, merged, source, redactedRaw, context);
     quest = await analyzeQuest(client, metadata.quest, merged, context);
-    // A checkout discovery is account-scoped: it may be offered to that
-    // checked account, but it must not consume a Monitor credential or turn
-    // into a public announcement before the scanner has independently seen it.
+    // Checkout discovery may be offered to that checked account and announced
+    // after analysis, but it must not consume a Monitor credential or open
+    // public sale before the scanner has independently verified it.
     if (quest.analysis_state === 'SUPPORTED' && source === 'MONITOR') {
       await createMonitorTestBatch(client, { quest, context, force: needsRetest });
     }
@@ -229,6 +229,7 @@ export async function resolveSaleEligibility({
     const publicSale = quest.sale_state === 'OPEN' && quest.analysis_state === 'SUPPORTED'
       && await hasCurrentTestPass(client, quest);
     const customerAccountSale = allowCustomerAccount && quest.analysis_state === 'SUPPORTED'
+      && !['PAUSED', 'EXPIRED'].includes(quest.sale_state)
       && coreMetadataPresent(quest);
     if (!publicSale && !customerAccountSale) {
       return { eligible: false, reason: 'QUEST_NOT_FOR_SALE', quest };

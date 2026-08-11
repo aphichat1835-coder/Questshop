@@ -41,7 +41,11 @@ export async function acquireTestRun({ holder, pool }) {
       m.cooldown_until AS selected_cooldown,m.last_used_at AS selected_last_used,
       c.key_version,c.nonce,c.ciphertext,c.auth_tag
       FROM quest_test_runs tr JOIN quests q ON q.quest_id=tr.quest_id
-      JOIN monitor_accounts m ON (tr.target_monitor_id IS NULL OR m.id=tr.target_monitor_id)
+      -- A recovered TESTING run must verify through the exact account that
+      -- sent its prior mutation. Fresh queued work with no target may select
+      -- any active monitor.
+      JOIN monitor_accounts m ON (m.id=COALESCE(tr.monitor_id,tr.target_monitor_id)
+        OR (tr.monitor_id IS NULL AND tr.target_monitor_id IS NULL))
       JOIN monitor_credentials c ON c.monitor_id=m.id
       WHERE (tr.state='TEST_QUEUED' AND tr.available_at<=clock_timestamp()
           OR tr.state='TESTING' AND tr.lease_expires_at<=clock_timestamp())

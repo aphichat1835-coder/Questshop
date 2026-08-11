@@ -120,11 +120,12 @@ async function persistHealth({ monitor, outcome, context }, options) {
       consecutive_failures=CASE WHEN $2='INVALID' THEN m.consecutive_failures+1
         WHEN $2='READY' THEN 0 ELSE m.consecutive_failures END,
       updated_at=clock_timestamp()
-      WHERE m.id=$1 AND EXISTS(SELECT 1 FROM monitor_credentials c WHERE c.monitor_id=m.id
+      WHERE m.id=$1 AND m.state_version=$10
+        AND EXISTS(SELECT 1 FROM monitor_credentials c WHERE c.monitor_id=m.id
         AND c.key_version=$6 AND c.nonce=$7 AND c.ciphertext=$8 AND c.auth_tag=$9)
       RETURNING m.*`, [monitor.id, outcome.healthState, outcome.errorCode ?? null,
       outcome.questCount ?? null, outcome.accountId ?? null, monitor.key_version,
-      monitor.nonce, monitor.ciphertext, monitor.auth_tag])).rows[0];
+      monitor.nonce, monitor.ciphertext, monitor.auth_tag, monitor.state_version])).rows[0];
     if (!row) return null;
     await appendAdminAudit(client, { action: 'MONITOR_HEALTH_CHECK', targetType: 'MONITOR',
       targetId: row.id, actorId: context.actorId,
@@ -170,10 +171,13 @@ export async function checkAllMonitorHealth({ env }, context, options = {}) {
     (await client.query(`SELECT id FROM monitor_accounts
       ORDER BY priority DESC,last_used_at NULLS FIRST,created_at`)).rows
   ));
-  const deadlineAt = Date.now() + Math.max(1, Number(options.deadlineMs ?? DEFAULT_ALL_MONITORS_DEADLINE_MS));
+  // This is a local latency budget, not a durable business deadline. A
+  // monotonic clock remains correct if the host wall clock changes mid-check.
+  const startedAt = performance.now();
+  const deadlineMs = Math.max(1, Number(options.deadlineMs ?? DEFAULT_ALL_MONITORS_DEADLINE_MS));
   const results = [];
   for (const monitor of monitors) {
-    const remainingMs = deadlineAt - Date.now();
+    const remainingMs = deadlineMs - (performance.now() - startedAt);
     if (remainingMs <= 0) {
       results.push({ monitor: { id: monitor.id }, healthState: 'DEGRADED',
         errorCode: 'HEALTH_CHECK_DEADLINE', staleCredential: false });

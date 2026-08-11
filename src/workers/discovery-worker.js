@@ -18,10 +18,10 @@ async function markMonitorFailure(pool, monitor, error, context) {
   if (error.fatalAuth || failures >= 5) state = 'QUARANTINED';
   else if (failures >= 3) state = 'COOLDOWN';
   const updated = (await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
-    state_version=state_version+CASE WHEN state<>$2 THEN 1 ELSE 0 END,
+    state_version=state_version+1,
     cooldown_until=CASE WHEN $2='COOLDOWN' THEN clock_timestamp()+interval '15 minutes' ELSE cooldown_until END,
-    updated_at=clock_timestamp() WHERE id=$1 AND state<>'DISABLED' RETURNING state`,
-  [monitor.id, state, failures])).rows[0];
+    updated_at=clock_timestamp() WHERE id=$1 AND state_version=$4 AND state<>'DISABLED' RETURNING state`,
+  [monitor.id, state, failures, monitor.state_version])).rows[0];
   if (updated?.state === 'QUARANTINED') await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
     VALUES(gen_random_uuid(),'MONITOR_QUARANTINED',$1,'OPEN','ERROR',$2,$3)
     ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
@@ -67,7 +67,8 @@ async function scanOneMonitor(monitor, input, context) {
     await ingestMonitorQuests(quests, { source: 'MONITOR', context, pool: input.pool,
       runnerConcurrency: input.runnerConcurrency });
     await input.pool.query(`UPDATE monitor_accounts SET consecutive_failures=0,last_used_at=clock_timestamp(),
-      updated_at=clock_timestamp() WHERE id=$1`, [monitor.id]);
+      state_version=state_version+1,updated_at=clock_timestamp()
+      WHERE id=$1 AND state_version=$2 AND state='ACTIVE'`, [monitor.id, monitor.state_version]);
     return { quests, missingCoreIds: missingCoreQuestIds(quests) };
   } catch (error) {
     await markMonitorFailure(input.pool, monitor, error, context);

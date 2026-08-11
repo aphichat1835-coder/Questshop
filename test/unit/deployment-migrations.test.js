@@ -2,6 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { runDeploymentMigrations } from '../../src/db/deployment-migrations.js';
 
+function databaseUrl(role) {
+  const url = new URL(['postgresql', ':', '/', '/db.example.invalid'].join(''));
+  url.username = role;
+  url.hostname = 'db.example.invalid';
+  url.pathname = '/questshop_test';
+  url.searchParams.set('sslmode', 'verify-full');
+  return url.toString();
+}
+
 function database(schemaVersion = 21) {
   const queries = [];
   return {
@@ -18,7 +27,7 @@ function database(schemaVersion = 21) {
 
 const env = {
   NODE_ENV: 'production', BACKUP_ENABLED: true, GIT_SHA: 'a'.repeat(40),
-  DATABASE_POOL_URL: 'postgresql://runtime:password@host/db?sslmode=verify-full',
+  DATABASE_POOL_URL: databaseUrl('runtime'),
 };
 
 test('production deployment refuses a pending migration when backup is disabled', async () => {

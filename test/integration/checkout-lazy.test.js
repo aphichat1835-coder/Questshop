@@ -7,6 +7,7 @@ import { adjustBalance } from '../../src/domain/wallet/service.js';
 import {
   buildQuote, confirmOrder, createSession, getSelectionPage, selectAll,
 } from '../../src/domain/checkout/service.js';
+import { resolveSaleEligibility } from '../../src/domain/catalog/service.js';
 import { openOrderItemReview, setQuestSaleState } from '../../src/domain/admin/operations-service.js';
 import { resolveSubjectReview } from '../../src/domain/reviews/service.js';
 import { questContractHash } from '../../src/quest-engine/schema/contract.js';
@@ -67,8 +68,8 @@ test('large checkout reserves all items but materializes one account job', async
     actorType: 'CUSTOMER', actorId: user, guildId: '10000000000000002', idempotencyKey: 'confirm-duplicate' }), options);
   assert.equal(duplicateOrder.orderId, order.orderId);
   assert.equal(duplicateOrder.idempotent, true);
-  assert.equal(Number((await pool.query('SELECT count(*)::integer AS count FROM orders WHERE id=$1',
-    [order.orderId])).rows[0].count), 1);
+  assert.equal(Number((await pool.query('SELECT count(*)::integer AS count FROM orders WHERE discord_user_id=$1',
+    [user])).rows[0].count), 1);
   const persistedSession = (await pool.query('SELECT trace_id FROM interaction_sessions WHERE id=$1', [created.session.id])).rows[0];
   const persistedOrder = (await pool.query('SELECT trace_id FROM orders WHERE id=$1', [order.orderId])).rows[0];
   const auditEvent = (await pool.query(`SELECT trace_id FROM outbox_events
@@ -133,6 +134,10 @@ test('large checkout reserves all items but materializes one account job', async
     createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
       guildId: '10000000000000002', idempotencyKey: 'quest-pause' }), { pool });
   assert.equal(paused.sale_state, 'PAUSED');
+  const pausedAdmission = await resolveSaleEligibility({ questId, allowCustomerAccount: true },
+    context('paused-customer-admission'), { pool });
+  assert.equal(pausedAdmission.eligible, false);
+  assert.equal(pausedAdmission.reason, 'QUEST_NOT_FOR_SALE');
   await pool.query(`UPDATE quests SET public_test_gate_override=true,
     public_test_gate_override_contract_hash=current_contract_hash WHERE quest_id=$1`, [questId]);
   const reopened = await setQuestSaleState({ questId, nextState: 'OPEN', reason: 'validation passed',

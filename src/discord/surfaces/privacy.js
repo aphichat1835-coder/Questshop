@@ -19,7 +19,9 @@ export function inspectPrivateSurface({ channel, guild, botMember, adminRoleId, 
     if (!adminRole || !canView(channel, adminRole)) return { safe: false, reason: 'ADMIN_ROLE_CANNOT_VIEW' };
   }
   for (const role of guild.roles.cache.values()) {
-    if (role.id === everyone.id || role.managed || allowed.has(role.id) || botMember?.roles?.cache?.has(role.id)) continue;
+    // Managed integration roles can still be assigned to people. They are
+    // safe to skip only when the bot itself holds them.
+    if (role.id === everyone.id || allowed.has(role.id) || botMember?.roles?.cache?.has(role.id)) continue;
     if (canView(channel, role)) return { safe: false, reason: 'UNEXPECTED_ROLE_CAN_VIEW', subjectId: role.id };
   }
   for (const overwrite of channel.permissionOverwrites?.cache?.values?.() ?? []) {

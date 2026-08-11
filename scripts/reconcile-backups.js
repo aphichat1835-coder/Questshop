@@ -5,7 +5,7 @@ import { createS3Client } from '../src/adapters/s3/client.js';
 import { closeDirectPool, getDirectPool } from '../src/db/pools.js';
 
 const env = loadEnvironment();
-if (env.BACKUP_ENABLED === false || (env.BACKUP_ENABLED == null && env.NODE_ENV !== 'production')) {
+if (env.BACKUP_ENABLED !== true) {
   throw new Error('Backups are disabled; enable BACKUP_ENABLED before running scripts/reconcile-backups.js');
 }
 
@@ -14,13 +14,22 @@ function validManifest(value) {
     && /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.id)
     && typeof value.objectKey === 'string' && value.objectKey.endsWith('.qsbk')
     && /^[a-f0-9]{64}$/i.test(value.checksum)
-    && Number.isInteger(value.schemaVersion) && Number.isInteger(value.encryptionKeyVersion);
+    && Number.isInteger(value.schemaVersion) && Number.isInteger(value.encryptionKeyVersion)
+    && value.reason === 'pre-migration';
 }
 
+const MANIFEST_MAX_BYTES = 64 * 1024;
+
 async function readManifest(s3, key) {
-  const response = await s3.send(new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key }));
+  const response = await s3.send(new GetObjectCommand({ Bucket: env.S3_BUCKET, Key: key,
+    // Request one byte past the limit so an object at the boundary remains
+    // valid while an oversized object is rejected before full buffering.
+    Range: `bytes=0-${MANIFEST_MAX_BYTES}` }));
+  if (Number(response.ContentLength) > MANIFEST_MAX_BYTES) {
+    throw new Error(`Backup manifest is too large: ${key}`);
+  }
   const text = await response.Body.transformToString();
-  if (Buffer.byteLength(text) > 64 * 1024) throw new Error(`Backup manifest is too large: ${key}`);
+  if (Buffer.byteLength(text) > MANIFEST_MAX_BYTES) throw new Error(`Backup manifest is too large: ${key}`);
   const manifest = JSON.parse(text);
   if (!validManifest(manifest) || `${manifest.objectKey}.json` !== key) {
     throw new Error(`Backup manifest is invalid: ${key}`);

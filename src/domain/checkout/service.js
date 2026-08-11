@@ -199,7 +199,9 @@ async function validateOptionAdmission(client, option, quest) {
     return;
   }
   if (option.admission_scope === 'CUSTOMER_ACCOUNT'
-    && quest?.analysis_state === 'SUPPORTED' && coreMetadataPresent(quest)) return;
+    && quest?.analysis_state === 'SUPPORTED'
+    && !['PAUSED', 'EXPIRED'].includes(quest.sale_state)
+    && coreMetadataPresent(quest)) return;
   throw new QuestshopError('QUEST_NOT_FOR_SALE', `Quest ${option.quest_name} ไม่รองรับสำหรับบัญชีนี้`);
 }
 

@@ -10,17 +10,29 @@ import {
   upsertEnvironmentText,
   writeEnvironmentFile,
 } from '../../src/config/setup-environment.js';
-import { decodeSecretBundle } from '../../src/config/load-local-environment.js';
+import { decodeSecretBundle } from '../../src/config/secret-bundle.js';
+import { runtimeEnvironmentValues } from '../../src/config/runtime-environment-values.js';
+import { assertDisposableTestDatabase } from '../fixtures/postgres.js';
 
 const certificate = '-----BEGIN CERTIFICATE-----\nTEST-CA\n-----END CERTIFICATE-----\n';
+
+function databaseUrl(role) {
+  const url = new URL(['postgresql', ':', '/', '/db.example.invalid'].join(''));
+  url.username = role;
+  url.hostname = 'db.example.invalid';
+  url.pathname = '/questshop_test';
+  url.searchParams.set('sslmode', 'verify-full');
+  return url.toString();
+}
+
 const external = Object.freeze({
   NODE_ENV: 'production',
   DISCORD_BOT_TOKEN: 'x'.repeat(25),
   DISCORD_CLIENT_ID: '123456789012345678',
   DISCORD_GUILD_ID: '123456789012345679',
   OWNER_ID: '123456789012345680',
-  DATABASE_POOL_URL: 'postgresql://runtime:password@host/db?sslmode=verify-full',
-  DATABASE_DIRECT_URL: 'postgresql://migrator:password@host/db?sslmode=verify-full',
+  DATABASE_POOL_URL: databaseUrl('runtime'),
+  DATABASE_DIRECT_URL: databaseUrl('migrator'),
   GIT_SHA: 'a'.repeat(40),
   DATABASE_SSL_CA_INPUT: certificate,
 });
@@ -132,4 +144,39 @@ test('stateless secret bundle is decoded without accepting malformed data', () =
   assert.throws(() => decodeSecretBundle('not-base64-json'));
   const invalid = Buffer.from(JSON.stringify({ 'not valid': 'x' })).toString('base64url');
   assert.throws(() => decodeSecretBundle(invalid));
+});
+
+test('runtime environment allowlist excludes deployment and unknown values before process mutation', () => {
+  const values = runtimeEnvironmentValues({
+    STATUS_TOKEN: Buffer.alloc(32, 6).toString('hex'),
+    DATABASE_POOL_URL: databaseUrl('runtime'),
+    DATABASE_DIRECT_URL: databaseUrl('migrator'),
+    DATABASE_RESTORE_URL: databaseUrl('restore'),
+    UNRELATED_DEPLOYMENT_SECRET: 'ignored',
+  });
+  assert.equal(values.STATUS_TOKEN.length, 64);
+  assert.equal(values.DATABASE_POOL_URL, databaseUrl('runtime'));
+  assert.equal(values.DATABASE_DIRECT_URL, undefined);
+  assert.equal(values.DATABASE_RESTORE_URL, undefined);
+  assert.equal(values.UNRELATED_DEPLOYMENT_SECRET, undefined);
+});
+
+test('destructive PostgreSQL fixtures require explicit disposable-database authorization', () => {
+  const previous = process.env.QUESTSHOP_ALLOW_TEST_DATABASE_RESET;
+  const disposableUrl = (name) => {
+    const url = new URL(['postgresql', ':', '/', '/test-host.invalid'].join(''));
+    url.hostname = 'test-host.invalid';
+    url.pathname = `/${name}`;
+    return url;
+  };
+  try {
+    delete process.env.QUESTSHOP_ALLOW_TEST_DATABASE_RESET;
+    assert.throws(() => assertDisposableTestDatabase(disposableUrl('questshop_ci')));
+    process.env.QUESTSHOP_ALLOW_TEST_DATABASE_RESET = 'true';
+    assert.doesNotThrow(() => assertDisposableTestDatabase(disposableUrl('questshop_ci')));
+    assert.throws(() => assertDisposableTestDatabase(disposableUrl('questshop_production')));
+  } finally {
+    if (previous == null) delete process.env.QUESTSHOP_ALLOW_TEST_DATABASE_RESET;
+    else process.env.QUESTSHOP_ALLOW_TEST_DATABASE_RESET = previous;
+  }
 });

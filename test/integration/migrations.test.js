@@ -2,17 +2,14 @@ import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import pg from 'pg';
 import { runMigrations } from '../../src/db/migrations.js';
 import { validateRuntimeRole } from '../../src/db/role-contract.js';
 import { MAX_COMPATIBLE_SCHEMA_VERSION } from '../../src/config/versions.js';
-
-const { Pool } = pg;
+import { createIsolatedTestPool } from '../fixtures/postgres.js';
 let pool;
 before(async () => {
   if (!process.env.TEST_DATABASE_URL) return;
-  pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL, max: 2 });
-  await pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public');
+  pool = await createIsolatedTestPool({ max: 2, applyMigrations: false });
 });
 after(async () => { await pool?.end(); });
 
@@ -36,6 +33,9 @@ test('migration runner applies and verifies all checksums idempotently', async (
   const activeBatchIndex = await pool.query(`SELECT indexdef FROM pg_indexes
     WHERE schemaname='public' AND indexname='quest_test_batches_one_active_contract_idx'`);
   assert.match(activeBatchIndex.rows[0].indexdef, /quest_id, contract_hash/);
+  const legacyBatchIndex = await pool.query(`SELECT indexdef FROM pg_indexes
+    WHERE schemaname='public' AND indexname='quest_test_batches_one_active_null_contract_idx'`);
+  assert.match(legacyBatchIndex.rows[0].indexdef, /contract_hash IS NULL/);
 
   await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state)
     VALUES('LOG_SYSTEM','guild','channel','message','DRIFTED')

@@ -10,6 +10,7 @@ against one exact Git SHA.  Do not record any secret or full voucher URL there.
 - Run `npm run backup` and `npm run restore:drill`; validate wallet checkpoints, reservations, payments, queue,
   outbox and encrypted credentials.
 - Close the test round with compensating entries. Never delete financial or Admin audit.
-- Enable gates individually: notifications, scanner, announcement, top-up, auto-credit, orders, runner,
-  customer interactions, then store open. Record Owner approval and evidence for each gate.
+- Enable gates individually: retention jobs, notifications, scanner, background testing, announcement,
+  top-up, auto-credit, orders, runner, customer interactions, then store open. Record Owner approval and
+  evidence for each gate.
 - Do not call the release production-ready until live boundaries and automated gates pass on one SHA.

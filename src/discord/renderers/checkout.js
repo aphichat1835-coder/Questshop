@@ -36,6 +36,15 @@ function timestamp(value, style = 'R') {
   return Number.isFinite(millis) ? `<t:${Math.floor(millis / 1000)}:${style}>` : 'ไม่ระบุ';
 }
 
+function safeHttpsUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'https:' ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 function walletAfter(available, total) {
   const result = BigInt(available ?? 0) - BigInt(total ?? 0);
   return result >= 0n ? baht(result) : `เครดิตไม่พอ (ขาด ${baht(-result)})`;
@@ -69,7 +78,8 @@ export function renderSelection(page) {
   ].join('\n');
   const embed = new EmbedBuilder().setColor(COLOR.primary).setTitle('เลือก Quest ที่ต้องการ')
     .setDescription(description).setFooter({ text: 'ระบบจะตรวจราคา สถานะ และเวลาคงเหลืออีกครั้งก่อนยืนยัน' });
-  if (page.session.payload.avatarUrl) embed.setThumbnail(page.session.payload.avatarUrl);
+  const avatarUrl = safeHttpsUrl(page.session.payload.avatarUrl);
+  if (avatarUrl) embed.setThumbnail(avatarUrl);
   const selectionComponents = rows.length
     ? [new ActionRowBuilder().addComponents(select)] : [];
   return {
@@ -111,7 +121,8 @@ export function renderQuote(quote) {
   const embed = new EmbedBuilder().setColor(COLOR.success).setTitle('ตรวจสอบและยืนยันรายการ')
     .setDescription(description.slice(0, 4096))
     .setFooter({ text: 'สำเร็จจึงคิดค่าบริการ • ล้มเหลวจะคืนเครดิตของ Quest นั้นอัตโนมัติ' });
-  if (quote.session.payload.avatarUrl) embed.setThumbnail(quote.session.payload.avatarUrl);
+  const avatarUrl = safeHttpsUrl(quote.session.payload.avatarUrl);
+  if (avatarUrl) embed.setThumbnail(avatarUrl);
   return {
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(
@@ -139,7 +150,8 @@ export function renderOrderConfirmation(result, historyLink) {
   ].join('\n');
   const embed = new EmbedBuilder().setColor(COLOR.success).setTitle('✅ รับรายการเรียบร้อยแล้ว')
     .setDescription(description).setFooter({ text: 'เก็บ Order ID ไว้สำหรับติดต่อ Support' });
-  if (result.order?.account_avatar_url) embed.setThumbnail(result.order.account_avatar_url);
+  const avatarUrl = safeHttpsUrl(result.order?.account_avatar_url);
+  if (avatarUrl) embed.setThumbnail(avatarUrl);
   const components = historyLink
     ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link)
       .setURL(historyLink).setLabel('ดูความคืบหน้าการทำ Quest'))]

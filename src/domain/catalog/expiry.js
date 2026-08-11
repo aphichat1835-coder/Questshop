@@ -45,7 +45,10 @@ export async function evaluateExpiryAdmission(client, {
   // New catalog/checkout admission requires starts_at. Older prelaunch jobs
   // may legitimately lack it, so do not strand an already-reserved N-1 job.
   if (Number.isFinite(startsAt) && startsAt > current) {
-    return { eligible: false, reason: 'QUEST_NOT_STARTED', remainingMs: null,
+    // remainingMs is always time remaining before expiry. Returning null here
+    // lets generic consumers accidentally classify this as expired.
+    return { eligible: false, reason: 'QUEST_NOT_STARTED',
+      remainingMs: Number.isFinite(expiresAt) ? expiresAt - current : null,
       availableAt: new Date(startsAt).toISOString() };
   }
   if (!Number.isFinite(expiresAt)) return { eligible: false, reason: 'EXPIRY_MISSING' };

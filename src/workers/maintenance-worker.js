@@ -317,7 +317,9 @@ export async function reconcileSellableQuests(pool, context, runnerConcurrency) 
         if (!current) return;
         const currentAdmission = await evaluateExpiryAdmission(database, { quest: current, runnerConcurrency });
         if (currentAdmission.eligible) return;
-        const expired = currentAdmission.reason !== 'EXPIRY_MISSING' && currentAdmission.remainingMs <= 0;
+        const expired = currentAdmission.reason !== 'EXPIRY_MISSING'
+          && currentAdmission.reason !== 'QUEST_NOT_STARTED'
+          && Number.isFinite(currentAdmission.remainingMs) && currentAdmission.remainingMs <= 0;
         const next = expired ? 'EXPIRED' : 'PAUSED';
         if (current.sale_state === next) return;
         assertTransition(SALE_TRANSITIONS, current.sale_state, next);

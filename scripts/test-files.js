@@ -40,7 +40,9 @@ if (coverage) {
   // Reporter destinations are paired in declaration order by Node. Keep each
   // reporter next to its destination; grouping reporters first produced an
   // empty LCOV artifact on supported Node versions while the textual report
-  // still looked successful.
+  // still looked successful. PostgreSQL fixtures hold a session advisory lock
+  // through each test-file lifecycle, so a combined coverage invocation cannot
+  // reset a disposable schema underneath another suite.
   await run(['--test', '--test-concurrency=1', '--experimental-test-coverage',
     '--test-reporter=spec', '--test-reporter-destination=stdout',
     '--test-reporter=lcov', '--test-reporter-destination=coverage/lcov.info', ...files]);
