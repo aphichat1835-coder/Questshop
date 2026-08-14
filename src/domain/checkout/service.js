@@ -431,12 +431,6 @@ async function validateConfirmationSession(client, sessionInput, preflight, env)
   if (!verifyPreflightSignature(preflight, env)) {
     throw new QuestshopError('PREFLIGHT_SIGNATURE_INVALID', 'ผลการตรวจบัญชีไม่ถูกต้อง กรุณาเริ่มใหม่');
   }
-  const blocked = (await client.query(`
-    SELECT 1 FROM blocklist_entries
-    WHERE discord_user_id = $1 AND block_type = 'ORDER_BLOCKED' AND revoked_at IS NULL
-      AND starts_at <= clock_timestamp() AND (expires_at IS NULL OR expires_at > clock_timestamp())
-  `, [actorId])).rowCount > 0;
-  if (blocked) throw new QuestshopError('ORDER_BLOCKED', 'บัญชีนี้ถูกระงับการสั่งทำ Quest');
   const queueCount = Number((await client.query(`
     SELECT count(*)::integer AS count FROM runner_jobs
     WHERE state IN ('QUEUED','LEASED','RUNNING','WAITING_RATE_LIMIT','WAITING_RETRY')

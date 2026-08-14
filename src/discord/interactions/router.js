@@ -1,6 +1,6 @@
 import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, LabelBuilder, ModalBuilder,
-  StringSelectMenuBuilder, TextInputBuilder, TextInputStyle, escapeMarkdown,
+  StringSelectMenuBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder, escapeMarkdown,
 } from 'discord.js';
 import { v7 as uuidv7 } from 'uuid';
 import { createContext } from '../../shared/correlation.js';
@@ -16,7 +16,6 @@ import { setupSurface } from '../surfaces/setup.js';
 import { assertRateLimitAvailable, consumeRateLimit } from '../../domain/admin/rate-limits.js';
 import { minimumConfiguredPrice, minimumSellablePrice } from '../../domain/pricing/resolver.js';
 import { withTransaction } from '../../db/transaction.js';
-import { FEATURE_GATES } from '../../config/feature-gates.js';
 import {
   bindSessionMessage,
   createAdminSession,
@@ -24,24 +23,22 @@ import {
   terminateAdminSession,
 } from '../../domain/admin/session-service.js';
 import {
-  createPromotion, setPriceRule, setPriceRuleEnabled, setPromotionState, updateFeatureGate, updateRuntimeConfig,
+  replaceManualPromotion, setManualPromotionEnabled, setQuestCategoryPrice, updateRuntimeConfig,
 } from '../../domain/admin/config-service.js';
 import { adjustWalletAsAdmin } from '../../domain/admin/money-service.js';
 import { refundCapturedOrderItem } from '../../domain/wallet/service.js';
-import { blockUser, unblockUser } from '../../domain/blocklist/service.js';
-import { addEvidence, assignReview, resolveSubjectReview } from '../../domain/reviews/service.js';
+import { resolveSubjectReview } from '../../domain/reviews/service.js';
 import { parseBahtToCents } from '../../shared/money.js';
 import { activateReceiver } from '../../domain/admin/receiver-service.js';
 import {
   addMonitor, checkAllMonitorHealth, checkMonitorHealth, rotateMonitorCredential, setMonitorState,
 } from '../../domain/admin/monitor-service.js';
 import {
-  forcePublishFailedMonitorTest, openOrderItemReview, setCircuitBreakerState, setQuestSaleState,
+  forcePublishFailedMonitorTest, openOrderItemReview, setCircuitBreakerState,
 } from '../../domain/admin/operations-service.js';
 import { loadTestFailureAlert, retryFailedTestAlert } from '../../domain/catalog/test-gate.js';
 import { discardDeadLetter, replayDeadLetter } from '../../domain/outbox/dlq-service.js';
 import { loadRuntimeConfig } from '../../config/runtime-config.js';
-import { APP_VERSION, ENGINE_VERSION } from '../../config/versions.js';
 import {
   baht,
   renderOrderConfirmation,
@@ -53,7 +50,8 @@ import {
 } from '../renderers/checkout.js';
 import { waitForCustomerTopup } from '../../domain/payments/customer-status.js';
 import { adminNavigationComponents } from '../renderers/admin.js';
-import { featureGateLabel, orderStateLabel, saleStateLabel } from '../renderers/labels.js';
+import { orderStateLabel } from '../renderers/labels.js';
+import { QUEST_PRICE_CATEGORIES } from '../../domain/pricing/categories.js';
 
 function money(cents) { return baht(cents); }
 function escapedText(value, fallback = 'ไม่ระบุ') {
@@ -93,35 +91,14 @@ const DISPLAY_STATES = Object.freeze({
   HALF_OPEN: 'กำลังทดสอบการกลับมาใช้งาน', CREDITED: 'เพิ่มเครดิตแล้ว', REJECTED: 'ปฏิเสธรายการ',
   ASSIGNED: 'มีผู้รับผิดชอบแล้ว', EVIDENCE_PENDING: 'รอหลักฐาน', DECISION_READY: 'พร้อมสรุปผล',
 });
-const PRICE_RULE_LABELS = Object.freeze({ TEMPORARY: 'ราคาพิเศษชั่วคราว', QUEST: 'ราคาเฉพาะ Quest',
-  TYPE: 'ราคาตามประเภท', DEFAULT: 'ราคาเริ่มต้น' });
-const ANALYSIS_LABELS = Object.freeze({ DETECTED: 'ตรวจพบแล้ว', METADATA_RETRY: 'กำลังอ่านข้อมูลใหม่',
-  ANALYZED: 'วิเคราะห์แล้ว', SUPPORTED: 'ระบบรองรับ', UNSUPPORTED: 'ระบบยังไม่รองรับ',
-  MANUAL_REVIEW: 'รอแอดมินตรวจสอบ', EXPIRED: 'หมดอายุแล้ว' });
-const SURFACE_LABELS = Object.freeze({ QUEST_AUTO: 'ห้องเริ่มทำ Quest', QUEST_NEW: 'ห้องประกาศ Quest ใหม่',
-  QUEST_HISTORY: 'ห้องประวัติการทำ Quest', ADMIN_PANEL: 'แผงควบคุมแอดมิน', LOG_PAYMENTS: 'บันทึกการเติมเงิน',
-  LOG_QUEST_OPERATIONS: 'บันทึกการทำ Quest', LOG_ADMIN: 'บันทึกการทำงานของแอดมิน', LOG_SYSTEM: 'บันทึกเหตุขัดข้อง' });
-const BLOCK_LABELS = Object.freeze({ TOPUP_BLOCKED: 'ระงับการเติมเงิน', ORDER_BLOCKED: 'ระงับการสั่งทำ Quest' });
-const SUBJECT_LABELS = Object.freeze({ TOPUP: 'รายการเติมเงิน', ORDER: 'ออเดอร์', ORDER_ITEM: 'งาน Quest', QUEST: 'Quest' });
-const REVIEW_DECISION_LABELS = Object.freeze({ CREDIT: 'เพิ่มเครดิต', REJECT: 'ปฏิเสธ', RETRY: 'ลองใหม่',
-  CAPTURE: 'คิดค่าบริการ', RELEASE: 'คืนเครดิต', STOP: 'หยุดงาน', FAIL: 'บันทึกว่าล้มเหลว' });
 function displayState(value) { return DISPLAY_STATES[value] ?? 'กำลังตรวจสอบ'; }
 function breakerStateLabel(value) {
   return { CLOSED: 'เปิดทำงานปกติ', OPEN: 'หยุดรับรายการอัตโนมัติ', HALF_OPEN: 'กำลังทดสอบการกลับมาใช้งาน' }[value]
     ?? 'กำลังตรวจสอบ';
 }
-function normalizedChoice(value, aliases) {
-  const normalized = String(value).trim().toUpperCase();
-  return aliases[normalized] ?? normalized;
-}
 function websocketPing(client) {
   const ping = client.ws?.ping;
   return Number.isFinite(ping) && ping >= 0 ? `${ping} ms` : 'กำลังเชื่อมต่อ';
-}
-function displayedBackupStatus(overview) {
-  if (overview.backupMode === 'AIVEN_MANAGED') return 'Aiven ดูแล Backup อัตโนมัติ';
-  if (overview.backupAgeMs == null) return 'สำรองล่าสุด: ยังไม่มี';
-  return `สำรองล่าสุด: ${Math.floor(overview.backupAgeMs / 3_600_000)} ชม. ก่อน`;
 }
 function overviewRuntimeMetrics(interaction, runtime) {
   const health = runtime.health ?? {};
@@ -134,21 +111,25 @@ function overviewRuntimeMetrics(interaction, runtime) {
     workers,
     healthyWorkers,
     uptimeMinutes: Math.floor(uptimeMs / 60_000),
-    backupStatus: displayedBackupStatus(overview),
+    discordReady: interaction.client.isReady(),
     rssMb: overview.memoryRssBytes == null ? 'ยังไม่มี' : `${Math.round(overview.memoryRssBytes / 1024 / 1024)} MB`,
     ping: websocketPing(interaction.client),
   };
 }
-function overviewDescription({ incidents, metrics, queue, reviews, row }) {
-  const { workers, healthyWorkers, uptimeMinutes, backupStatus, ping } = metrics;
+function overviewDescription({ incidents, metrics, queue, reviews, surfaces, row, runtime }) {
+  const { workers, healthyWorkers, uptimeMinutes, ping, discordReady } = metrics;
+  const values = runtime.config.values ?? {};
+  const adminRole = values.adminRoleId ? `<@&${values.adminRoleId}>` : 'ยังไม่ตั้ง';
+  const questRole = values.questAnnouncementRoleId ? `<@&${values.questAnnouncementRoleId}>` : 'ปิด';
   return [
     '**ภาพรวมการเงิน**',
     `ลูกค้าที่มีเครดิต: **${row.users} คน**`, `เครดิตพร้อมใช้รวม: **${money(row.available)}**`, `เครดิตที่จองรวม: **${money(row.reserved)}**`,
     '', '**งานที่ต้องดูแล**',
     `งานในคิว: **${queue.rows[0].count}** • รอตรวจสอบ: **${reviews.rows[0].count}** • เหตุขัดข้อง: **${incidents.rows[0].count}**`,
     '', '**สุขภาพระบบ**',
+    `ฐานข้อมูล: **${runtime.health?.checks?.database ?? (runtime.health?.ready ? 'พร้อม' : 'กำลังตรวจ')}** • Discord: **${discordReady ? 'พร้อม' : 'กำลังเชื่อมต่อ'}**`,
     `Worker พร้อมทำงาน: **${healthyWorkers}/${workers.length}** • Ping: **${ping}** • เปิดมาแล้ว: **${uptimeMinutes} นาที**`,
-    `การสำรองข้อมูล: **${backupStatus}**`,
+    `ห้อง/แผงที่ติดตั้ง: **${surfaces.rows[0].count}** • ยศแอดมิน: **${adminRole}** • ยศแจ้ง Quest: **${questRole}**`,
   ].join('\n');
 }
 function runnerConcurrency(runtime) {
@@ -199,13 +180,6 @@ function voucherModal(sessionId) {
     .addLabelComponents(new LabelBuilder().setLabel('ลิงก์ซองอั่งเปา')
       .setDescription('รองรับซองผู้รับคนเดียว กรุณาตรวจยอดก่อนส่ง').setTextInputComponent(input));
 }
-function gateReasonModal(sessionId, enabled) {
-  const input = new TextInputBuilder().setCustomId('reason').setStyle(TextInputStyle.Paragraph)
-    .setRequired(true).setMinLength(5).setMaxLength(500);
-  return new ModalBuilder().setCustomId(customId(enabled ? 'gate_enable_submit' : 'gate_disable_submit', sessionId))
-    .setTitle(enabled ? 'เปิดระบบ' : 'ปิดระบบ')
-    .addLabelComponents(new LabelBuilder().setLabel('เหตุผลการเปลี่ยนแปลง').setTextInputComponent(input));
-}
 function fieldsModal(route, sessionId, title, fields) {
   const modal = new ModalBuilder().setCustomId(customId(route, sessionId)).setTitle(title);
   for (const field of fields) {
@@ -230,58 +204,8 @@ function listRows(rows, formatter, empty = 'ไม่มี') {
   return content || empty;
 }
 
-function backupSummary(backups, drills) {
-  const backupRows = listRows(backups, (row) => `• ${row.backup_type === 'PRE_MIGRATION' ? 'ก่อนอัปเดตฐานข้อมูล' : 'สำรองข้อมูลประจำวัน'} • ${displayState(row.state)} • <t:${Math.floor(new Date(row.completed_at ?? row.started_at).getTime() / 1000)}:R>`);
-  const drillRows = listRows(drills, (row) => `• ${displayState(row.state)} • <t:${Math.floor(new Date(row.completed_at ?? row.started_at).getTime() / 1000)}:R>`);
-  return `**ไฟล์สำรองล่าสุด**\n${backupRows}\n\n**ผลทดสอบกู้ข้อมูลล่าสุด**\n${drillRows}\n\nการทดสอบกู้ข้อมูลทำในฐานข้อมูลชั่วคราวและไม่กระทบร้านที่กำลังเปิดอยู่`;
-}
-
-function aivenBackupSummary() {
-  return [
-    '**การสำรองข้อมูล: Aiven-managed**',
-    'Aiven เป็นผู้สำรอง PostgreSQL อัตโนมัติ ระบบบอทจึงไม่เรียก `pg_dump`, `pg_restore` หรือ S3 จาก inwcloud',
-    '',
-    'สถานะนี้ไม่ใช่ผลการทดสอบกู้ข้อมูลของ Questshop และแผน Aiven Free มีข้อจำกัดด้านประวัติ/การกู้คืน',
-    'ตรวจและกู้ข้อมูลผ่าน Aiven Console เมื่อเกิดเหตุฉุกเฉิน',
-  ].join('\n');
-}
-
-function brandingSummary(runtime) {
-  const values = runtime.config.values ?? {};
-  const adminRole = values.adminRoleId ? `<@&${values.adminRoleId}>` : 'ยังไม่ตั้ง';
-  const questRole = values.questAnnouncementRoleId ? `<@&${values.questAnnouncementRoleId}>` : 'ปิด';
-  const branding = values.branding ?? {};
-  const description = String(branding.description ?? 'ใช้ข้อความเริ่มต้น').replaceAll('\n', ' ').slice(0, 180);
-  return [
-    `**เวอร์ชันการตั้งค่า:** ${runtime.config.version}`,
-    `**จำนวนงานพร้อมกัน:** ${runnerConcurrency(runtime)} / ${runtime.env.RUNNER_CONCURRENCY_HARD_MAX}`,
-    `**ยศแอดมิน:** ${adminRole}`,
-    `**ยศแจ้ง Quest ใหม่:** ${questRole}`,
-    '',
-    `**ชื่อหน้าร้าน:** ${branding.title ?? 'ใช้ชื่อเริ่มต้น'}`,
-    `**คำอธิบาย:** ${description}`,
-    `**รูปหรือวิดีโอ:** ${branding.mediaUrl ? 'ตั้งค่าแล้ว' : 'ยังไม่ได้ตั้ง'}`,
-  ].join('\n');
-}
-
-function paymentReviewLine(row) {
-  const ownerOnly = row.owner_only ? ' • เจ้าของร้านเป็นผู้สรุปผล' : '';
-  const assignee = row.assigned_to ? ` • <@${row.assigned_to}>` : '';
-  const evidence = Number(row.evidence_count ?? 0) ? ` • หลักฐาน ${row.evidence_count}` : '';
-  return `• \`${row.id}\` • **${SUBJECT_LABELS[row.subject_type] ?? 'รายการตรวจสอบ'}** • ${displayState(row.state)}${assignee}${evidence}${ownerOnly}`;
-}
-
-function paymentSummary(breaker, reviews) {
-  const header = `ระบบรับซอง: **${breakerStateLabel(breaker.state)}** • ${breaker.reason ?? 'ทำงานปกติ'}`;
-  return [header, listRows(reviews, paymentReviewLine, 'ไม่มีรายการรอตรวจสอบ')].join('\n\n');
-}
-
 function deadLetterLine(row) {
   return `• \`${row.id}\` • ${row.category === 'FINANCIAL' ? 'เกี่ยวกับเงิน' : 'การแจ้งเตือนทั่วไป'} • ${displayState(row.state)} • รหัสตรวจสอบ \`${row.error_code ?? 'ไม่ระบุ'}\``;
-}
-
-function blocklistLine(row) {
-  return `• \`${row.discord_user_id}\` • **${BLOCK_LABELS[row.block_type] ?? 'ระงับการใช้งาน'}** • ${row.reason}`;
 }
 
 function incidentLine(row) {
@@ -308,79 +232,70 @@ function adminReply(interaction, selected, payload) {
     allowedMentions: { parse: [] } });
 }
 
-async function renderGatePanel(interaction, runtime) {
-  ownerOnly(interaction, runtime, 'เมนูเปิด–ปิดระบบใช้ได้เฉพาะเจ้าของร้าน');
-  const rows = (await runtime.pool.query('SELECT * FROM feature_gates ORDER BY gate')).rows;
-  return adminReply(interaction, 'gates', { embeds: [panelEmbed(0x5865f2, 'เปิด–ปิดระบบ',
-    listRows(rows, (row) => `${row.enabled ? '🟢' : '🔴'} **${featureGateLabel(row.gate)}**\n${row.reason}`))],
-  components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder().setCustomId(customId('admin_gate_pick'))
-    .setPlaceholder('เลือกระบบที่ต้องการเปิดหรือปิด').addOptions(FEATURE_GATES.map((gate) => ({ label: featureGateLabel(gate), value: gate,
-      description: 'แตะเพื่อดูและเปลี่ยนสถานะ' }))))] });
-}
-
 function renderWalletPanel(interaction) {
   return adminReply(interaction, 'wallet', { embeds: [panelEmbed(0xf0b232, 'ปรับยอดและคืนเครดิต',
-    'การปรับยอดทุกครั้งจะสร้างธุรกรรมชดเชยใหม่ โดยไม่แก้ประวัติเดิม\nระบบจะแสดงยอดก่อน–หลังและให้ยืนยันซ้ำภายใน 5 นาที\nเครดิตที่กำลังจองแก้ตรงจากเมนูนี้ไม่ได้')],
+    'เลือกผู้ใช้หรือรายการงานจากหน้าถัดไป ระบบจะแสดงยอดก่อน–หลังและให้ยืนยันซ้ำ\nเครดิตที่กำลังจองแก้ตรงจากเมนูนี้ไม่ได้ และทุกการแก้ยอดมีประวัติถาวร')],
   components: [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId('wallet_adjust')).setLabel('ปรับเครดิตพร้อมใช้').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(customId('refund_prepare')).setLabel('คืนเครดิตงานที่คิดเงินแล้ว').setStyle(ButtonStyle.Primary),
-  )] });
-}
-
-async function renderBlocklistPanel(interaction, runtime) {
-  const blocks = (await runtime.pool.query(`SELECT * FROM blocklist_entries WHERE revoked_at IS NULL
-    AND (expires_at IS NULL OR expires_at>clock_timestamp()) ORDER BY created_at DESC LIMIT 10`)).rows;
-  const blockRows = listRows(blocks, blocklistLine, 'ยังไม่มีผู้ใช้ที่ถูกระงับ');
-  const description = [blockRows, 'การระงับไม่ริบเครดิตและไม่หยุดงานเดิม'].join('\n\n');
-  return adminReply(interaction, 'blocklist', { embeds: [panelEmbed(0xf0b232, 'ระงับการใช้งาน', description)],
-  components: [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId('block_add')).setLabel('ระงับผู้ใช้').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(customId('block_remove')).setLabel('ยกเลิกการระงับ').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(customId('wallet_adjust')).setLabel('เลือกผู้ใช้เพื่อปรับเครดิต').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(customId('refund_prepare')).setLabel('เลือกงานเพื่อคืนเครดิต').setStyle(ButtonStyle.Secondary),
   )] });
 }
 
 async function renderPaymentsPanel(interaction, runtime) {
-  const reviews = (await runtime.pool.query(`SELECT r.*,count(e.id)::integer AS evidence_count
-    FROM manual_reviews r LEFT JOIN review_evidence e ON e.review_id=r.id WHERE r.state<>'RESOLVED'
-    GROUP BY r.id ORDER BY r.financial DESC,r.created_at LIMIT 10`)).rows;
-  const breaker = (await runtime.pool.query("SELECT * FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
-  return adminReply(interaction, 'payments', { embeds: [panelEmbed(0xf0b232, 'รายการเติมเงินที่ต้องตรวจ', paymentSummary(breaker, reviews))],
-  components: [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId('review_assign')).setLabel('รับผิดชอบรายการ')
-      .setStyle(ButtonStyle.Primary).setDisabled(!reviews.length),
-    new ButtonBuilder().setCustomId(customId('review_evidence')).setLabel('เพิ่มหลักฐาน')
-      .setStyle(ButtonStyle.Secondary).setDisabled(!reviews.length),
-    new ButtonBuilder().setCustomId(customId('review_resolve')).setLabel('สรุปผลการตรวจ')
-      .setStyle(ButtonStyle.Danger).setDisabled(!reviews.length),
-    new ButtonBuilder().setCustomId(customId('breaker_prepare')).setLabel('ทดสอบและเปิดระบบรับซองอีกครั้ง')
-      .setStyle(ButtonStyle.Secondary).setDisabled(interaction.user.id !== runtime.env.OWNER_ID),
-  )] });
-}
-
-async function renderSurfacesPanel(interaction, runtime) {
-  const surfaces = (await runtime.pool.query('SELECT * FROM surfaces ORDER BY surface_key')).rows;
-  return adminReply(interaction, 'surfaces', { embeds: [panelEmbed(0x5865f2, 'ห้องและแผงข้อความ',
-    listRows(surfaces, (surface) => `${surface.state === 'ACTIVE' ? '🟢' : '🟠'} **${SURFACE_LABELS[surface.surface_key] ?? 'ห้องของระบบ'}** • <#${surface.channel_id}> • ${displayState(surface.state)}`, 'ยังไม่ได้ติดตั้งห้องหรือแผงข้อความ'))],
-    components: [] });
+  const reviews = (await runtime.pool.query(`SELECT r.*,t.discord_user_id,t.amount_cents,t.provider_transaction_id,
+    t.status AS topup_status,count(e.id)::integer AS evidence_count
+    FROM manual_reviews r JOIN topups t ON r.subject_type='TOPUP' AND r.subject_id=t.id::text
+    LEFT JOIN review_evidence e ON e.review_id=r.id WHERE r.state<>'RESOLVED'
+    GROUP BY r.id,t.id ORDER BY r.created_at LIMIT 25`)).rows;
+  const summary = reviews.length
+    ? reviews.map((review) => `• <@${review.discord_user_id}> • ${money(review.amount_cents ?? 0)} • ${displayState(review.topup_status)}`).join('\n')
+    : 'ไม่มีรายการเติมเงินที่รอ Owner ตรวจสอบ';
+  const components = reviews.length ? [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+    .setCustomId(customId('payment_review_pick')).setPlaceholder('เลือกรายการเติมเงินที่ต้องตรวจ')
+    .addOptions(reviews.map((review) => ({
+      label: `${review.discord_user_id} • ${money(review.amount_cents ?? 0)}`.slice(0, 100), value: review.id,
+      description: `${displayState(review.topup_status)} • หลักฐาน ${review.evidence_count} รายการ`.slice(0, 100),
+    }))))] : [];
+  return adminReply(interaction, 'payments', { embeds: [panelEmbed(0xf0b232, 'เติมเงินที่ต้องตรวจ',
+    summary)], components });
 }
 
 async function renderPricingPanel(interaction, runtime) {
-  const rules = (await runtime.pool.query(`SELECT * FROM price_rules ORDER BY enabled DESC, created_at DESC LIMIT 10`)).rows;
-  return adminReply(interaction, 'pricing', { embeds: [panelEmbed(0x5865f2, 'ตั้งราคา',
-    listRows(rules, (rule) => `• \`${rule.id}\` • **${PRICE_RULE_LABELS[rule.rule_type] ?? 'กฎราคา'}** ${rule.quest_id ?? rule.task_type ?? 'ทุก Quest'} — ${money(rule.amount_cents)} • ${rule.enabled ? '🟢 เปิดใช้' : '🔴 ปิดใช้'}`, 'ยังไม่มีกฎราคา'))],
-  components: [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId('price_create')).setLabel('สร้างกฎราคา').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(customId('price_manage')).setLabel('เปิด / ปิดกฎราคา').setStyle(ButtonStyle.Secondary).setDisabled(!rules.length),
-  )] });
+  const rows = (await runtime.pool.query(`SELECT DISTINCT ON (task_type) task_type,amount_cents,state_version
+    FROM price_rules WHERE enabled=true AND rule_type='TYPE'
+    ORDER BY task_type,created_at DESC`)).rows;
+  const byType = new Map(rows.map((row) => [row.task_type, row]));
+  const categoryLine = (category) => {
+    const rules = QUEST_PRICE_CATEGORIES[category].map((taskType) => byType.get(taskType)).filter(Boolean);
+    const amount = rules[0]?.amount_cents ?? 500;
+    return `• **${category === 'GAME' ? 'Quest เล่นเกม' : 'Quest ดูวิดีโอ'}** — ${money(amount)}`;
+  };
+  return adminReply(interaction, 'pricing', { embeds: [panelEmbed(0x5865f2, 'ราคาทำ Quest',
+    `${categoryLine('GAME')}\n${categoryLine('VIDEO')}\n\nเลือกระเภทแล้วใส่ราคาใหม่เพียงช่องเดียว`)],
+  components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+    .setCustomId(customId('price_category_pick')).setPlaceholder('เลือกประเภท Quest ที่ต้องการเปลี่ยนราคา')
+    .addOptions(
+      { label: 'Quest เล่นเกม', value: 'GAME', description: 'ครอบคลุม Quest เล่นเกมทุกชนิดที่ระบบรองรับ' },
+      { label: 'Quest ดูวิดีโอ', value: 'VIDEO', description: 'ครอบคลุม Quest ดูวิดีโอทุกชนิดที่ระบบรองรับ' },
+    ))] });
 }
 
 async function renderPromotionsPanel(interaction, runtime) {
-  const promotions = (await runtime.pool.query('SELECT * FROM promotions ORDER BY version DESC LIMIT 10')).rows;
-  return adminReply(interaction, 'promotions', { embeds: [panelEmbed(0x5865f2, 'โปรโมชั่น',
-    listRows(promotions, (promotion) => `• \`${promotion.id}\` • **${promotion.name}** • ${displayState(promotion.state)} • สิ้นสุด <t:${Math.floor(new Date(promotion.ends_at).getTime() / 1000)}:R>`, 'ยังไม่มีโปรโมชั่น'))],
+  const promotion = (await runtime.pool.query(`SELECT * FROM promotions WHERE manual_controlled=true
+    ORDER BY version DESC LIMIT 1`)).rows[0] ?? null;
+  const tiers = promotion ? (await runtime.pool.query(`SELECT * FROM promotion_tiers
+    WHERE promotion_id=$1 ORDER BY minimum_amount_cents`, [promotion.id])).rows : [];
+  const tierText = tiers.length
+    ? tiers.map((tier) => `${money(tier.minimum_amount_cents)} = ${(Number(tier.basis_points) / 100).toFixed(2)}%`).join('\n')
+    : 'ยังไม่ได้ตั้งโบนัสเติมเงิน';
+  const description = promotion
+    ? `สถานะ: **${promotion.state === 'ACTIVE' ? 'เปิดใช้งาน' : 'ปิดอยู่'}**\n${tierText}\n\nจำกัดต่อผู้ใช้ตลอดรุ่นนี้: **${promotion.max_uses_per_user ?? 'ไม่จำกัด'} ครั้ง**\nโบนัสสูงสุดต่อผู้ใช้ต่อวัน: **${promotion.max_bonus_per_day_cents == null ? 'ไม่จำกัด' : money(promotion.max_bonus_per_day_cents)}**`
+    : tierText;
+  return adminReply(interaction, 'promotions', { embeds: [panelEmbed(0x5865f2, 'โบนัสเติมเงิน', description)],
   components: [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId('promo_create')).setLabel('สร้างโปรโมชั่น').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(customId('promo_manage')).setLabel('เปิด / ปิดโปรโมชั่น').setStyle(ButtonStyle.Secondary).setDisabled(!promotions.length),
+    new ButtonBuilder().setCustomId(customId('promo_set')).setLabel(promotion ? 'แก้โบนัสเติมเงิน' : 'ตั้งโบนัสเติมเงิน').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(customId('promo_toggle')).setLabel(promotion?.state === 'ACTIVE' ? 'ปิดโบนัส' : 'เปิดโบนัส')
+      .setStyle(promotion?.state === 'ACTIVE' ? ButtonStyle.Danger : ButtonStyle.Success).setDisabled(!promotion),
   )] });
 }
 
@@ -498,58 +413,48 @@ async function renderMonitorDetail(interaction, runtime, monitorId) {
   )] });
 }
 
-async function renderCatalogPanel(interaction, runtime) {
-  const quests = (await runtime.pool.query('SELECT * FROM quests ORDER BY updated_at DESC LIMIT 10')).rows;
-  return adminReply(interaction, 'catalog', { embeds: [panelEmbed(0x5865f2, 'จัดการ Quest',
-    listRows(quests, (quest) => `• \`${quest.quest_id}\` • **${quest.name ?? 'ไม่ระบุ'}**\n${ANALYSIS_LABELS[quest.analysis_state] ?? 'กำลังวิเคราะห์'} • ${saleStateLabel(quest.sale_state)}`, 'ยังไม่มี Quest'))],
-  components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('catalog_sale'))
-    .setLabel('เปลี่ยนสถานะรับทำ Quest').setStyle(ButtonStyle.Primary))] });
-}
-
-async function renderOrdersPanel(interaction, runtime) {
+async function renderOrdersPanel(interaction, runtime, offset = 0) {
+  const pageSize = 25;
   const items = (await runtime.pool.query(`SELECT i.*,o.account_username FROM order_items i
     JOIN orders o ON o.id=i.order_id WHERE i.state NOT IN ('READY_TO_CLAIM','EXPIRED_RELEASED',
-    'EXTERNAL_COMPLETED_RELEASED','STOPPED_RELEASED','FAILED_RELEASED') ORDER BY i.updated_at LIMIT 10`)).rows;
-  return adminReply(interaction, 'orders', { embeds: [panelEmbed(0x5865f2, 'งานลูกค้าและคิว',
-    listRows(items, (item) => `• \`${item.id}\` • **${item.quest_name}** • ${orderStateLabel(item.state)} • ${item.progress_bucket}%`, 'ไม่มีงาน Quest ที่กำลังดำเนินการ'))],
-  components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(customId('adminorder_review'))
-    .setLabel('ตรวจสอบ / หยุด / ลองใหม่').setStyle(ButtonStyle.Danger).setDisabled(!items.length))] });
-}
-
-async function renderBackupPanel(interaction, runtime) {
-  if (runtime.env.BACKUP_MODE === 'AIVEN_MANAGED') {
-    return adminReply(interaction, 'backup', { embeds: [panelEmbed(0x5865f2, 'สำรองและกู้ข้อมูล', aivenBackupSummary())] });
+    'EXTERNAL_COMPLETED_RELEASED','STOPPED_RELEASED','FAILED_RELEASED')
+    ORDER BY i.updated_at DESC LIMIT $1 OFFSET $2`, [pageSize, offset])).rows;
+  const total = Number((await runtime.pool.query(`SELECT count(*)::integer AS count FROM order_items
+    WHERE state NOT IN ('READY_TO_CLAIM','EXPIRED_RELEASED','EXTERNAL_COMPLETED_RELEASED',
+    'STOPPED_RELEASED','FAILED_RELEASED')`)).rows[0].count);
+  const configured = runtime.config.values?.runnerConcurrency ?? runtime.env.RUNNER_CONCURRENCY;
+  const actionRows = [];
+  if (items.length) {
+    const picker = new StringSelectMenuBuilder()
+      .setCustomId(customId('adminorder_pick')).setPlaceholder('เลือกงานลูกค้าเพื่อดูรายละเอียด');
+    picker.addOptions(items.map((item) => ({
+      label: `${item.quest_name} • ${orderStateLabel(item.state)}`.slice(0, 100), value: item.id,
+      description: `${item.account_username ?? item.account_id ?? 'บัญชี Quest'} • ${item.progress_bucket}%`.slice(0, 100),
+    })));
+    actionRows.push(new ActionRowBuilder().addComponents(picker));
   }
-  const [backups, drills] = await Promise.all([
-    runtime.pool.query('SELECT * FROM backup_runs ORDER BY started_at DESC LIMIT 5'),
-    runtime.pool.query('SELECT * FROM restore_drills ORDER BY started_at DESC LIMIT 5'),
-  ]);
-  return adminReply(interaction, 'backup', { embeds: [panelEmbed(0x5865f2, 'สำรองและกู้ข้อมูล', backupSummary(backups.rows, drills.rows))] });
-}
-
-function renderBrandingPanel(interaction, runtime) {
-  return adminReply(interaction, 'branding', { embeds: [panelEmbed(0x5865f2, 'ตั้งค่าหน้าร้าน', brandingSummary(runtime))],
-  components: [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId('config_branding')).setLabel('แก้หน้าร้าน').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(customId('config_concurrency')).setLabel('จำนวนงานพร้อมกัน').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(customId('config_roles')).setLabel('ตั้งยศแอดมิน / แจ้ง Quest').setStyle(ButtonStyle.Danger)
-      .setDisabled(interaction.user.id !== runtime.env.OWNER_ID),
-  )] });
-}
-
-function renderSecretsPanel(interaction, runtime) {
-  ownerOnly(interaction, runtime, 'สถานะกุญแจระบบใช้ได้เฉพาะเจ้าของร้าน');
-  const keys = runtime.env;
-  const backupKeyring = keys.BACKUP_ENCRYPTION_KEYS_JSON;
-  const description = [
-    `กุญแจเข้ารหัสข้อมูล: **รุ่น ${keys.DATA_ENCRYPTION_KEYS_JSON.current}** • เก็บรุ่นเดิม ${Object.keys(keys.DATA_ENCRYPTION_KEYS_JSON.keys).length} รุ่น`,
-    `กุญแจตรวจซองซ้ำ: **รุ่น ${keys.VOUCHER_HMAC_KEYS_JSON.current}** • เก็บรุ่นเดิม ${Object.keys(keys.VOUCHER_HMAC_KEYS_JSON.keys).length} รุ่น`,
-    backupKeyring
-      ? `กุญแจสำรองข้อมูล: **รุ่น ${backupKeyring.current}** • เก็บรุ่นเดิม ${Object.keys(backupKeyring.keys).length} รุ่น`
-      : 'กุญแจสำรองข้อมูล: **ไม่ต้องใช้** เพราะ Aiven ดูแล Backup ของฐานข้อมูล',
-    'หน้านี้แสดงเฉพาะสถานะและหมายเลขรุ่น ไม่สามารถเปิดดูค่ากุญแจจริงได้',
-  ].join('\n');
-  return adminReply(interaction, 'secrets', { embeds: [panelEmbed(0x5865f2, 'สถานะกุญแจระบบ', description)] });
+  actionRows.push(new ActionRowBuilder().addComponents(new ButtonBuilder()
+    .setCustomId(customId('config_concurrency')).setLabel(`จำนวนงานพร้อมกัน: ${configured}`)
+    .setStyle(ButtonStyle.Secondary)));
+  if (total > pageSize) {
+    const previous = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ORDER_PAGE',
+      payload: { offset: Math.max(0, offset - pageSize) }, configVersion: runtime.config.version },
+    contextFor(interaction, 'order_page_previous'), { pool: runtime.pool });
+    const next = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ORDER_PAGE',
+      payload: { offset: offset + pageSize }, configVersion: runtime.config.version },
+    contextFor(interaction, 'order_page_next'), { pool: runtime.pool });
+    actionRows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(customId('orders_page', previous.id)).setLabel('ก่อนหน้า').setStyle(ButtonStyle.Secondary)
+        .setDisabled(offset === 0),
+      new ButtonBuilder().setCustomId(customId('orders_page', next.id)).setLabel('ถัดไป').setStyle(ButtonStyle.Secondary)
+        .setDisabled(offset + pageSize >= total),
+    ));
+  }
+  return adminReply(interaction, 'orders', { embeds: [panelEmbed(0x5865f2, 'งานลูกค้าและคิว',
+    `${listRows(items, (item) => `• **${item.quest_name}** • ${orderStateLabel(item.state)} • ${item.progress_bucket}%`, 'ไม่มีงาน Quest ที่กำลังดำเนินการ')}\n\nหน้า ${Math.floor(offset / pageSize) + 1} • ทั้งหมด ${total} งาน`)],
+  components: actionRows });
 }
 
 async function renderDlqPanel(interaction, runtime) {
@@ -557,32 +462,49 @@ async function renderDlqPanel(interaction, runtime) {
     WHERE state IN ('DEAD_LETTER','PENDING') ORDER BY created_at DESC LIMIT 10`)).rows;
   const activeIncidents = (await runtime.pool.query(`SELECT * FROM incidents WHERE state<>'RESOLVED'
     ORDER BY severity DESC,opened_at DESC LIMIT 10`)).rows;
-  return adminReply(interaction, 'dlq', { embeds: [panelEmbed(0xf23f43, 'งานค้างและเหตุขัดข้อง', dlqSummary(dlq, activeIncidents))],
-  components: [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(customId('dlq_replay')).setLabel('ลองส่งงานค้างใหม่').setStyle(ButtonStyle.Primary).setDisabled(!dlq.length),
-    new ButtonBuilder().setCustomId(customId('dlq_discard')).setLabel('ปิดงานค้างที่ไม่เกี่ยวกับเงิน').setStyle(ButtonStyle.Danger)
-      .setDisabled(interaction.user.id !== runtime.env.OWNER_ID || !dlq.length),
-  )] });
+  const breaker = (await runtime.pool.query("SELECT * FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
+  const controls = [];
+  if (dlq.length) {
+    const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'DLQ_SELECT',
+      payload: { dlqIds: dlq.map((item) => item.id) }, configVersion: runtime.config.version },
+    contextFor(interaction, 'dlq_select_session'), { pool: runtime.pool });
+    controls.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+      .setCustomId(customId('dlq_pick', session.id)).setPlaceholder('เลือกรายการปัญหาเพื่อดูและจัดการ')
+      .addOptions(dlq.map((item) => ({
+        label: `${item.category} • ${item.source_type}`.slice(0, 100), value: item.id,
+        description: `${displayState(item.state)} • ${String(item.id).slice(0, 8)}`.slice(0, 100),
+      })))));
+  }
+  if (breaker?.state === 'OPEN' && interaction.user.id === runtime.env.OWNER_ID) {
+    controls.push(new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(customId('breaker_prepare')).setLabel('ตรวจสอบและเปิดระบบรับซองอีกครั้ง').setStyle(ButtonStyle.Danger)));
+  }
+  return adminReply(interaction, 'dlq', { embeds: [panelEmbed(0xf23f43, 'ปัญหาที่ต้องจัดการ',
+    `${dlqSummary(dlq, activeIncidents)}${breaker?.state === 'OPEN' ? `\n\n**ระบบรับซอง:** ${breakerStateLabel(breaker.state)}` : ''}`)], components: controls });
 }
 
 async function renderOverviewPanel(interaction, runtime) {
-  const [wallets, queue, reviews, incidents] = await Promise.all([
+  const [wallets, queue, reviews, incidents, surfaces] = await Promise.all([
     runtime.pool.query('SELECT count(*)::integer AS users,COALESCE(sum(available_cents),0)::bigint AS available,COALESCE(sum(reserved_cents),0)::bigint AS reserved FROM wallets'),
     runtime.pool.query("SELECT count(*)::integer AS count FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')"),
     runtime.pool.query("SELECT count(*)::integer AS count FROM manual_reviews WHERE state<>'RESOLVED'"),
     runtime.pool.query("SELECT count(*)::integer AS count FROM incidents WHERE state<>'RESOLVED'"),
+    runtime.pool.query("SELECT count(*)::integer AS count FROM surfaces WHERE state='ACTIVE'"),
   ]);
   const row = wallets.rows[0];
   const metrics = overviewRuntimeMetrics(interaction, runtime);
-  const description = overviewDescription({ incidents, metrics, queue, reviews, row });
-  return adminReply(interaction, 'overview', { embeds: [panelEmbed(0x5865f2, 'ภาพรวมร้าน', description)] });
+  const description = overviewDescription({ incidents, metrics, queue, reviews, surfaces, row, runtime });
+  const controls = [new ActionRowBuilder().addComponents(new ButtonBuilder()
+    .setCustomId(customId('config_roles')).setLabel('ตั้งยศแอดมิน / แจ้ง Quest').setStyle(ButtonStyle.Secondary)
+    .setDisabled(interaction.user.id !== runtime.env.OWNER_ID))];
+  return adminReply(interaction, 'overview', { embeds: [panelEmbed(0x5865f2, 'ภาพรวมร้าน', description)], components: controls });
 }
 
 const ADMIN_PANEL_RENDERERS = Object.freeze({
-  gates: renderGatePanel, wallet: renderWalletPanel, blocklist: renderBlocklistPanel, payments: renderPaymentsPanel,
-  surfaces: renderSurfacesPanel, pricing: renderPricingPanel, promotions: renderPromotionsPanel, receivers: renderReceiversPanel,
-  monitors: renderMonitorsPanel, catalog: renderCatalogPanel, orders: renderOrdersPanel, backup: renderBackupPanel,
-  branding: renderBrandingPanel, secrets: renderSecretsPanel, dlq: renderDlqPanel,
+  wallet: renderWalletPanel, payments: renderPaymentsPanel, pricing: renderPricingPanel,
+  promotions: renderPromotionsPanel, receivers: renderReceiversPanel, monitors: renderMonitorsPanel,
+  orders: renderOrdersPanel, dlq: renderDlqPanel,
 });
 
 async function handleSurfaceCommand(interaction, runtime) {
@@ -607,8 +529,8 @@ async function assertSurfaceBinding(interaction, route, runtime) {
 }
 
 function isBackofficeRoute(route) {
-  const prefixes = ['admin', 'gate_', 'wallet_', 'refund_', 'block_', 'review_',
-    'price_', 'promo_', 'receiver_', 'monitor_', 'catalog_', 'adminorder_', 'dlq_', 'config_', 'breaker_', 'test_fail_'];
+  const prefixes = ['admin', 'wallet_', 'refund_', 'price_', 'promo_', 'receiver_',
+    'monitor_', 'adminorder_', 'dlq_', 'config_', 'breaker_', 'test_fail_'];
   return prefixes.some((prefix) => route === prefix || route.startsWith(prefix));
 }
 
@@ -862,10 +784,71 @@ async function handleAdminPanel({ interaction, route, runtime, gates: _gates }) 
 async function handleWalletAdjust({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'wallet_adjust' && interaction.isButton()) {
   const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_WALLET_PREPARE',
+    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_WALLET_USER',
     payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'wallet_prepare'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('wallet_adjust_submit', session.id, 'ปรับเครดิตลูกค้า', [
-    { id: 'user_id', label: 'Discord User ID ของลูกค้า', max: 20 },
+  await interaction.reply({ ephemeral: true, content: 'เลือกสมาชิกในเซิร์ฟเวอร์ หรือค้นหาด้วย Discord ID สำหรับผู้ที่ออกจากเซิร์ฟเวอร์แล้ว',
+    components: [
+      new ActionRowBuilder().addComponents(new UserSelectMenuBuilder()
+        .setCustomId(customId('wallet_user_pick', session.id)).setPlaceholder('เลือกสมาชิก').setMinValues(1).setMaxValues(1)),
+      new ActionRowBuilder().addComponents(new ButtonBuilder()
+        .setCustomId(customId('wallet_user_search')).setLabel('ค้นหาด้วย Discord ID').setStyle(ButtonStyle.Secondary)),
+    ] });
+}
+}
+
+async function handleWalletUserSearch({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'wallet_user_search' && interaction.isButton()) {
+  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ADMIN_WALLET_SEARCH',
+    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'wallet_search_session'), { pool: runtime.pool });
+  return interaction.showModal(fieldsModal('wallet_user_search_submit', session.id, 'ค้นหาผู้ใช้ด้วย Discord ID', [
+    { id: 'discord_user_id', label: 'Discord User ID', max: 20 },
+  ]));
+}
+}
+
+async function handleWalletUserSearchSubmit({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'wallet_user_search_submit' && interaction.isModalSubmit()) {
+  await interaction.deferReply({ ephemeral: true });
+  const search = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_SEARCH' },
+  contextFor(interaction, 'wallet_search_load'), { pool: runtime.pool });
+  const discordUserId = interaction.fields.getTextInputValue('discord_user_id').trim();
+  if (!/^\d{17,20}$/.test(discordUserId)) throw new TypeError('Discord User ID ไม่ถูกต้อง');
+  const prepare = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ADMIN_WALLET_PREPARE',
+    payload: { discordUserId }, configVersion: runtime.config.version },
+  contextFor(interaction, 'wallet_search_selected'), { pool: runtime.pool });
+  await completeInteractionSession(search, interaction, runtime);
+  return interaction.editReply({ content: `กรอก Discord ID \`${discordUserId}\` แล้ว กดปุ่มเพื่อกรอกยอดปรับเครดิต`,
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(customId('wallet_adjust_from_search', prepare.id)).setLabel('ปรับเครดิตผู้ใช้นี้').setStyle(ButtonStyle.Primary))] });
+}
+}
+
+async function handleWalletAdjustFromSearch({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'wallet_adjust_from_search' && interaction.isButton()) {
+  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_PREPARE' },
+  contextFor(interaction, 'wallet_search_prepare_load'), { pool: runtime.pool });
+  return interaction.showModal(fieldsModal('wallet_adjust_submit', route.sessionId, 'ปรับเครดิตลูกค้า', [
+    { id: 'amount', label: 'จำนวนบาท (+ เพิ่ม / - ลด)', placeholder: '100.00 หรือ -50.00', max: 24 },
+    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+  ]));
+}
+}
+
+async function handleWalletUserPick({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'wallet_user_pick' && interaction.isUserSelectMenu()) {
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_USER' },
+  contextFor(interaction, 'wallet_user_load'), { pool: runtime.pool });
+  const prepare = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ADMIN_WALLET_PREPARE',
+    payload: { discordUserId: interaction.values[0] }, configVersion: runtime.config.version },
+  contextFor(interaction, 'wallet_prepare_selected'), { pool: runtime.pool });
+  await completeInteractionSession(session, interaction, runtime);
+  return interaction.showModal(fieldsModal('wallet_adjust_submit', prepare.id, 'ปรับเครดิตลูกค้า', [
     { id: 'amount', label: 'จำนวนบาท (+ เพิ่ม / - ลด)', placeholder: '100.00 หรือ -50.00', max: 24 },
     { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
   ]));
@@ -875,11 +858,10 @@ if (route.route === 'wallet_adjust' && interaction.isButton()) {
 async function handleWalletAdjustSubmit({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'wallet_adjust_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_PREPARE' },
   contextFor(interaction, 'wallet_prepare_load'), { pool: runtime.pool });
-  const discordUserId = interaction.fields.getTextInputValue('user_id').trim();
-  if (!/^\d{17,20}$/.test(discordUserId)) throw new TypeError('Discord User ID ไม่ถูกต้อง');
+  const discordUserId = session.payload.discordUserId;
   const amountCents = parseSignedBaht(interaction.fields.getTextInputValue('amount'));
   if (amountCents === 0n) throw new TypeError('จำนวนเงินต้องไม่เป็นศูนย์');
   const reason = interaction.fields.getTextInputValue('reason').trim();
@@ -923,10 +905,32 @@ if (route.route === 'wallet_adjust_confirm' && interaction.isButton()) {
 async function handleRefundPrepare({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'refund_prepare' && interaction.isButton()) {
   const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_REFUND_PREPARE',
+    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_REFUND_SELECT',
     payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'refund_prepare'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('refund_prepare_submit', session.id, 'คืนเครดิตงาน Quest', [
-    { id: 'item_id', label: 'ID งาน Quest', max: 36 },
+  const items = (await runtime.pool.query(`SELECT i.id,i.quest_name,i.price_cents,o.account_username
+    FROM order_items i JOIN orders o ON o.id=i.order_id JOIN wallet_reservations r ON r.order_item_id=i.id
+    WHERE r.state='CAPTURED' AND NOT EXISTS(SELECT 1 FROM refunds f WHERE f.order_item_id=i.id)
+    ORDER BY i.completed_at DESC NULLS LAST LIMIT 25`)).rows;
+  if (!items.length) return interaction.reply({ ephemeral: true, content: 'ยังไม่มีงานที่คิดค่าบริการแล้วและคืนเครดิตได้' });
+  return interaction.reply({ ephemeral: true, content: 'เลือกงานที่ต้องการคืนเครดิต',
+    components: [new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+      .setCustomId(customId('refund_item_pick', session.id)).setPlaceholder('เลือกงาน Quest')
+      .addOptions(items.map((item) => ({ label: item.quest_name.slice(0, 100), value: item.id,
+        description: `${item.account_username ?? 'บัญชี Quest'} • ${money(item.price_cents)}`.slice(0, 100) }))))] });
+}
+}
+
+async function handleRefundItemPick({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'refund_item_pick' && interaction.isStringSelectMenu()) {
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REFUND_SELECT' },
+  contextFor(interaction, 'refund_item_load'), { pool: runtime.pool });
+  const prepare = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ADMIN_REFUND_PREPARE',
+    payload: { orderItemId: interaction.values[0] }, configVersion: runtime.config.version },
+  contextFor(interaction, 'refund_prepare_selected'), { pool: runtime.pool });
+  await completeInteractionSession(session, interaction, runtime);
+  return interaction.showModal(fieldsModal('refund_prepare_submit', prepare.id, 'คืนเครดิตงาน Quest', [
     { id: 'reason', label: 'เหตุผลการคืนเงิน', long: true, max: 500 },
   ]));
 }
@@ -935,10 +939,10 @@ if (route.route === 'refund_prepare' && interaction.isButton()) {
 async function handleRefundPrepareSubmit({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'refund_prepare_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REFUND_PREPARE' },
   contextFor(interaction, 'refund_prepare_load'), { pool: runtime.pool });
-  const orderItemId = interaction.fields.getTextInputValue('item_id').trim();
+  const orderItemId = session.payload.orderItemId;
   const reason = interaction.fields.getTextInputValue('reason').trim();
   const row = (await runtime.pool.query(`SELECT r.*,i.order_id,i.quest_name,w.available_cents,
     EXISTS(SELECT 1 FROM refunds f WHERE f.order_item_id=r.order_item_id) AS refunded
@@ -974,235 +978,122 @@ if (route.route === 'refund_confirm' && interaction.isButton()) {
 }
 }
 
-async function handleBlockAction({ interaction, route, runtime, gates: _gates }) {
-if (['block_add', 'block_remove'].includes(route.route) && interaction.isButton()) {
-  const operation = route.route === 'block_add' ? 'ADMIN_BLOCK' : 'ADMIN_UNBLOCK';
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation,
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'block_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal(route.route === 'block_add' ? 'block_add_submit' : 'block_remove_submit',
-    session.id, route.route === 'block_add' ? 'ระงับผู้ใช้' : 'ยกเลิกการระงับ', [
-      { id: 'user_id', label: 'Discord User ID', max: 20 },
-      { id: 'block_type', label: 'ประเภท', placeholder: 'เติมเงิน หรือ Quest', max: 20 },
-      ...(route.route === 'block_add' ? [{ id: 'hours', label: 'หมดอายุในกี่ชั่วโมง (เว้นว่าง=ถาวร)', required: false, max: 8 }] : []),
-      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-    ]));
-}
-}
-
-function blockInput(interaction) {
-  const rawBlockType = interaction.fields.getTextInputValue('block_type').trim();
-  const blockType = { 'เติมเงิน': 'TOPUP_BLOCKED', 'QUEST': 'ORDER_BLOCKED', 'เควส': 'ORDER_BLOCKED' }[rawBlockType.toUpperCase()]
-    ?? rawBlockType.toUpperCase();
-  const input = {
-    discordUserId: interaction.fields.getTextInputValue('user_id').trim(),
-    blockType,
-    reason: interaction.fields.getTextInputValue('reason').trim(),
-  };
-  if (!/^\d{17,20}$/.test(input.discordUserId)) throw new TypeError('Discord User ID ไม่ถูกต้อง');
-  return input;
-}
-
-function blockExpiryHours(interaction) {
-  const hoursText = interaction.fields.getTextInputValue('hours').trim();
-  const hours = hoursText ? Number(hoursText) : null;
-  if (hours != null && (!Number.isInteger(hours) || hours <= 0 || hours > 8760)) {
-    throw new TypeError('จำนวนชั่วโมงไม่ถูกต้อง');
-  }
-  return hours;
-}
-
-async function executeBlockChange({ adding, input, interaction, runtime }) {
-  if (adding) {
-    await blockUser({ ...input, expiresInHours: blockExpiryHours(interaction) },
-      contextFor(interaction, 'block_add_execute'), { pool: runtime.pool });
-    return;
-  }
-  await unblockUser(input, contextFor(interaction, 'block_remove_execute'), { pool: runtime.pool });
-}
-
-async function handleBlockSubmit({ interaction, route, runtime, gates: _gates }) {
-if (['block_add_submit', 'block_remove_submit'].includes(route.route) && interaction.isModalSubmit()) {
+async function handlePaymentReviewPick({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'payment_review_pick' && interaction.isStringSelectMenu()) {
   await interaction.deferReply({ ephemeral: true });
-  const adding = route.route === 'block_add_submit';
+  const review = (await runtime.pool.query(`SELECT r.*,t.discord_user_id,t.amount_cents,t.provider_transaction_id,
+    t.status AS topup_status,t.failure_code,t.warning_code
+    FROM manual_reviews r JOIN topups t ON r.subject_type='TOPUP' AND r.subject_id=t.id::text
+    WHERE r.id=$1 AND r.state<>'RESOLVED'`, [interaction.values[0]])).rows[0];
+  if (!review) throw new QuestshopError('REVIEW_NOT_FOUND', 'รายการเติมเงินนี้ถูกจัดการไปแล้ว');
+  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'TOPUP_REVIEW_DETAIL',
+    payload: { reviewId: review.id, expectedVersion: String(review.state_version) }, configVersion: runtime.config.version },
+  contextFor(interaction, 'topup_review_detail'), { pool: runtime.pool });
+  const detail = [
+    `ผู้เติม: <@${review.discord_user_id}> (\`${review.discord_user_id}\`)`,
+    `สถานะ: **${displayState(review.topup_status)}**`,
+    `ยอดที่ยืนยันได้: **${review.amount_cents == null ? 'ยังไม่ทราบ' : money(review.amount_cents)}**`,
+    `เลขธุรกรรม: \`${review.provider_transaction_id ?? 'ยังไม่มี'}\``,
+    `สาเหตุ: ${escapedText(review.failure_code ?? review.opened_reason ?? 'ต้องตรวจในแอป TrueMoney')}`,
+  ].join('\n');
+  return interaction.editReply({ content: detail, components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('topup_review_credit', session.id)).setLabel('เพิ่มเครดิต').setStyle(ButtonStyle.Success)
+      .setDisabled(interaction.user.id !== runtime.env.OWNER_ID),
+    new ButtonBuilder().setCustomId(customId('topup_review_reject', session.id)).setLabel('ปฏิเสธรายการ').setStyle(ButtonStyle.Danger)
+      .setDisabled(interaction.user.id !== runtime.env.OWNER_ID),
+  )] });
+}
+}
+
+async function handleTopupReviewDecision({ interaction, route, runtime, gates: _gates }) {
+if (['topup_review_credit', 'topup_review_reject'].includes(route.route) && interaction.isButton()) {
+  ownerOnly(interaction, runtime, 'รายการเติมเงินที่ผลไม่ชัดเจนให้ Owner ตัดสินเท่านั้น');
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId,
-    operation: adding ? 'ADMIN_BLOCK' : 'ADMIN_UNBLOCK' }, contextFor(interaction, 'block_load'), { pool: runtime.pool });
-  const input = blockInput(interaction);
-  await executeBlockChange({ adding, input, interaction, runtime });
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOPUP_REVIEW_DETAIL' },
+  contextFor(interaction, 'topup_review_action_load'), { pool: runtime.pool });
+  const credit = route.route === 'topup_review_credit';
+  const decision = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'TOPUP_REVIEW_DECISION',
+    payload: { ...session.payload, decision: credit ? 'CREDIT' : 'REJECT' }, configVersion: runtime.config.version },
+  contextFor(interaction, 'topup_review_decision_session'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`${adding ? 'ระงับ' : 'ยกเลิกการระงับ'} \`${input.discordUserId}\` สำหรับ **${BLOCK_LABELS[input.blockType] ?? 'การใช้งานที่เลือก'}** เรียบร้อย`);
+  return interaction.showModal(fieldsModal('topup_review_decision_submit', decision.id,
+    credit ? 'ยืนยันเพิ่มเครดิตจากซอง' : 'ปฏิเสธรายการเติมเงิน', credit ? [
+      { id: 'amount', label: 'ยอดที่ยืนยันได้ (บาท)', max: 24 },
+      { id: 'provider_id', label: 'เลขธุรกรรม TrueMoney', max: 200 },
+      { id: 'reason', label: 'หลักฐานและเหตุผล', long: true, max: 500 },
+    ] : [{ id: 'reason', label: 'เหตุผลที่ปฏิเสธ', long: true, max: 500 }]));
 }
 }
 
-async function handleReviewResolve({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'review_resolve' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_REVIEW_PREPARE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'review_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('review_resolve_submit', session.id, 'สรุปรายการที่รอตรวจสอบ', [
-    { id: 'review_id', label: 'ID รายการตรวจสอบ', max: 36 },
-    { id: 'decision', label: 'คำตัดสิน', placeholder: 'เพิ่มเครดิต/ปฏิเสธ/ลองใหม่/คิดเงิน/คืน/หยุด/ล้มเหลว', max: 20 },
-    { id: 'amount', label: 'ยอดบาท (เฉพาะเพิ่มเครดิต)', required: false, max: 24 },
-    { id: 'provider_id', label: 'เลขธุรกรรมผู้ให้บริการ (ถ้ามี)', required: false, max: 200 },
-    { id: 'reason', label: 'เหตุผลและหลักฐาน', long: true, max: 500 },
-  ]));
-}
-}
-
-async function handleReviewAssign({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'review_assign' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_REVIEW_ASSIGN',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'review_assign_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('review_assign_submit', session.id, 'รับผิดชอบรายการตรวจสอบ', [
-    { id: 'review_id', label: 'ID รายการตรวจสอบ', max: 36 },
-  ]));
-}
-}
-
-async function handleReviewAssignSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'review_assign_submit' && interaction.isModalSubmit()) {
+async function handleTopupReviewDecisionSubmit({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'topup_review_decision_submit' && interaction.isModalSubmit()) {
+  ownerOnly(interaction, runtime, 'รายการเติมเงินที่ผลไม่ชัดเจนให้ Owner ตัดสินเท่านั้น');
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REVIEW_ASSIGN' },
-  contextFor(interaction, 'review_assign_load'), { pool: runtime.pool });
-  const reviewId = interaction.fields.getTextInputValue('review_id').trim();
-  const review = (await runtime.pool.query(`SELECT * FROM manual_reviews WHERE id=$1 AND state='OPEN'`, [reviewId])).rows[0];
-  if (!review) throw new QuestshopError('REVIEW_NOT_OPEN', 'รายการนี้ไม่ได้เปิดรอการตรวจสอบอยู่');
-  const assigned = await assignReview({ reviewId, assigneeId: interaction.user.id,
-    expectedVersion: review.state_version }, contextFor(interaction, 'review_assign_execute'), { pool: runtime.pool });
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOPUP_REVIEW_DECISION' },
+  contextFor(interaction, 'topup_review_decision_load'), { pool: runtime.pool });
+  const credit = session.payload.decision === 'CREDIT';
+  const result = await resolveSubjectReview({
+    reviewId: session.payload.reviewId, expectedVersion: session.payload.expectedVersion, decision: session.payload.decision,
+    reason: interaction.fields.getTextInputValue('reason').trim(), isOwner: true,
+    amountCents: credit ? parseBahtToCents(interaction.fields.getTextInputValue('amount')) : null,
+    providerTransactionId: credit ? interaction.fields.getTextInputValue('provider_id').trim() : null,
+  }, contextFor(interaction, 'topup_review_decision_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`รับผิดชอบรายการตรวจสอบ \`${assigned.id}\` แล้ว`);
+  return interaction.editReply(`จัดการรายการเติมเงินแล้ว: **${result.applied.status ?? session.payload.decision}**`);
 }
 }
-
-async function handleReviewEvidence({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'review_evidence' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_REVIEW_EVIDENCE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'review_evidence_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('review_evidence_submit', session.id, 'เพิ่มหลักฐานการตรวจสอบ', [
-    { id: 'review_id', label: 'ID รายการตรวจสอบ', max: 36 },
-    { id: 'type', label: 'ประเภทหลักฐาน', placeholder: 'PROVIDER_CHECK / RUNNER_LOG / ADMIN_NOTE', max: 64 },
-    { id: 'note', label: 'รายละเอียดหลักฐาน', long: true, max: 1000 },
-  ]));
-}
-}
-
-async function handleReviewEvidenceSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'review_evidence_submit' && interaction.isModalSubmit()) {
-  await interaction.deferReply({ ephemeral: true });
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REVIEW_EVIDENCE' },
-  contextFor(interaction, 'review_evidence_load'), { pool: runtime.pool });
-  const reviewId = interaction.fields.getTextInputValue('review_id').trim();
-  const evidenceType = interaction.fields.getTextInputValue('type').trim().toUpperCase();
-  if (!/^[A-Z][A-Z0-9_]{1,63}$/.test(evidenceType)) throw new TypeError('ประเภทหลักฐานไม่ถูกต้อง');
-  const review = await addEvidence({ reviewId, evidenceType,
-    payload: { note: interaction.fields.getTextInputValue('note').trim() } },
-  contextFor(interaction, 'review_evidence_execute'), { pool: runtime.pool });
-  await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`เพิ่มหลักฐานให้รายการ \`${review.id}\` แล้ว • ${displayState(review.state)}`);
-}
-}
-
-async function handleReviewResolveSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'review_resolve_submit' && interaction.isModalSubmit()) {
-  await interaction.deferReply({ ephemeral: true });
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REVIEW_PREPARE' },
-  contextFor(interaction, 'review_prepare_load'), { pool: runtime.pool });
-  const reviewId = interaction.fields.getTextInputValue('review_id').trim();
-  const review = (await runtime.pool.query(`SELECT * FROM manual_reviews WHERE id=$1
-    AND state<>'RESOLVED'`, [reviewId])).rows[0];
-  if (!review) throw new QuestshopError('REVIEW_NOT_FOUND', 'ไม่พบรายการที่ยังเปิดรอตรวจสอบ');
-  if (review.owner_only && interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'รายการนี้ให้เจ้าของร้านตัดสินเท่านั้น');
-  const decision = normalizedChoice(interaction.fields.getTextInputValue('decision'), {
-    'เพิ่มเครดิต': 'CREDIT', 'ปฏิเสธ': 'REJECT', 'ลองใหม่': 'RETRY', 'คิดเงิน': 'CAPTURE',
-    'คิดค่าบริการ': 'CAPTURE', 'คืน': 'RELEASE', 'คืนเครดิต': 'RELEASE', 'หยุด': 'STOP', 'หยุดงาน': 'STOP',
-    'ล้มเหลว': 'FAIL',
-  });
-  const amountText = interaction.fields.getTextInputValue('amount').trim();
-  const payload = { reviewId, expectedVersion: String(review.state_version), decision,
-    amountCents: amountText ? String(parseBahtToCents(amountText)) : null,
-    providerTransactionId: interaction.fields.getTextInputValue('provider_id').trim() || null,
-    reason: interaction.fields.getTextInputValue('reason').trim() };
-  const confirm = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message?.id ?? null,
-    operation: 'ADMIN_REVIEW_CONFIRM', payload, configVersion: runtime.config.version },
-  contextFor(interaction, 'review_confirm_session'), { pool: runtime.pool });
-  return interaction.editReply({ content: `ยืนยันสรุปรายการ \`${review.id}\`\nประเภท: **${SUBJECT_LABELS[review.subject_type] ?? 'รายการตรวจสอบ'}** / \`${review.subject_id}\`\nคำตัดสิน: **${REVIEW_DECISION_LABELS[decision] ?? 'ตรวจสอบเพิ่มเติม'}**\nเกี่ยวข้องกับเงิน: **${review.financial ? 'ใช่' : 'ไม่'}**\nเหตุผล: ${payload.reason}`,
-    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
-      .setCustomId(customId('review_resolve_confirm', confirm.id)).setLabel('ยืนยันคำตัดสิน')
-      .setStyle(ButtonStyle.Danger))] });
-}
-}
-
-async function handleReviewResolveConfirm({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'review_resolve_confirm' && interaction.isButton()) {
-  await interaction.deferReply({ ephemeral: true });
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REVIEW_CONFIRM' },
-  contextFor(interaction, 'review_confirm_load'), { pool: runtime.pool });
-  const current = (await runtime.pool.query('SELECT state_version FROM manual_reviews WHERE id=$1',
-    [session.payload.reviewId])).rows[0];
-  if (String(current?.state_version) !== session.payload.expectedVersion) {
-    throw new QuestshopError('STALE_STATE', 'รายการเปลี่ยนหลังเปิดหน้าตรวจสอบ กรุณาเริ่มใหม่');
-  }
-  const result = await resolveSubjectReview({ reviewId: session.payload.reviewId,
-    decision: session.payload.decision, reason: session.payload.reason,
-    expectedVersion: session.payload.expectedVersion,
-    isOwner: interaction.user.id === runtime.env.OWNER_ID,
-    amountCents: session.payload.amountCents == null ? null : BigInt(session.payload.amountCents),
-    providerTransactionId: session.payload.providerTransactionId },
-  contextFor(interaction, 'review_resolve_execute'), { pool: runtime.pool });
-  await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply({ content: `สรุปรายการสำเร็จ: **${displayState(result.review.state)}**`, components: [] });
-}
-}
-
-async function handleCatalogSale({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'catalog_sale' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'QUEST_SALE_CHANGE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'catalog_sale_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('catalog_sale_submit', session.id, 'สถานะขาย Quest', [
-    { id: 'quest_id', label: 'Quest ID', max: 100 },
-    { id: 'state', label: 'สถานะใหม่', placeholder: 'เปิด / พัก / หมดอายุ', max: 10 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
-}
-}
-
-async function handleCatalogSaleSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'catalog_sale_submit' && interaction.isModalSubmit()) {
-  await interaction.deferReply({ ephemeral: true });
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'QUEST_SALE_CHANGE' },
-  contextFor(interaction, 'catalog_sale_load'), { pool: runtime.pool });
-  const quest = await setQuestSaleState({ questId: interaction.fields.getTextInputValue('quest_id').trim(),
-    nextState: normalizedChoice(interaction.fields.getTextInputValue('state'), {
-      'เปิด': 'OPEN', 'พัก': 'PAUSED', 'หมดอายุ': 'EXPIRED',
-    }),
-    runnerConcurrency: runnerConcurrency(runtime),
-    reason: interaction.fields.getTextInputValue('reason').trim() },
-  contextFor(interaction, 'catalog_sale_execute'), { pool: runtime.pool });
-  await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`Quest \`${quest.quest_id}\` เปลี่ยนเป็น **${saleStateLabel(quest.sale_state)}** แล้ว`);
-}
-}
-
 async function handleOrderReview({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'adminorder_review' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ORDER_REVIEW_OPEN',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'order_review_session'), { pool: runtime.pool });
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ORDER_ITEM_DETAIL' },
+  contextFor(interaction, 'order_review_load_detail'), { pool: runtime.pool });
   return interaction.showModal(fieldsModal('adminorder_review_submit', session.id, 'เปิดรายการตรวจสอบงาน Quest', [
-    { id: 'item_id', label: 'ID งาน Quest', max: 36 },
-    { id: 'owner_only', label: 'ให้เจ้าของร้านตัดสินเท่านั้น?', placeholder: 'ใช่ หรือ ไม่', max: 4 },
     { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
   ]));
+}
+}
+
+async function handleOrderPick({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'adminorder_pick' && interaction.isStringSelectMenu()) {
+  await interaction.deferReply({ ephemeral: true });
+  const item = (await runtime.pool.query(`SELECT i.*,o.account_id,o.account_username,o.id AS order_id,
+    r.state AS reservation_state,r.amount_cents,r.state_version AS reservation_version,
+    count(a.id)::integer AS attempts
+    FROM order_items i JOIN orders o ON o.id=i.order_id
+    LEFT JOIN wallet_reservations r ON r.order_item_id=i.id
+    LEFT JOIN runner_jobs j ON j.order_item_id=i.id
+    LEFT JOIN runner_attempts a ON a.job_id=j.id
+    WHERE i.id=$1 GROUP BY i.id,o.id,r.id`, [interaction.values[0]])).rows[0];
+  if (!item) throw new QuestshopError('ORDER_ITEM_NOT_FOUND', 'ไม่พบงาน Quest นี้');
+  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ORDER_ITEM_DETAIL',
+    payload: { orderItemId: item.id, expectedVersion: String(item.state_version) }, configVersion: runtime.config.version },
+  contextFor(interaction, 'order_item_detail'), { pool: runtime.pool });
+  const detail = [
+    `Quest: **${escapedText(item.quest_name)}**`,
+    `บัญชี Quest: **${escapedText(item.account_username ?? item.account_id)}** (\`${item.account_id}\`)`,
+    `สถานะ: **${orderStateLabel(item.state)}** • ความคืบหน้า **${item.progress_bucket}%**`,
+    `ออเดอร์: \`${item.order_id}\` • ราคา: **${money(item.price_cents)}**`,
+    `ยอดจอง: **${item.reservation_state ?? 'ไม่พบ'}** • Attempts: **${item.attempts}**`,
+  ].join('\n');
+  return interaction.editReply({ content: detail, components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('adminorder_review', session.id)).setLabel('ส่งตรวจสอบงานนี้').setStyle(ButtonStyle.Danger)
+      .setDisabled(['READY_TO_CLAIM', 'EXPIRED_RELEASED', 'EXTERNAL_COMPLETED_RELEASED', 'STOPPED_RELEASED', 'FAILED_RELEASED'].includes(item.state)),
+  )] });
+}
+}
+
+async function handleOrderPage({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'orders_page' && interaction.isButton()) {
+  await interaction.deferUpdate();
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ORDER_PAGE' },
+  contextFor(interaction, 'order_page_load'), { pool: runtime.pool });
+  await completeInteractionSession(session, interaction, runtime);
+  return renderOrdersPanel(interaction, runtime, Number(session.payload.offset ?? 0));
 }
 }
 
@@ -1210,190 +1101,169 @@ async function handleOrderReviewSubmit({ interaction, route, runtime, gates: _ga
 if (route.route === 'adminorder_review_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ORDER_REVIEW_OPEN' },
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ORDER_ITEM_DETAIL' },
   contextFor(interaction, 'order_review_load'), { pool: runtime.pool });
-  const ownerOnlyText = interaction.fields.getTextInputValue('owner_only').trim().toLowerCase();
-  const ownerOnly = ['yes', 'ใช่'].includes(ownerOnlyText);
-  const review = await openOrderItemReview({ orderItemId: interaction.fields.getTextInputValue('item_id').trim(),
-    reason: interaction.fields.getTextInputValue('reason').trim(), ownerOnly },
+  const review = await openOrderItemReview({ orderItemId: session.payload.orderItemId,
+    reason: interaction.fields.getTextInputValue('reason').trim(), ownerOnly: false },
   contextFor(interaction, 'order_review_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`เปิดรายการตรวจสอบ \`${review.id}\` แล้ว${review.owner_only ? ' • เจ้าของร้านเป็นผู้ตัดสิน' : ''}`);
+  return interaction.editReply(`เปิดรายการตรวจสอบงาน **${review.subject_id}** แล้ว`);
 }
 }
 
-async function handlePriceCreate({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'price_create' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'PRICE_CREATE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'price_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('price_create_submit', session.id, 'สร้างกฎราคา', [
-    { id: 'scope', label: 'ใช้ราคากับ', placeholder: 'เริ่มต้น / ประเภท / Quest / ชั่วคราว', max: 16 },
-    { id: 'target', label: 'Quest หรือประเภทเป้าหมาย', placeholder: 'เช่น WATCH_VIDEO หรือ Quest ID (เว้นว่างได้)', required: false, max: 100 },
-    { id: 'amount', label: 'ราคา (บาท)', placeholder: '5.00', max: 24 },
-    { id: 'period', label: 'เริ่ม | จบ (ISO 8601, เว้นว่างได้)', placeholder: '2026-08-01T00:00:00+07:00 | 2026-08-31T23:59:59+07:00', required: false, max: 120 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
-}
-}
-
-function priceTarget(ruleType, rawTarget) {
-  const target = rawTarget.trim();
-  if (ruleType === 'QUEST') return { questId: target || null, taskType: null };
-  if (ruleType === 'TYPE') return { questId: null, taskType: target.toUpperCase() || null };
-  if (ruleType !== 'TEMPORARY') return { questId: null, taskType: null };
-  if (target.startsWith('quest:')) return { questId: target.slice(6) || null, taskType: null };
-  if (target.startsWith('type:')) return { questId: null, taskType: target.slice(5).toUpperCase() || null };
-  return { questId: null, taskType: null };
-}
-
-function pricePeriod(rawPeriod) {
-  const [startText, endText] = rawPeriod.trim() ? rawPeriod.split('|').map((value) => value.trim()) : [];
-  const startsAt = startText ? new Date(startText) : null;
-  const endsAt = endText ? new Date(endText) : null;
-  const invalidStart = startText && !Number.isFinite(startsAt.getTime());
-  const invalidEnd = endText && !Number.isFinite(endsAt.getTime());
-  if (invalidStart || invalidEnd || (startsAt && endsAt && endsAt <= startsAt)) {
-    throw new TypeError('ช่วงเวลาของกฎราคาไม่ถูกต้อง');
-  }
-  return { startsAt, endsAt };
-}
-
-function priceRuleInput(interaction) {
-  const ruleType = normalizedChoice(interaction.fields.getTextInputValue('scope'), {
-    'เริ่มต้น': 'DEFAULT', 'ประเภท': 'TYPE', 'ชั่วคราว': 'TEMPORARY',
+function parsePromotionTiersInput(raw) {
+  const tiers = String(raw).split(',').map((entry) => {
+    const [amount, percent, ...extra] = entry.split('=').map((value) => value.trim());
+    if (!amount || !percent || extra.length) throw new TypeError('รูปแบบ Tier ต้องเป็น ยอด=เปอร์เซ็นต์ เช่น 100=10');
+    return { minimumAmountCents: parseBahtToCents(amount), basisPoints: parsePromotionBasisPoints(percent) };
   });
-  return {
-    ruleType,
-    ...priceTarget(ruleType, interaction.fields.getTextInputValue('target')),
-    ...pricePeriod(interaction.fields.getTextInputValue('period')),
-    amountCents: parseBahtToCents(interaction.fields.getTextInputValue('amount')),
-    reason: interaction.fields.getTextInputValue('reason').trim(),
-  };
+  if (!tiers.length) throw new TypeError('ต้องมีโบนัสอย่างน้อยหนึ่งระดับ');
+  return tiers;
 }
 
-async function handlePriceCreateSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'price_create_submit' && interaction.isModalSubmit()) {
+function parseOptionalPositiveInteger(value, label) {
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) throw new TypeError(`${label} ไม่ถูกต้อง`);
+  return parsed;
+}
+
+async function handlePriceCategoryPick({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'price_category_pick' && interaction.isStringSelectMenu()) {
+  const category = interaction.values[0];
+  const taskTypes = QUEST_PRICE_CATEGORIES[category];
+  if (!taskTypes) throw new TypeError('ประเภท Quest ไม่ถูกต้อง');
+  const rules = (await runtime.pool.query(`SELECT task_type,amount_cents,state_version FROM price_rules
+    WHERE enabled=true AND rule_type='TYPE' AND task_type=ANY($1::text[])`, [taskTypes])).rows;
+  if (rules.length !== taskTypes.length) throw new QuestshopError('PRICE_CONFIGURATION_MISSING', 'ยังตั้งราคาประเภทนี้ไม่ครบ');
+  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PRICE_CATEGORY_PREPARE',
+    payload: { category, expectedVersions: Object.fromEntries(rules.map((rule) => [rule.task_type, String(rule.state_version)])) },
+    configVersion: runtime.config.version }, contextFor(interaction, 'price_category_prepare'), { pool: runtime.pool });
+  return interaction.showModal(fieldsModal('price_category_submit', session.id,
+    category === 'GAME' ? 'ตั้งราคา Quest เล่นเกม' : 'ตั้งราคา Quest ดูวิดีโอ', [
+      { id: 'amount', label: 'ราคาใหม่ (บาท)', placeholder: money(rules[0].amount_cents), max: 24 },
+    ]));
+}
+}
+
+async function handlePriceCategorySubmit({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'price_category_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PRICE_CREATE' },
-  contextFor(interaction, 'price_load'), { pool: runtime.pool });
-  const rule = await setPriceRule(priceRuleInput(interaction),
-  contextFor(interaction, 'price_create_execute'), { pool: runtime.pool });
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PRICE_CATEGORY_PREPARE' },
+  contextFor(interaction, 'price_category_load'), { pool: runtime.pool });
+  const amountCents = parseBahtToCents(interaction.fields.getTextInputValue('amount'));
+  const old = (await runtime.pool.query(`SELECT amount_cents FROM price_rules WHERE enabled=true
+    AND rule_type='TYPE' AND task_type=ANY($1::text[]) ORDER BY created_at LIMIT 1`,
+  [QUEST_PRICE_CATEGORIES[session.payload.category]])).rows[0];
+  const confirm = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PRICE_CATEGORY_CONFIRM',
+    payload: { category: session.payload.category, amountCents: String(amountCents), expectedVersions: session.payload.expectedVersions },
+    configVersion: runtime.config.version }, contextFor(interaction, 'price_category_confirm_session'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`สร้าง **${PRICE_RULE_LABELS[rule.rule_type] ?? 'กฎราคา'}** ราคา **${money(rule.amount_cents)}** แล้ว`);
+  return interaction.editReply({ content: `ยืนยันเปลี่ยนราคา **${session.payload.category === 'GAME' ? 'Quest เล่นเกม' : 'Quest ดูวิดีโอ'}**\n${money(old.amount_cents)} → **${money(amountCents)}**\nราคานี้ใช้ต่อเนื่องจนกว่าจะเปลี่ยนครั้งถัดไป`,
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(customId('price_category_confirm', confirm.id)).setLabel('ยืนยันเปลี่ยนราคา').setStyle(ButtonStyle.Danger))] });
 }
 }
 
-async function handlePriceManage({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'price_manage' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'PRICE_MANAGE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'price_manage_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('price_manage_submit', session.id, 'เปิดหรือปิดกฎราคา', [
-    { id: 'rule_id', label: 'ID กฎราคา', max: 36 },
-    { id: 'action', label: 'ต้องการทำอะไร', placeholder: 'เปิด หรือ ปิด', max: 7 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
-}
-}
-
-async function handlePriceManageSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'price_manage_submit' && interaction.isModalSubmit()) {
+async function handlePriceCategoryConfirm({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'price_category_confirm' && interaction.isButton()) {
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PRICE_MANAGE' },
-  contextFor(interaction, 'price_manage_load'), { pool: runtime.pool });
-  const action = normalizedChoice(interaction.fields.getTextInputValue('action'), { 'เปิด': 'ENABLE', 'ปิด': 'DISABLE' });
-  if (!['ENABLE', 'DISABLE'].includes(action)) throw new TypeError('กรุณากรอก “เปิด” หรือ “ปิด”');
-  const priceRuleId = interaction.fields.getTextInputValue('rule_id').trim();
-  const current = (await runtime.pool.query('SELECT state_version FROM price_rules WHERE id=$1', [priceRuleId])).rows[0];
-  if (!current) throw new QuestshopError('PRICE_RULE_NOT_FOUND', 'ไม่พบกฎราคานี้');
-  const rule = await setPriceRuleEnabled({ priceRuleId: interaction.fields.getTextInputValue('rule_id').trim(),
-    enabled: action === 'ENABLE', expectedVersion: current.state_version,
-    reason: interaction.fields.getTextInputValue('reason').trim() },
-  contextFor(interaction, 'price_manage_execute'), { pool: runtime.pool });
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PRICE_CATEGORY_CONFIRM' },
+  contextFor(interaction, 'price_category_confirm_load'), { pool: runtime.pool });
+  const result = await setQuestCategoryPrice({ category: session.payload.category,
+    amountCents: BigInt(session.payload.amountCents), expectedVersions: session.payload.expectedVersions },
+  contextFor(interaction, 'price_category_change'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`กฎราคา \`${rule.id}\` **${rule.enabled ? 'เปิดใช้งาน' : 'ปิดใช้งาน'}** แล้ว`);
+  return interaction.editReply(`ตั้งราคา ${result.category === 'GAME' ? 'Quest เล่นเกม' : 'Quest ดูวิดีโอ'} เป็น **${money(result.amountCents)}** แล้ว`);
 }
 }
 
-async function handlePromotionCreate({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'promo_create' && interaction.isButton()) {
+async function handlePromotionSet({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'promo_set' && interaction.isButton()) {
   const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'PROMOTION_CREATE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'promo_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('promo_create_submit', session.id, 'สร้างโปรโมชั่น', [
-    { id: 'name', label: 'ชื่อโปรโมชั่น', max: 100 },
-    { id: 'period', label: 'เริ่ม | จบ (ISO 8601)', placeholder: '2026-08-01T00:00:00+07:00 | 2026-09-01T00:00:00+07:00', max: 120 },
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PROMOTION_TERMS_PREPARE',
+    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'promotion_terms_prepare'), { pool: runtime.pool });
+  return interaction.showModal(fieldsModal('promo_set_submit', session.id, 'ตั้งโบนัสเติมเงิน', [
     { id: 'tiers', label: 'ยอดเติม=โบนัสเปอร์เซ็นต์', placeholder: '100=10, 300=15, 600=20', max: 300 },
-    { id: 'limits', label: 'ครั้งต่อลูกค้า | โบนัสสูงสุดต่อวัน', placeholder: '1 | 500.00 (เว้นว่างได้)', required: false, max: 80 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+    { id: 'uses', label: 'จำนวนครั้งต่อผู้ใช้ตลอดรุ่นนี้', placeholder: 'เว้นว่างได้', required: false, max: 10 },
+    { id: 'daily_cap', label: 'โบนัสสูงสุดต่อผู้ใช้ต่อวัน (บาท)', placeholder: 'เว้นว่างได้', required: false, max: 24 },
   ]));
 }
 }
 
-async function handlePromotionCreateSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'promo_create_submit' && interaction.isModalSubmit()) {
+async function handlePromotionSetSubmit({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'promo_set_submit' && interaction.isModalSubmit()) {
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PROMOTION_CREATE' },
-  contextFor(interaction, 'promo_load'), { pool: runtime.pool });
-  const [startText, endText] = interaction.fields.getTextInputValue('period').split('|').map((value) => value.trim());
-  const startsAt = new Date(startText); const endsAt = new Date(endText);
-  if (!Number.isFinite(startsAt.getTime()) || !Number.isFinite(endsAt.getTime()) || endsAt <= startsAt) throw new TypeError('ช่วงเวลาโปรโมชั่นไม่ถูกต้อง');
-  const tiers = interaction.fields.getTextInputValue('tiers').split(',').map((entry) => {
-    const [amount, percent] = entry.split('=').map((value) => value.trim());
-    const basisPoints = parsePromotionBasisPoints(percent);
-    return { minimumAmountCents: parseBahtToCents(amount), basisPoints };
-  });
-  const limitsText = interaction.fields.getTextInputValue('limits').trim();
-  const [usesText, bonusText] = limitsText ? limitsText.split('|').map((value) => value.trim()) : [];
-  const maxUsesPerUser = usesText ? Number(usesText) : null;
-  if (maxUsesPerUser != null && (!Number.isInteger(maxUsesPerUser) || maxUsesPerUser <= 0)) throw new TypeError('จำนวนครั้งต่อผู้ใช้ไม่ถูกต้อง');
-  const promotion = await createPromotion({ name: interaction.fields.getTextInputValue('name'),
-    startsAt, endsAt, tiers, maxUsesPerUser,
-    maxBonusPerDayCents: bonusText ? parseBahtToCents(bonusText) : null,
-    activate: true, reason: interaction.fields.getTextInputValue('reason').trim() },
-  contextFor(interaction, 'promo_create_execute'), { pool: runtime.pool });
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PROMOTION_TERMS_PREPARE' },
+  contextFor(interaction, 'promotion_terms_load'), { pool: runtime.pool });
+  const tiers = parsePromotionTiersInput(interaction.fields.getTextInputValue('tiers'));
+  const maxUsesPerUser = parseOptionalPositiveInteger(interaction.fields.getTextInputValue('uses'), 'จำนวนครั้งต่อผู้ใช้');
+  const dailyCapText = interaction.fields.getTextInputValue('daily_cap').trim();
+  const maxBonusPerDayCents = dailyCapText ? parseBahtToCents(dailyCapText) : null;
+  const confirm = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PROMOTION_TERMS_CONFIRM',
+    payload: { tiers: tiers.map((tier) => ({ minimumAmountCents: String(tier.minimumAmountCents), basisPoints: tier.basisPoints })),
+      maxUsesPerUser, maxBonusPerDayCents: maxBonusPerDayCents == null ? null : String(maxBonusPerDayCents) },
+    configVersion: runtime.config.version }, contextFor(interaction, 'promotion_terms_confirm_session'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`สร้างและเปิดโปรโมชั่น **${promotion.name}** รุ่น ${promotion.version} แล้ว`);
+  const preview = tiers.map((tier) => `${money(tier.minimumAmountCents)} = ${(tier.basisPoints / 100).toFixed(2)}%`).join('\n');
+  return interaction.editReply({ content: `ยืนยันตั้งโบนัสเติมเงิน\n${preview}\nจำนวนครั้งต่อผู้ใช้: **${maxUsesPerUser ?? 'ไม่จำกัด'}**\nโบนัสต่อวัน: **${maxBonusPerDayCents == null ? 'ไม่จำกัด' : money(maxBonusPerDayCents)}**`,
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(customId('promo_set_confirm', confirm.id)).setLabel('ยืนยันบันทึกโบนัส').setStyle(ButtonStyle.Danger))] });
 }
 }
 
-async function handlePromotionManage({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'promo_manage' && interaction.isButton()) {
+async function handlePromotionSetConfirm({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'promo_set_confirm' && interaction.isButton()) {
+  await interaction.deferReply({ ephemeral: true });
+  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PROMOTION_TERMS_CONFIRM' },
+  contextFor(interaction, 'promotion_terms_confirm_load'), { pool: runtime.pool });
+  const result = await replaceManualPromotion({
+    tiers: session.payload.tiers.map((tier) => ({ ...tier, minimumAmountCents: BigInt(tier.minimumAmountCents) })),
+    maxUsesPerUser: session.payload.maxUsesPerUser,
+    maxBonusPerDayCents: session.payload.maxBonusPerDayCents == null ? null : BigInt(session.payload.maxBonusPerDayCents),
+  }, contextFor(interaction, 'promotion_terms_replace'), { pool: runtime.pool });
+  await completeInteractionSession(session, interaction, runtime);
+  return interaction.editReply(`บันทึกโบนัสเติมเงินรุ่น **${result.promotion.version}** และเปิดใช้งานแล้ว`);
+}
+}
+
+async function handlePromotionToggle({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'promo_toggle' && interaction.isButton()) {
+  const current = (await runtime.pool.query(`SELECT * FROM promotions WHERE manual_controlled=true
+    ORDER BY version DESC LIMIT 1`)).rows[0];
+  if (!current) throw new QuestshopError('PROMOTION_NOT_FOUND', 'ยังไม่มีโบนัสเติมเงินให้เปิดหรือปิด');
+  const enabled = current.state !== 'ACTIVE';
   const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'PROMOTION_MANAGE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'promo_manage_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('promo_manage_submit', session.id, 'เปลี่ยนสถานะโปรโมชั่น', [
-    { id: 'promotion_id', label: 'ID โปรโมชั่น', max: 36 },
-    { id: 'state', label: 'สถานะ', placeholder: 'แบบร่าง / เปิด / ปิด', max: 8 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PROMOTION_TOGGLE_CONFIRM',
+    payload: { enabled, expectedVersion: String(current.state_version) }, configVersion: runtime.config.version },
+  contextFor(interaction, 'promotion_toggle_session'), { pool: runtime.pool });
+  return interaction.reply({ ephemeral: true, content: `ยืนยัน${enabled ? 'เปิด' : 'ปิด'}โบนัสเติมเงิน?`,
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(customId('promo_toggle_confirm', session.id)).setLabel(`ยืนยัน${enabled ? 'เปิด' : 'ปิด'}โบนัส`)
+      .setStyle(enabled ? ButtonStyle.Success : ButtonStyle.Danger))] });
 }
 }
 
-async function handlePromotionManageSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'promo_manage_submit' && interaction.isModalSubmit()) {
+async function handlePromotionToggleConfirm({ interaction, route, runtime, gates: _gates }) {
+if (route.route === 'promo_toggle_confirm' && interaction.isButton()) {
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PROMOTION_MANAGE' },
-  contextFor(interaction, 'promo_manage_load'), { pool: runtime.pool });
-  const promotionId = interaction.fields.getTextInputValue('promotion_id').trim();
-  const current = (await runtime.pool.query('SELECT state_version FROM promotions WHERE id=$1', [promotionId])).rows[0];
-  if (!current) throw new QuestshopError('PROMOTION_NOT_FOUND', 'ไม่พบโปรโมชั่น');
-  const promotion = await setPromotionState({ promotionId,
-    state: normalizedChoice(interaction.fields.getTextInputValue('state'), {
-      'แบบร่าง': 'DRAFT', 'เปิด': 'ACTIVE', 'ปิด': 'DISABLED',
-    }),
-    expectedVersion: current.state_version,
-    reason: interaction.fields.getTextInputValue('reason').trim() }, contextFor(interaction, 'promo_manage_execute'), { pool: runtime.pool });
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PROMOTION_TOGGLE_CONFIRM' },
+  contextFor(interaction, 'promotion_toggle_load'), { pool: runtime.pool });
+  const updated = await setManualPromotionEnabled(session.payload,
+    contextFor(interaction, 'promotion_toggle_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`โปรโมชั่น **${promotion.name}** เป็น **${displayState(promotion.state)}** แล้ว`);
+  return interaction.editReply(`โบนัสเติมเงิน${updated.state === 'ACTIVE' ? 'เปิดใช้งานแล้ว' : 'ปิดแล้ว'}`);
 }
 }
-
 async function handleReceiverActivate({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'receiver_activate' && interaction.isButton()) {
   if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'เบอร์รับเงินใช้ได้เฉพาะเจ้าของร้าน');
@@ -1574,18 +1444,21 @@ if (route.route === 'monitor_toggle' && interaction.isButton()) {
 }
 
 async function handleDlqAction({ interaction, route, runtime, gates: _gates }) {
-if (['dlq_replay', 'dlq_discard'].includes(route.route) && interaction.isButton()) {
-  if (route.route === 'dlq_discard' && interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'การปิดงานค้างใช้ได้เฉพาะเจ้าของร้าน');
-  const operation = route.route === 'dlq_replay' ? 'DLQ_REPLAY' : 'DLQ_DISCARD';
+if (!['dlq_replay', 'dlq_discard'].includes(route.route) || !interaction.isButton()) return;
+  const replay = route.route === 'dlq_replay';
+  if (!replay && interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'การปิดงานค้างใช้ได้เฉพาะเจ้าของร้าน');
+  const selected = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'DLQ_DETAIL' },
+  contextFor(interaction, 'dlq_action_load'), { pool: runtime.pool });
+  const operation = replay ? 'DLQ_REPLAY' : 'DLQ_DISCARD';
   const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation,
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'dlq_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal(route.route === 'dlq_replay' ? 'dlq_replay_submit' : 'dlq_discard_submit',
-    session.id, operation, [
-      { id: 'dlq_id', label: 'ID งานค้าง', max: 36 },
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation,
+    payload: { dlqId: selected.payload.dlqId }, configVersion: runtime.config.version },
+  contextFor(interaction, 'dlq_action_session'), { pool: runtime.pool });
+  return interaction.showModal(fieldsModal(replay ? 'dlq_replay_submit' : 'dlq_discard_submit', session.id,
+    replay ? 'ลองส่งงานค้างใหม่' : 'ปิดงานค้างที่ไม่เกี่ยวกับเงิน', [
       { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
     ]));
-}
 }
 
 async function handleDlqSubmit({ interaction, route, runtime, gates: _gates }) {
@@ -1597,14 +1470,44 @@ if (['dlq_replay_submit', 'dlq_discard_submit'].includes(route.route) && interac
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation },
   contextFor(interaction, 'dlq_load'), { pool: runtime.pool });
-  const input = { dlqId: interaction.fields.getTextInputValue('dlq_id').trim(),
-    reason: interaction.fields.getTextInputValue('reason').trim() };
+  const input = { dlqId: session.payload.dlqId, reason: interaction.fields.getTextInputValue('reason').trim() };
   const result = replay
     ? await replayDeadLetter(input, contextFor(interaction, 'dlq_replay_execute'), { pool: runtime.pool })
     : await discardDeadLetter({ ...input, isOwner: true }, contextFor(interaction, 'dlq_discard_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`${replay ? 'ส่งงานค้างใหม่' : 'ปิดงานค้าง'} สำเร็จ: \`${replay ? result.replayOutboxId : result.id}\``);
 }
+}
+
+async function handleDlqPick({ interaction, route, runtime, gates: _gates }) {
+if (route.route !== 'dlq_pick' || !interaction.isStringSelectMenu()) return;
+  await interaction.deferReply({ ephemeral: true });
+  const selection = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'DLQ_SELECT' },
+  contextFor(interaction, 'dlq_pick_load'), { pool: runtime.pool });
+  const dlqId = interaction.values[0];
+  if (!selection.payload.dlqIds?.includes(dlqId)) throw new QuestshopError('DLQ_SELECTION_INVALID', 'รายการปัญหานี้หมดอายุแล้ว');
+  const item = (await runtime.pool.query(`SELECT * FROM dead_letter_items WHERE id=$1
+    AND state IN ('DEAD_LETTER','PENDING')`, [dlqId])).rows[0];
+  if (!item) throw new QuestshopError('DLQ_NOT_FOUND', 'ไม่พบรายการปัญหาที่ยังจัดการได้');
+  const detail = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
+    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'DLQ_DETAIL',
+    payload: { dlqId: item.id }, configVersion: runtime.config.version },
+  contextFor(interaction, 'dlq_detail_session'), { pool: runtime.pool });
+  const discardAllowed = !['FINANCIAL', 'AUDIT'].includes(item.category) && interaction.user.id === runtime.env.OWNER_ID;
+  const description = [
+    `ประเภท: **${escapedText(item.category)}** / ${escapedText(item.source_type)}`,
+    `สถานะ: **${displayState(item.state)}**`, `รหัสรายการ: \`${item.id}\``,
+    `สาเหตุล่าสุด: ${escapedText(item.error_code ?? 'ไม่ระบุ')}`,
+    `สร้างเมื่อ: <t:${Math.floor(new Date(item.created_at).getTime() / 1000)}:R>`,
+    ['FINANCIAL', 'AUDIT'].includes(item.category) ? 'รายการนี้เกี่ยวข้องกับเงินหรือ Audit จึงปิดทิ้งไม่ได้' : 'Owner สามารถปิดทิ้งได้เมื่อยืนยันว่าไม่ต้อง Retry',
+  ].join('\n');
+  return interaction.editReply({ content: description, components: [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(customId('dlq_replay', detail.id)).setLabel('ลองส่งงานนี้ใหม่').setStyle(ButtonStyle.Primary)
+      .setDisabled(item.state !== 'DEAD_LETTER'),
+    new ButtonBuilder().setCustomId(customId('dlq_discard', detail.id)).setLabel('ปิดงานนี้').setStyle(ButtonStyle.Danger)
+      .setDisabled(!discardAllowed || item.state !== 'DEAD_LETTER'),
+  )] });
 }
 
 async function handleConcurrency({ interaction, route, runtime, gates: _gates }) {
@@ -1641,30 +1544,18 @@ if (route.route === 'config_concurrency_submit' && interaction.isModalSubmit()) 
 }
 
 async function handleConfig({ interaction, route, runtime, gates: _gates }) {
-if (['config_branding', 'config_roles'].includes(route.route) && interaction.isButton()) {
-  const roles = route.route === 'config_roles';
-  if (roles && interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'การตั้งค่ายศใช้ได้เฉพาะเจ้าของร้าน');
-  const operation = roles ? 'CONFIG_ROLES' : 'CONFIG_BRANDING';
+if (route.route === 'config_roles' && interaction.isButton()) {
+  ownerOnly(interaction, runtime, 'การตั้งค่ายศใช้ได้เฉพาะเจ้าของร้าน');
   const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation,
+    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'CONFIG_ROLES',
     payload: { expectedVersion: runtime.config.version }, configVersion: runtime.config.version },
   contextFor(interaction, 'config_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal(roles ? 'config_roles_submit' : 'config_branding_submit',
-    session.id, roles ? 'ตั้งค่ายศของระบบ' : 'ตั้งค่าหน้าร้าน', roles ? [
-      { id: 'admin_role', label: 'ID ยศแอดมิน (เว้นว่างเพื่อปิด)', required: false, max: 20 },
-      { id: 'quest_role', label: 'ID ยศแจ้ง Quest ใหม่', required: false, max: 20 },
-      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-    ] : [
-      { id: 'title', label: 'ชื่อแผง Quest Auto', max: 256 },
-      { id: 'description', label: 'คำอธิบาย', long: true, max: 2000 },
-      { id: 'media_url', label: 'ลิงก์รูปหรือ GIF (เว้นว่างได้)', required: false, max: 500 },
-      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-    ]));
+  return interaction.showModal(fieldsModal('config_roles_submit', session.id, 'ตั้งค่ายศของระบบ', [
+    { id: 'admin_role', label: 'ID ยศแอดมิน (เว้นว่างเพื่อปิด)', required: false, max: 20 },
+    { id: 'quest_role', label: 'ID ยศแจ้ง Quest ใหม่', required: false, max: 20 },
+    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+  ]));
 }
-}
-
-function configOperation(roles) {
-  return roles ? 'CONFIG_ROLES' : 'CONFIG_BRANDING';
 }
 
 function roleConfigPatch(interaction) {
@@ -1676,31 +1567,14 @@ function roleConfigPatch(interaction) {
   return { adminRoleId, questAnnouncementRoleId };
 }
 
-function brandingConfigPatch(interaction) {
-  const mediaUrl = interaction.fields.getTextInputValue('media_url').trim() || null;
-  if (mediaUrl && !['https:', 'http:'].includes(new URL(mediaUrl).protocol)) {
-    throw new TypeError('ลิงก์รูปหรือ GIF ต้องเป็น HTTP(S)');
-  }
-  return { branding: {
-    title: interaction.fields.getTextInputValue('title').trim(),
-    description: interaction.fields.getTextInputValue('description').trim(), mediaUrl,
-  } };
-}
-
-function configPatch(interaction, roles) {
-  return roles ? roleConfigPatch(interaction) : brandingConfigPatch(interaction);
-}
-
 async function handleConfigSubmit({ interaction, route, runtime, gates: _gates }) {
-if (['config_roles_submit', 'config_branding_submit'].includes(route.route) && interaction.isModalSubmit()) {
-  const roles = route.route === 'config_roles_submit';
-  if (roles) ownerOnly(interaction, runtime, 'การตั้งค่ายศใช้ได้เฉพาะเจ้าของร้าน');
+if (route.route === 'config_roles_submit' && interaction.isModalSubmit()) {
+  ownerOnly(interaction, runtime, 'การตั้งค่ายศใช้ได้เฉพาะเจ้าของร้าน');
   await interaction.deferReply({ ephemeral: true });
-  const operation = configOperation(roles);
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation },
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'CONFIG_ROLES' },
   contextFor(interaction, 'config_load'), { pool: runtime.pool });
-  const changed = await updateRuntimeConfig({ patch: configPatch(interaction, roles), expectedVersion: session.payload.expectedVersion,
+  const changed = await updateRuntimeConfig({ patch: roleConfigPatch(interaction), expectedVersion: session.payload.expectedVersion,
     reason: interaction.fields.getTextInputValue('reason').trim() },
   contextFor(interaction, 'config_execute'), { pool: runtime.pool });
   runtime.config = await loadRuntimeConfig(runtime.pool);
@@ -1720,7 +1594,6 @@ if (route.route === 'breaker_prepare' && interaction.isButton()) {
       beforeState: breaker.state }, configVersion: runtime.config.version },
   contextFor(interaction, 'breaker_session'), { pool: runtime.pool });
   return interaction.showModal(fieldsModal('breaker_submit', session.id, 'ทดสอบระบบรับซองอีกครั้ง', [
-    { id: 'state', label: 'การทำงาน', placeholder: 'ทดสอบ หรือ เปิดปกติ', max: 10 },
     { id: 'reason', label: 'หลักฐานและเหตุผล', long: true, max: 500 },
   ]));
 }
@@ -1734,58 +1607,15 @@ if (route.route === 'breaker_submit' && interaction.isModalSubmit()) {
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'BREAKER_CHANGE' },
   contextFor(interaction, 'breaker_load'), { pool: runtime.pool });
   const breaker = await setCircuitBreakerState({ breakerKey: session.payload.breakerKey,
-    nextState: normalizedChoice(interaction.fields.getTextInputValue('state'), {
-      'ทดสอบ': 'HALF_OPEN', 'เปิดปกติ': 'CLOSED', 'เปิด': 'CLOSED',
-    }),
+    // A direct provider probe could redeem a real voucher. HALF_OPEN instead
+    // lets the payment worker verify the next legitimate request and only it
+    // can close the breaker after the pinned provider schema succeeds.
+    nextState: 'HALF_OPEN',
     expectedVersion: session.payload.expectedVersion,
     reason: interaction.fields.getTextInputValue('reason').trim() },
   contextFor(interaction, 'breaker_execute'), { pool: runtime.pool });
   await completeInteractionSession(session, interaction, runtime);
   return interaction.editReply(`ระบบรับซองเป็น **${breakerStateLabel(breaker.state)}** แล้ว${breaker.state === 'HALF_OPEN' ? ' และจะทดสอบด้วยรายการถัดไปหนึ่งรายการ' : ''}`);
-}
-}
-
-async function handleGatePick({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'admin_gate_pick' && interaction.isStringSelectMenu()) {
-  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'เมนูเปิด–ปิดระบบใช้ได้เฉพาะเจ้าของร้าน');
-  await interaction.deferReply({ ephemeral: true });
-  const gate = (await runtime.pool.query('SELECT * FROM feature_gates WHERE gate=$1', [interaction.values[0]])).rows[0];
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'ADMIN_GATE',
-    payload: { gate: gate.gate, expectedVersion: Number(gate.version) }, configVersion: runtime.config.version },
-  contextFor(interaction, 'admin_gate_session'), { pool: runtime.pool });
-  return interaction.editReply({ content: `**${featureGateLabel(gate.gate)}** ขณะนี้ ${gate.enabled ? 'เปิด' : 'ปิด'}`,
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(customId('gate_enable', session.id)).setLabel('เปิด').setStyle(ButtonStyle.Success).setDisabled(gate.enabled),
-      new ButtonBuilder().setCustomId(customId('gate_disable', session.id)).setLabel('ปิด').setStyle(ButtonStyle.Danger).setDisabled(!gate.enabled),
-    )] });
-}
-}
-
-async function handleGateToggle({ interaction, route, runtime, gates: _gates }) {
-if (['gate_enable','gate_disable'].includes(route.route) && interaction.isButton()) {
-  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'เมนูเปิด–ปิดระบบใช้ได้เฉพาะเจ้าของร้าน');
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_GATE' }, contextFor(interaction, 'admin_gate_load'), { pool: runtime.pool });
-  return interaction.showModal(gateReasonModal(route.sessionId, route.route === 'gate_enable'));
-}
-}
-
-async function handleGateSubmit({ interaction, route, runtime, gates: _gates }) {
-if (['gate_enable_submit','gate_disable_submit'].includes(route.route) && interaction.isModalSubmit()) {
-  if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'เมนูเปิด–ปิดระบบใช้ได้เฉพาะเจ้าของร้าน');
-  await interaction.deferReply({ ephemeral: true });
-  const context = contextFor(interaction, 'admin_gate_change');
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_GATE' }, context, { pool: runtime.pool });
-  const changed = await updateFeatureGate({ gate: session.payload.gate,
-    enabled: route.route === 'gate_enable_submit', reason: interaction.fields.getTextInputValue('reason'),
-    expectedVersion: session.payload.expectedVersion,
-    release: runtime.env.PRELAUNCH ? {
-      prelaunch: true, gitSha: runtime.env.GIT_SHA, appVersion: APP_VERSION, engineVersion: ENGINE_VERSION,
-    } : null }, context, { pool: runtime.pool });
-  await completeInteractionSession(session, interaction, runtime);
-  return interaction.editReply(`อัปเดต **${changed.gate}** เป็น ${changed.enabled ? 'เปิด' : 'ปิด'} (v${changed.version}) แล้ว`);
 }
 }
 
@@ -1805,34 +1635,32 @@ const ROUTE_HANDLERS = Object.freeze({
   "admin": handleAdminPanel,
   "admin_nav": handleAdminPanel,
   "wallet_adjust": handleWalletAdjust,
+  "wallet_user_pick": handleWalletUserPick,
+  "wallet_user_search": handleWalletUserSearch,
+  "wallet_user_search_submit": handleWalletUserSearchSubmit,
+  "wallet_adjust_from_search": handleWalletAdjustFromSearch,
   "wallet_adjust_submit": handleWalletAdjustSubmit,
   "wallet_adjust_confirm": handleWalletAdjustConfirm,
   "refund_prepare": handleRefundPrepare,
+  "refund_item_pick": handleRefundItemPick,
   "refund_prepare_submit": handleRefundPrepareSubmit,
   "refund_confirm": handleRefundConfirm,
-  "block_add": handleBlockAction,
-  "block_remove": handleBlockAction,
-  "block_add_submit": handleBlockSubmit,
-  "block_remove_submit": handleBlockSubmit,
-  "review_assign": handleReviewAssign,
-  "review_assign_submit": handleReviewAssignSubmit,
-  "review_evidence": handleReviewEvidence,
-  "review_evidence_submit": handleReviewEvidenceSubmit,
-  "review_resolve": handleReviewResolve,
-  "review_resolve_submit": handleReviewResolveSubmit,
-  "review_resolve_confirm": handleReviewResolveConfirm,
-  "catalog_sale": handleCatalogSale,
-  "catalog_sale_submit": handleCatalogSaleSubmit,
+  "payment_review_pick": handlePaymentReviewPick,
+  "topup_review_credit": handleTopupReviewDecision,
+  "topup_review_reject": handleTopupReviewDecision,
+  "topup_review_decision_submit": handleTopupReviewDecisionSubmit,
+  "adminorder_pick": handleOrderPick,
+  "orders_page": handleOrderPage,
   "adminorder_review": handleOrderReview,
   "adminorder_review_submit": handleOrderReviewSubmit,
-  "price_create": handlePriceCreate,
-  "price_create_submit": handlePriceCreateSubmit,
-  "price_manage": handlePriceManage,
-  "price_manage_submit": handlePriceManageSubmit,
-  "promo_create": handlePromotionCreate,
-  "promo_create_submit": handlePromotionCreateSubmit,
-  "promo_manage": handlePromotionManage,
-  "promo_manage_submit": handlePromotionManageSubmit,
+  "price_category_pick": handlePriceCategoryPick,
+  "price_category_submit": handlePriceCategorySubmit,
+  "price_category_confirm": handlePriceCategoryConfirm,
+  "promo_set": handlePromotionSet,
+  "promo_set_submit": handlePromotionSetSubmit,
+  "promo_set_confirm": handlePromotionSetConfirm,
+  "promo_toggle": handlePromotionToggle,
+  "promo_toggle_confirm": handlePromotionToggleConfirm,
   "receiver_activate": handleReceiverActivate,
   "receiver_activate_submit": handleReceiverActivateSubmit,
   "receiver_activate_confirm": handleReceiverActivateConfirm,
@@ -1847,31 +1675,30 @@ const ROUTE_HANDLERS = Object.freeze({
   "monitor_enable": handleMonitorState,
   "monitor_disable": handleMonitorState,
   "monitor_toggle": handleLegacyMonitorToggle,
+  "dlq_pick": handleDlqPick,
   "dlq_replay": handleDlqAction,
   "dlq_discard": handleDlqAction,
   "dlq_replay_submit": handleDlqSubmit,
   "dlq_discard_submit": handleDlqSubmit,
   "config_concurrency": handleConcurrency,
   "config_concurrency_submit": handleConcurrencySubmit,
-  "config_branding": handleConfig,
   "config_roles": handleConfig,
   "config_roles_submit": handleConfigSubmit,
-  "config_branding_submit": handleConfigSubmit,
   "breaker_prepare": handleBreakerPrepare,
   "breaker_submit": handleBreakerSubmit,
   "test_fail_send": handleTestFailureSend,
   "test_fail_retry": handleTestFailureRetry,
-  "admin_gate_pick": handleGatePick,
-  "gate_enable": handleGateToggle,
-  "gate_disable": handleGateToggle,
-  "gate_enable_submit": handleGateSubmit,
-  "gate_disable_submit": handleGateSubmit,
 });
 
 async function dispatchRoute(context) {
   const handler = ROUTE_HANDLERS[context.route.route]
     ?? (context.route.route.startsWith('admin_refresh_') ? handleAdminPanel : null);
-  if (!handler) return null;
+  if (!handler) {
+    return context.interaction.reply({
+      content: 'เมนูนี้เป็นแผงรุ่นเก่าและหมดอายุแล้ว กรุณาเปิด `/admin-panel` ใหม่',
+      ephemeral: true,
+    });
+  }
   return handler(context);
 }
 

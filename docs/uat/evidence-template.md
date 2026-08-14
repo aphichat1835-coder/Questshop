@@ -22,7 +22,8 @@ migration or configuration deployment changes it.
 
 ## Preconditions
 
-- [ ] Customer feature gates are closed; only Owner/Admin may use UAT routes.
+- [ ] `PRELAUNCH=true` restricts customer routes to Owner/Admin for this UAT round; normal capabilities are not
+      manually opened one by one.
 - [ ] Managed PostgreSQL TLS uses `verify-full`; direct/runtime Aiven URLs and roles
       roles are distinct and runtime has no DDL privilege.
 - [ ] Private log rooms deny `@everyone`; the bot has the expected permissions.
@@ -71,26 +72,14 @@ code.  Do not record a Discord user token.
 | Alert delivery | | financial and infrastructure alert reaches Owner | | |
 | Rollback rehearsal | | app rollback or forward-fix decision recorded | | |
 
-## Closeout and gate opening
+## Closeout and normal-operation confirmation
 
 - [ ] Run `CONFIRM_PRELAUNCH_CLOSEOUT=I_UNDERSTAND_COMPENSATING_TRANSACTIONS npm run prelaunch:closeout`.
 - [ ] Record the resulting `PRELAUNCH_CLOSEOUT` release-evidence ID and confirm
       that no financial/admin audit was deleted.
-- [ ] Owner approves each gate in this order, with its `PRELAUNCH_GATE`
-      evidence ID: notifications → scanner → announcement → top-up →
-      auto-credit → orders → runner → customer interactions → store open.
-
-| Gate | Evidence ID | Opened at (UTC) | Owner | Rollback condition |
-|---|---|---|---|---|
-| `NOTIFICATIONS_ENABLED` | | | | |
-| `QUEST_SCANNER_ENABLED` | | | | |
-| `QUEST_ANNOUNCEMENT_ENABLED` | | | | |
-| `TOPUP_ACCEPTING` | | | | |
-| `AUTO_CREDIT_ENABLED` | | | | |
-| `ORDER_ACCEPTING` | | | | |
-| `RUNNER_DISPATCH_ENABLED` | | | | |
-| `CUSTOMER_INTERACTIONS_ENABLED` | | | | |
-| `STORE_OPEN` | | | | |
+- [ ] Owner confirms `PRELAUNCH=false` only after the closeout is complete. Normal capabilities are already
+      configured as enabled; do not manually open each one from a panel.
+- [ ] Record any incident brake that remained closed, its health/invariant result and Owner reopening approval.
 
 ## Final decision
 

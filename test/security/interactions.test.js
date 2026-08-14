@@ -53,6 +53,7 @@ test('Discord router delegates durable session state writes to domain services',
   const source = await readFile(new URL('../../src/discord/interactions/router.js', import.meta.url), 'utf8');
   assert.doesNotMatch(source, /UPDATE\s+interaction_sessions/i);
   assert.doesNotMatch(source, /INSERT\s+INTO\s+(?:wallets|wallet_transactions|orders|order_items)/i);
+  assert.doesNotMatch(source, /(?:block_add|catalog_sale|price_create|promo_create|admin_gate_pick)/);
   assert.match(source, /completeInteractionSession/);
   assert.match(source, /bindSessionMessage/);
 });

@@ -6,7 +6,7 @@ import {
   addMonitor, checkAllMonitorHealth, checkMonitorHealth, rotateMonitorCredential, setMonitorState,
 } from '../../src/domain/admin/monitor-service.js';
 import { setCircuitBreakerState } from '../../src/domain/admin/operations-service.js';
-import { createPromotion, setPriceRule, setPriceRuleEnabled, setPromotionState } from '../../src/domain/admin/config-service.js';
+import { replaceManualPromotion, setManualPromotionEnabled, setQuestCategoryPrice } from '../../src/domain/admin/config-service.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -125,38 +125,34 @@ test('circuit breaker recovery uses optimistic state version and audit', async (
     WHERE target_id='TRUEMONEY_DIRECT' AND action='CIRCUIT_BREAKER_CHANGE'`)).rows[0].count), 2);
 });
 
-test('price rules can be scheduled then independently enabled or disabled with audit evidence', async (t) => {
+test('admin changes only the GAME or VIDEO category, with immutable rule snapshots', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
-  const rule = await setPriceRule({ ruleType: 'DEFAULT', amountCents: 500,
-    startsAt: new Date('2030-01-01T00:00:00Z'), endsAt: new Date('2030-02-01T00:00:00Z'),
-    reason: 'scheduled baseline' }, context, { pool });
-  assert.equal(rule.enabled, true);
-  const disabled = await setPriceRuleEnabled({ priceRuleId: rule.id, enabled: false, expectedVersion: rule.state_version,
-    reason: 'temporary suspension' }, context, { pool });
-  assert.equal(disabled.enabled, false);
-  await assert.rejects(() => setPriceRuleEnabled({ priceRuleId: rule.id, enabled: true,
-    expectedVersion: rule.state_version, reason: 'stale admin tab' }, context, { pool }), /STALE_CONFIG/);
-  const enabled = await setPriceRuleEnabled({ priceRuleId: rule.id, enabled: true, expectedVersion: disabled.state_version,
-    reason: 'resume scheduled price' }, context, { pool });
-  assert.equal(enabled.enabled, true);
-  const audit = (await pool.query(`SELECT action FROM admin_audit_logs WHERE target_id=$1 ORDER BY created_at`, [rule.id])).rows;
-  assert.deepEqual(audit.map((entry) => entry.action), ['PRICE_RULE_CREATE', 'PRICE_RULE_DISABLE', 'PRICE_RULE_ENABLE']);
+  const before = (await pool.query(`SELECT task_type,state_version FROM price_rules WHERE enabled=true
+    AND rule_type='TYPE' AND task_type IN ('WATCH_VIDEO','WATCH_VIDEO_ON_MOBILE')`)).rows;
+  const changed = await setQuestCategoryPrice({ category: 'VIDEO', amountCents: 625n,
+    expectedVersions: Object.fromEntries(before.map((row) => [row.task_type, String(row.state_version)])) }, context, { pool });
+  assert.equal(changed.rules.length, 2);
+  assert.equal(BigInt(changed.amountCents), 625n);
+  assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM price_rules WHERE enabled=true
+    AND rule_type='TYPE' AND task_type IN ('WATCH_VIDEO','WATCH_VIDEO_ON_MOBILE')`)).rows[0].count), 2);
+  const audit = (await pool.query(`SELECT action FROM admin_audit_logs WHERE target_type='QUEST_PRICE_CATEGORY'`)).rows;
+  assert.deepEqual(audit.map((entry) => entry.action), ['QUEST_CATEGORY_PRICE_CHANGED']);
 });
 
-test('promotion lifecycle keeps one active campaign and preserves an audit for displaced campaign', async (t) => {
+test('promotion has no public name or calendar: edits make a new manual version', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
-  const period = { startsAt: new Date('2020-01-01T00:00:00Z'), endsAt: new Date('2030-01-01T00:00:00Z') };
-  const first = await createPromotion({ name: 'first', ...period,
-    tiers: [{ minimumAmountCents: 10_000, basisPoints: 1_000 }], activate: true, reason: 'initial offer' }, context, { pool });
-  const second = await createPromotion({ name: 'second', ...period,
-    tiers: [{ minimumAmountCents: 10_000, basisPoints: 1_500 }], activate: false, reason: 'next offer' }, context, { pool });
-  const activated = await setPromotionState({ promotionId: second.id, state: 'ACTIVE', expectedVersion: second.state_version,
-    reason: 'replace offer' }, context, { pool });
-  assert.equal(activated.state, 'ACTIVE');
-  const states = (await pool.query('SELECT id,state FROM promotions WHERE id = ANY($1::uuid[]) ORDER BY name', [[first.id, second.id]])).rows;
-  assert.deepEqual(states.map((row) => row.state), ['DISABLED', 'ACTIVE']);
-  const actions = (await pool.query(`SELECT action FROM admin_audit_logs WHERE target_type='PROMOTION'
-    AND target_id = ANY($1::text[]) ORDER BY created_at`, [[first.id, second.id]])).rows.map((row) => row.action);
-  assert.ok(actions.includes('PROMOTION_DISABLE'));
-  assert.ok(actions.includes('PROMOTION_ACTIVE'));
+  const first = await replaceManualPromotion({ tiers: [{ minimumAmountCents: 10_000n, basisPoints: 1_000 }],
+    maxUsesPerUser: 2, maxBonusPerDayCents: 5_000n }, context, { pool });
+  assert.equal(first.promotion.state, 'ACTIVE');
+  assert.equal(first.promotion.manual_controlled, true);
+  assert.equal(first.promotion.starts_at, null);
+  assert.equal(first.promotion.ends_at, null);
+  const disabled = await setManualPromotionEnabled({ enabled: false,
+    expectedVersion: first.promotion.state_version }, context, { pool });
+  const second = await replaceManualPromotion({ tiers: [{ minimumAmountCents: 30_000n, basisPoints: 1_500 }],
+    maxUsesPerUser: null, maxBonusPerDayCents: null }, context, { pool });
+  assert.equal(disabled.state, 'DISABLED');
+  assert.ok(Number(second.promotion.version) > Number(first.promotion.version));
+  const active = (await pool.query("SELECT count(*)::integer AS count FROM promotions WHERE state='ACTIVE'" )).rows[0];
+  assert.equal(active.count, 1);
 });

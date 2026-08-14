@@ -7,10 +7,23 @@
 ## Release status
 
 `package.json` ระบุเวอร์ชันพัฒนา `0.1.0` แต่ repository ยังไม่มีหลักฐาน Production release/tag ที่ผ่าน
-Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT ครบ จึงรวมรายการปัจจุบันไว้ใต้
+Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ครบ จึงรวมรายการปัจจุบันไว้ใต้
 `[Unreleased]` และไม่แต่งวันที่ Release
 
 ## [Unreleased]
+
+### Current operational baseline
+
+- Deployment บน inwcloud ใช้ Node 22.x และคำสั่ง
+  `npm ci --omit=dev && npm run deploy && npm start` โดย `deploy` ทำ
+  `setup:verify → migrate → register` ก่อน runtime เริ่ม
+- `DATABASE_DIRECT_URL` เป็น Migrator URL ที่ต้องใช้ตอน deploy; `DATABASE_POOL_URL` เป็น Runtime URL
+  ที่บอทใช้หลัง start. ทั้งคู่ต้องเป็น role คนละตัวและใช้ `sslmode=verify-full`
+- Aiven เป็น owner ของ backup/recovery ในค่าเริ่มต้น `BACKUP_MODE=AIVEN_MANAGED`; Questshop ไม่กล่าวอ้างว่า
+  ทำ local backup หรือ restore drill ในโหมดนี้
+- `LOG_PAYMENTS` อาจ render full voucher link ตาม Owner policy โดยไม่มี runtime human-visibility/privacy guard.
+  Owner ต้องควบคุมสมาชิกห้อง Discord เอง
+- Source/automation ยังเป็น `implemented-but-unverified` จนกว่า live evidence จะผ่านบน SHA เดียวกัน
 
 ### Added
 
@@ -24,7 +37,7 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
   Admin/health surfaces disclose the provider boundary.
 
 - Forward-only migration guard สำหรับ active Monitor test batch ที่ยังไม่มี contract hash, คำสั่งตรวจความพร้อม
-  retire Data/Voucher/Backup Key version และ regression coverage สำหรับ Quest start window/Payment Log privacy
+  retire Data/Voucher/Backup Key version และ regression coverage สำหรับ Quest start window/Payment Log delivery
 
 - Owner-only `keys:adopt`, `db:verify-roles`, `setup:preflight` และ secret-bundle export สำหรับตรวจ
   keyring/role/Discord Administrator โดยไม่พิมพ์ Secret ออกมา
@@ -56,6 +69,26 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 - Automated unit, PostgreSQL integration, concurrency, crash, security, contract, recovery และ load tests
 
 ### Changed
+
+- Simplified the Admin panel to nine operational categories. Normal store functions now start enabled automatically;
+  the retired global gate, manual Quest sale, manual blocklist, backup, branding and key-status panels no longer
+  appear. Incident recovery remains scoped to the affected subsystem.
+- Replaced raw/scheduled price rules with two durable customer-facing categories: GAME and VIDEO, each seeded at
+  500 satang (5.00 THB). Editing a category atomically retires its old snapshots and creates new TYPE snapshots.
+- Replaced named/scheduled promotions in the Admin UX with a persistent manual bonus version: tiers, per-user version
+  limit and per-user daily bonus cap. Receipts keep bonus amounts without showing an internal campaign name.
+- Replaced manual user block/unblock with an automatic Bangkok-day top-up lock that never affects existing Quest work.
+
+- Reworked the root operational documentation (`README.md`, `AGENTS.md`, `SECURITY.md`) around the current
+  inwcloud + Aiven deployment path, exact Environment Variable responsibilities, Runtime/Migrator separation,
+  direct CA handling, health endpoints, accepted Payment Log exposure and evidence boundaries.
+- Added a dedicated [inwcloud + Aiven deployment guide](docs/deployment/inwcloud-aiven.md) with required variables,
+  role bootstrap boundary, direct TLS CA configuration, health checks, expected logs, troubleshooting and rollback
+  limits.
+
+- Payment Log delivery regression coverage now uses the same UUID-shaped Top-up identity as the durable schema.
+  The central logger calls static Pino methods while retaining redaction for bindings, structured fields and message
+  text; its security test now checks literal secret absence without constructing a dynamic regular expression.
 
 - Owner-only surface installation and `LOG_PAYMENTS` delivery no longer inspect human channel visibility. The Owner
   is responsible for keeping backoffice channels private, including a channel that receives full voucher links.
@@ -138,8 +171,6 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
   เริ่มต้นเป็น 2 และ CI สร้าง LCOV artifact
 
 - Startup ตรวจ Discord Administrator ครั้งเดียวก่อนรับงาน; ห้องหลังบ้านไม่ทำ per-surface bot permission drift check
-- Payment Log ตรวจความเป็นส่วนตัวของมนุษย์ทุกครั้งก่อนถอดรหัสหรือส่งลิงก์ซองเต็ม; หากไม่ปลอดภัยจะปิด
-  Surface, เปิด Incident, แจ้ง Owner และเก็บ Financial DLQ ไว้ Replay หลังซ่อมสิทธิ์
 - Keyring ใช้ cryptographic sentinel ใน PostgreSQL เพื่อตรวจจับ key material คนละชุดแม้ version เท่ากัน
 - Keyring sentinel ตรวจชุด key versions แบบ exact และสร้างทั้งชุดใน Transaction เดียว; Database เก่าที่มี
   ข้อมูลต้องผ่าน Owner adoption ที่ตั้งใจชัดเจนก่อน Runtime จะยอมเริ่ม
@@ -149,7 +180,7 @@ Discord, TrueMoney, Managed PostgreSQL, Restore drill และ Owner UAT คร
 
 - คำสั่ง Runtime/Migration/Register/Backup โหลด `.env` ให้อัตโนมัติ และ Docker รองรับการ Mount
   `.env` โดยไม่ Copy Secret เข้า Image
-- `.env.example` เหลือเฉพาะค่าภายนอกที่ระบบสร้างเองไม่ได้; Backup เริ่มต้นปิดจนกว่าจะตั้งค่า S3/Restore
+- `.env.example` เหลือเฉพาะค่าภายนอกที่ระบบสร้างเองไม่ได้; Backup ค่าเริ่มต้นใช้ Aiven-managed mode
 - Monitor-discovered Quest ต้องมี Monitor อย่างน้อยหนึ่งบัญชีทดสอบผ่านก่อนประกาศ/เปิดขายทั่วไป
   เว้นแต่ Admin ใช้ audited **ส่งเลย** override
 - Customer-discovered Quest บันทึกตัวตนผู้ใช้และ Quest account ในหลังบ้านโดยไม่บันทึก Token ดิบ;

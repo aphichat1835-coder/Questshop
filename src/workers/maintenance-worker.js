@@ -253,14 +253,14 @@ async function recoverCrashedPayments(database, context) {
   }
 }
 
-async function maintainMonitorsAndBlocks(database, context) {
+async function maintainMonitorsAndDailyTopupLocks(database, context) {
   await database.query(`UPDATE monitor_accounts SET state='ACTIVE',state_version=state_version+1,cooldown_until=NULL,
       updated_at=clock_timestamp() WHERE state='COOLDOWN' AND cooldown_until<=clock_timestamp()`);
-  const expiredBlocks = await database.query(`UPDATE blocklist_entries SET revoked_at=clock_timestamp(),
-      revoked_by='SYSTEM' WHERE revoked_at IS NULL AND expires_at<=clock_timestamp() RETURNING *`);
-  for (const block of expiredBlocks.rows) await appendAdminAudit(database, { action: 'BLOCK_EXPIRED',
-      targetType: 'DISCORD_USER', targetId: block.discord_user_id, actorId: 'SYSTEM', before: block,
-      after: { revokedAt: block.revoked_at, blockType: block.block_type }, reason: 'configured expiry reached', context });
+  const expiredLocks = await database.query(`DELETE FROM topup_daily_locks
+    WHERE expires_at<=clock_timestamp() RETURNING *`);
+  for (const lock of expiredLocks.rows) await appendAdminAudit(database, { action: 'TOPUP_DAILY_LOCK_EXPIRED',
+      targetType: 'DISCORD_USER', targetId: lock.discord_user_id, actorId: 'SYSTEM', before: lock,
+      after: { expiredAt: lock.expires_at }, reason: 'daily top-up cycle ended', context });
 }
 
 async function queueMaintenanceNotifications(database, context) {
@@ -289,7 +289,7 @@ async function runTransactionalMaintenance(pool, context) {
     await reconcilePassedMonitorTestBatches(database, context);
     await reconcileFailedMonitorTestBatches(database, context);
     await recoverCrashedPayments(database, context);
-    await maintainMonitorsAndBlocks(database, context);
+    await maintainMonitorsAndDailyTopupLocks(database, context);
     await queueMaintenanceNotifications(database, context);
   });
 }

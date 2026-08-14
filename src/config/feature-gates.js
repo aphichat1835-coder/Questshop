@@ -13,11 +13,13 @@ export const FEATURE_GATES = Object.freeze([
 ]);
 
 export const DEFAULT_FEATURE_GATES = Object.freeze(
-  Object.fromEntries(FEATURE_GATES.map((gate) => [gate, false])),
+  // A new Questshop installation is usable as soon as its Owner installs the
+  // relevant Discord surfaces. Gates remain an internal circuit breaker for
+  // incidents; they are not a storefront configuration task.
+  Object.fromEntries(FEATURE_GATES.map((gate) => [gate, true])),
 );
 
 export function assertFeatureGate(gate) {
   if (!FEATURE_GATES.includes(gate)) throw new Error(`Unknown feature gate: ${gate}`);
   return gate;
 }
-

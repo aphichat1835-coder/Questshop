@@ -62,7 +62,9 @@ export async function acquireDelivery({ holder, ttlSeconds = 30 }, options = {})
       WITH candidate AS (
         SELECT o.id,o.state AS previous_state FROM outbox_events o
         JOIN message_projections p ON p.id=o.projection_id
-        WHERE (p.surface_key IS DISTINCT FROM 'QUEST_NEW' OR EXISTS(
+        WHERE (p.surface_key LIKE 'DM:%' OR EXISTS(
+          SELECT 1 FROM surfaces s WHERE s.surface_key=p.surface_key AND s.state='ACTIVE'
+        )) AND (p.surface_key IS DISTINCT FROM 'QUEST_NEW' OR EXISTS(
           SELECT 1 FROM feature_gates g WHERE g.gate='QUEST_ANNOUNCEMENT_ENABLED' AND g.enabled=true
         )) AND ((
           o.state IN ('PENDING', 'RETRY_WAIT') AND o.available_at <= clock_timestamp()

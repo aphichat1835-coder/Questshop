@@ -1,164 +1,182 @@
 # Security Policy
 
-Questshop จัดการข้อมูลที่มีความเสี่ยงสูง ได้แก่ Discord bot/user tokens, TrueMoney vouchers, Wallet credit,
-Receiver phone, PostgreSQL credentials และ encryption/HMAC keys โปรดอ่านนโยบายนี้ก่อน Deploy, Review หรือ
-รายงานช่องโหว่
+Questshop handles Discord credentials, Quest account tokens, TrueMoney voucher information, Wallet credit,
+PostgreSQL credentials, receiver information and encryption/HMAC key material. Treat this repository as a
+financially and credential-sensitive system even while it remains pre-launch.
+
+> [!IMPORTANT]
+> Source/test evidence is not a live-security certificate. The supported development line is
+> `[Unreleased]` / `0.1.x`, and its current completion label is **implemented-but-unverified** until the live
+> checklist passes on one exact Git SHA.
 
 ## Supported versions
 
 | Version | Security support |
 |---|---|
-| `[Unreleased]` / development `0.1.x` | Supported while actively maintained |
-| Older snapshots or forks | Not supported unless the Owner explicitly says otherwise |
-
-ยังไม่มี Production release ที่รับรองแล้ว การที่ source และ automated tests ผ่านไม่ใช่หลักฐานว่า Live environment
-ปลอดภัยหรือพร้อมใช้งาน
+| `[Unreleased]` / development `0.1.x` | Maintained while the Owner actively maintains this repository |
+| Older snapshot, fork or unpinned deployment | No support guarantee |
 
 ## Reporting a vulnerability
 
-อย่าเปิด Public issue, Discussion, Pull Request comment หรือ Discord public channel ที่มีรายละเอียด Exploit หรือ
-ข้อมูลลับ
+Do not open a public Issue, Discussion, Pull Request comment or Discord public-channel post containing exploit
+details or sensitive values.
 
-ช่องทางที่แนะนำ:
+1. Use [GitHub Private Vulnerability Reporting / Security Advisory](https://github.com/aphichat1835-coder/Questshop/security/advisories/new)
+   if it is available for this repository.
+2. Otherwise contact the Repository Owner privately first, without sending a real secret until a secure channel is
+   confirmed.
 
-1. ใช้ [GitHub Private Vulnerability Reporting / Security Advisory](https://github.com/aphichat1835-coder/Questshop/security/advisories/new)
-   ของ repository นี้ หากเปิดใช้งานอยู่
-2. หากใช้ไม่ได้ ให้ติดต่อ Repository Owner แบบส่วนตัวก่อนส่งรายละเอียด ห้ามส่ง Token หรือ Secret จริงจนกว่า
-   จะยืนยันช่องทางที่เหมาะสม
+Use redacted/fake data. A useful report contains:
 
-รายงานควรมีข้อมูลต่อไปนี้โดยใช้ค่าจำลองหรือข้อมูลที่ปิดบังแล้ว:
+- affected commit SHA/branch and environment type;
+- smallest safe reproduction and expected versus actual result;
+- affected route, worker, migration, adapter or state transition;
+- non-secret Order/Top-up/Job IDs, support code or correlation ID;
+- whether an external mutation may have occurred;
+- containment suggestion, if known.
 
-- ประเภทช่องโหว่และผลกระทบ
-- Commit SHA/branch/version ที่ตรวจพบ
-- Preconditions และขั้นตอนทำซ้ำที่สั้นที่สุด
-- Expected/actual behavior
-- Component ที่เกี่ยวข้อง เช่น Discord route, Domain service, Worker, Migration หรือ Provider phase
-- Correlation/support code, Order/Top-up/Job ID ที่ไม่ใช่ Secret
-- หลักฐานว่าเกิด Side effect หรือไม่ โดยไม่แนบ Token, Cookie, Voucher URL เต็ม หรือ Database URL
-- แนวทางแก้หรือ Containment หากมี
+Do not redeem a real voucher, alter another person's Wallet, use somebody else's token, flood Discord/TrueMoney,
+destroy data or access a live environment without Owner authorization. Use fake adapters and disposable databases
+where possible. This repository has no bug bounty and grants no permission to test Discord or TrueMoney systems.
 
-อย่าทดสอบด้วยการ Redeem ซองจริง, ทำให้เครดิตผู้อื่นเปลี่ยน, ใช้ Token ของผู้อื่น, ทำลายข้อมูล, Flood Discord/
-Provider หรือเข้าถึง Production โดยไม่ได้รับอนุญาต ใช้ Fake adapter และ disposable database เมื่อทำได้
+## Data that must not be disclosed
 
-Repository นี้ยังไม่มี Bug bounty และไม่มีการอนุญาตให้ทดสอบระบบภายนอกของ Discord หรือ TrueMoney
+Never put these into Git, a test fixture, screenshot, log, ticket, PR, issue, Discord message or a copied terminal
+output:
 
-## Sensitive data that must never be disclosed
+- Discord Bot token or Discord user token;
+- cookie, session, OAuth, interaction or webhook token;
+- `DATABASE_POOL_URL`, `DATABASE_DIRECT_URL`, database password or TLS private material;
+- `STATUS_TOKEN`, Data encryption keyring, Voucher HMAC keyring or any other raw key JSON;
+- S3 access/secret keys, decrypted dumps or decrypted receiver value;
+- raw TrueMoney provider request/response that contains PII or credentials.
 
-- Discord bot token หรือ user token
-- Cookie, session, interaction/webhook token หรือ OAuth secret
-- Full TrueMoney voucher URL/code นอก `log-payments` ที่ผ่านการตรวจห้องลับ
-- Database URL, password, TLS private material หรือ dump ที่ถอดรหัสแล้ว
-- AES/HMAC/backup key หรือ raw keyring JSON
-- S3 access/secret key
-- Receiver phone แบบเต็มจาก decrypted storage
-- Raw provider request/response ที่อาจมี PII หรือ Secret
+If a secret leaks, revoke/rotate it at the provider first. Then preserve only safe metadata needed for an incident.
+Deleting a file from the latest commit does not remove a leaked value from Git history, logs, artifacts, shell history
+or provider backups.
 
-หาก Secret รั่ว ให้ Revoke/rotate ที่ Provider ก่อน แล้วจึง Preserve เฉพาะ metadata ที่จำเป็นสำหรับ Incident
-อย่า Commit การลบ Secret อย่างเดียวแล้วถือว่าแก้เสร็จ เพราะ Git history, logs, artifacts และ backups อาจยังมีค่าเดิม
+### Owner-accepted Payment Log exposure
 
-## Priority areas
+The Owner deliberately chose to remove runtime human-visibility/privacy checks for backoffice surfaces. The
+`LOG_PAYMENTS` projection can render a **full voucher link**, and the bot does not inspect channel viewers before
+doing so. This is an accepted product risk, not a security control.
 
-โปรดรายงานเป็นพิเศษหากพบ:
+The exception is narrow: a full voucher link belongs only in the Payment Log projection. It must not appear in the
+application logger, a customer-facing response, a generic Admin panel or another projection. The Owner is solely
+responsible for Discord channel membership, access history and any exposure caused by configuring that channel
+incorrectly.
 
-- Token/Secret ปรากฏใน Log, Error, Discord UI, test fixture, artifact หรือ Git history
-- Customer/Admin authorization bypass, forged/stale custom ID หรือ session actor/guild/channel mismatch
-- Wallet ติดลบ, duplicate credit, double Capture/Release, Ledger mismatch หรือแก้ Ledger/Audit เดิมได้
-- Voucher replay, HMAC bypass, Receiver snapshot mismatch หรือ Promotion ถูกใช้เกิน Limit
-- TrueMoney post-send timeout ถูก Blind retry หรือ Schema drift แล้วยัง Credit
-- Account active-job uniqueness bypass หรือ Queue fairness/resource-exhaustion ที่กระทบผู้อื่น
-- Lease/fencing bypass ที่ทำให้ Worker เก่า Commit หลังเสียสิทธิ์
-- Outbox duplicate delivery, Financial DLQ discard หรือข้อความลับส่งไป Surface ผิดห้อง
-- SQL injection, migration checksum bypass, Runtime role ได้ DDL/แก้ Ledger หรือ TLS verification ถูกปิดใน Production
-- AES-GCM nonce/AAD/key-version misuse, key rotation data loss หรือ backup decrypt/restore integrity bypass
-- `/statusz` authorization bypass หรือ Health endpoint เผย Secret/operational data โดยไม่ได้รับอนุญาต
-- Markdown/mention/URL injection ที่ทำให้ Ping, phishing หรือเปิด URL นอก allowlist
+## Security invariants enforced by the source
 
-## Security invariants
+### Money and payment
 
-### Money
+- All money is integer satang; floating point is forbidden.
+- Financial transactions use PostgreSQL `SERIALIZABLE`, row locks, bounded whole-transaction retries and idempotency.
+- Wallet balances cannot become negative. Reserved balance changes only through Reserve/Capture/Release paths.
+- Wallet Ledger and Admin audit are append-only. Corrections use compensating transactions with reason and audit.
+- `REDEEMED` and `CREDITED` are distinct; recovery must credit a redeemed Top-up exactly once.
+- Ambiguous payment is Owner-only Manual Review. A request that may have been sent is never blindly retried.
+- Invalid provider schema, receiver, currency or amount fails closed without credit.
+- Financial/Audit DLQ may be replayed but cannot be discarded.
 
-- จำนวนเงินเป็น integer satang เท่านั้น ห้าม Floating point
-- Financial transaction ใช้ `SERIALIZABLE`, row locks, bounded whole-transaction retry และ idempotency
-- Wallet balance ห้ามติดลบ; Reserved เปลี่ยนผ่าน Reserve/Capture/Release เท่านั้น
-- Ledger/Admin audit เป็น Append-only การแก้ไขใช้ Compensating transaction
-- `REDEEMED` ไม่เท่ากับ `CREDITED`; Recovery ต้อง Credit exactly once
-- Ambiguous payment เป็น Owner-only decision และห้าม Blind retry
-- Financial/Audit DLQ ห้าม Discard
+### Credentials and cryptography
 
-### Credentials
+- Customer token lifecycle is receive → validate → encrypt → session/order use → delete after terminal work.
+- Monitor credentials remain encrypted and have no Admin plaintext-read route.
+- AES-256-GCM uses random 12-byte nonces, versioned keyrings and context-specific AAD.
+- Voucher identity uses a versioned HMAC plus database uniqueness constraints.
+- `npm run setup` can create `STATUS_TOKEN`, Data encryption and Voucher HMAC keyrings once; re-running it must not
+  silently replace a durable value.
+- Central redaction covers structured logger fields, strings and serialized errors. Do not bypass it by logging raw
+  provider payloads or concatenating secrets into a message.
 
-- Customer token เป็น Session/Order scoped และลบเมื่อหมดหน้าที่
-- Monitor token เข้ารหัสและ Admin เปิดดูไม่ได้
-- Encryption ใช้ AES-256-GCM, random 12-byte nonce, versioned key และ context-specific AAD
-- Voucher identity ใช้ versioned HMAC และ unique constraint
-- `npm run setup` สร้าง Status token และ Data/Voucher/Backup keys แยกกันครั้งเดียวลง `.env` mode
-  `0600`; การรันซ้ำต้องรักษาค่าเดิม
-- ห้ามสุ่ม Key ใหม่ทุก Startup หรือเก็บ `.env` ไว้เฉพาะ Filesystem ชั่วคราวของ Container
-- ก่อน Redeploy ต้อง Mount `.env` จาก Durable secret storage หรือย้ายค่าเข้า Environment/Secret manager
+### PostgreSQL and deployment roles
 
-### Discord
+- Production database URLs require `sslmode=verify-full`; `pg` receives explicit CA data with
+  `rejectUnauthorized: true` when `DATABASE_SSL_CA_BASE64` is configured.
+- `questshop_migrator` and `questshop_runtime` are separate roles. The Runtime role has no schema DDL capability.
+- Runtime must not have effective `UPDATE`/`DELETE` permission on `wallet_transactions`, `admin_audit_logs` or
+  `release_evidence`, including through `PUBLIC` or inherited membership.
+- Deployment migration synchronizes object privileges and fails closed if the effective role contract is violated.
+- Runtime validates the contract read-only; it does not repair roles, membership or schema privileges.
 
-- Ephemeral ไม่ใช่ Authorization; ทุก Side effect ต้อง Reauthorize actor/context/state
-- Custom ID เป็น versioned opaque identifier และทุก callback โหลด Server-side session ใหม่
-- Allowed mentions เป็น deny-by-default
-- Setup ต้องตรวจ Bot access และ Private log visibility ก่อนติดตั้ง
-- Runtime Permission Drift auto-repair ไม่มีในระบบตาม Owner policy; Discord 403 ต้อง Preserve incident แล้ว Owner แก้เอง
+### Discord, workers and external mutations
 
-### Workers and external mutations
+- Ephemeral Discord responses are not authorization. Side effects reauthorize actor, Guild/channel/message context and
+  durable state.
+- Component IDs are opaque/versioned and bind to server-side sessions.
+- Allowed mentions default to deny.
+- External calls never run inside a database transaction. Each mutation has durable intent/checkpoint and fresh
+  verification after send.
+- Worker commits require lease owner, fencing token and state version. Lost ownership stops the stale worker.
+- Runtime permission-drift monitoring/auto-repair is intentionally absent. Discord 403 produces an incident for
+  manual Owner repair; the bot must not change Discord permissions itself.
 
-- External call ห้ามอยู่ใน Database transaction
-- Intent/checkpoint ต้อง Commit ก่อน External mutation และต้อง Verify state หลังส่ง
-- ทุก Commit ของ Worker ที่ถือ Lease ต้องตรวจ owner + fencing token + state version
-- Retry/429/deadline มี Budget; ห้าม Unbounded loop
-- Restart recovery ต้อง Preserve partial truth และไม่เดาผลสำเร็จ
+## Required secure deployment practice
 
-## Deployment minimums
+Before deployment, follow [README.md](README.md#รันบน-inwcloud--aiven) and keep these boundaries intact:
 
-ก่อนเปิด Production gates ต้องมีอย่างน้อย:
+- inwcloud runs Node 22.x and its Environment Variables/secret store holds all secrets; never bake `.env` into an
+  image or repository.
+- `DATABASE_POOL_URL` is the Runtime URL; `DATABASE_DIRECT_URL` is the separate Migrator URL needed by
+  `npm run deploy`.
+- Set `GIT_SHA` to the full 40-character commit actually being deployed.
+- Use `BACKUP_MODE=AIVEN_MANAGED` unless an intentional, fully provisioned Local S3 backup/restore design exists.
+- Use `npm ci --omit=dev && npm run deploy && npm start` for the current inwcloud deployment path.
+- A successful `Questshop ready` confirms only that this runtime started; normal store functions are enabled by
+  installation, but it does not prove live payment/Quest behavior or complete Owner UAT.
 
-- Node.js และ dependency versions ตรง `package-lock.json`
-- Managed PostgreSQL 16+, TLS `verify-full`, CA จริง และแยก runtime/migrator/backup/restore roles
-- Runtime role ไม่มี DDL และไม่มี `UPDATE/DELETE` บน Ledger/Admin audit
-- Secret manager, versioned keyrings และ `GIT_SHA` ที่เป็น revision จริง
-- Private `log-payments`, `log-quest-operations`, `log-admin`, `log-system` พร้อมตรวจ `@everyone`
-- Automated verification, high-severity dependency audit และ Docker build บน SHA เดียวกัน
-- TrueMoney/Quest live UAT แบบควบคุม, encrypted backup และ verified restore drill
-- Owner closeout และเปิด Feature gates ทีละขั้นตาม [Pre-launch UAT](docs/uat/prelaunch.md)
+## Priority areas for review
 
-ห้ามลด Validation, ปิด TLS verification, เปิด Auto-credit เมื่อ Provider contract ไม่แน่นอน หรือแก้ Database ตรง
-เพื่อให้การทดสอบผ่าน
+Report immediately if you find:
+
+- a token, secret, database URL, full voucher link outside the accepted Payment Log path, or decrypted receiver value
+  in output/history;
+- forged/stale interaction/session authorization, customer/Admin privilege bypass or unsafe command routing;
+- negative Wallet balance, duplicate credit, double Capture/Release, Ledger mismatch or editable audit evidence;
+- voucher replay, HMAC bypass, Receiver/Promotion snapshot mismatch or post-send blind retry;
+- active-account uniqueness, queue fairness, lease/fencing or restart-recovery bypass;
+- SQL injection, migration checksum bypass, Runtime DDL/effective privilege escalation or disabled TLS verification;
+- unbounded provider/Discord retry, message duplication, financial DLQ discard or unsafe URL/mention rendering;
+- `/statusz` authorization bypass or secret/operational leakage.
 
 ## Known and accepted risks
 
-- Discord user token/Self-bot behavior อาจขัดข้อกำหนด Discord และทำให้บัญชีถูกจำกัด
-- Direct TrueMoney endpoint ไม่มี Contract รับประกัน และ v1 ไม่มี Automated reconciliation
-- ไม่มี Token consent record และไม่ตรวจว่าผู้ซื้อเป็นเจ้าของ Quest account ตาม Owner policy
-- คนละผู้ซื้ออาจใช้ Quest account เดียวกันได้เมื่อมี Token แต่ Active job ซ้อนกันไม่ได้
-- Customer-discovered Quest อาจถูกวิเคราะห์/ประกาศตาม Policy โดยไม่รอ Monitor test สำหรับบัญชีนั้น
-- Discord messages, profile data และ full voucher link ในห้อง Payment log ถูกเก็บตามนโยบาย Owner
-- ไม่มี Staging แยก; Pre-launch ใช้ Production bot/guild/database โดยปิด Customer gates
-- Runtime ไม่ซ่อม Discord permission drift อัตโนมัติ
+- Discord user token/Self-bot behavior can violate Discord terms and affect the account.
+- Direct TrueMoney integration has no guaranteed provider contract and v1 has no automated reconciliation.
+- The system does not verify the buyer owns a submitted Quest account and records no consent record by Owner policy.
+- A Quest account can be presented by another buyer after prior work is terminal, but never has overlapping active jobs.
+- Customer-discovered Quest can be considered for that authenticated account even when no Monitor has tested it.
+- There is no separate staging environment; pre-launch uses the production Guild/database with `PRELAUNCH=true`,
+  which limits customer interactions to Owner/Admin without requiring normal capabilities to be manually opened.
+- Aiven-managed backup/recovery is an external provider boundary; Questshop does not claim a local restore drill in that
+  mode.
+- Owner-selected `LOG_PAYMENTS` configuration can expose full voucher links because automated viewer checks were
+  removed.
 
-ความเสี่ยงที่ยอมรับไม่ได้ยกเลิกหน้าที่ในการรายงาน Token leak, unauthorized access, money invariant failure หรือ
-การเปิดเผยข้อมูลเกินขอบเขตที่กำหนด
+Acceptance of these risks never permits token theft, unauthorized access, payment manipulation or accidental public
+secret disclosure.
 
 ## Incident response
 
-ทุก Incident ใช้ลำดับ:
+Follow this sequence for every incident:
 
 ```text
 Detect → Contain → Preserve evidence → Recover → Verify → Reopen → Post-incident review
 ```
 
-Immediate financial containment ได้แก่ปิด Gate ที่เกี่ยวข้อง, หยุด Auto-credit/Order intake เมื่อจำเป็น และรักษา
-Ledger/attempt/fencing evidence ห้าม Auto-release หรือแก้ยอดเพื่อซ่อน mismatch
+- The system closes only the relevant internal gate/surface during an incident; preserve Ledger, attempts, leases,
+  fencing and provider evidence. Owner recovery must use the incident-specific flow rather than a global gate panel.
+- Do not auto-release or edit money records to hide a mismatch.
+- Record incident ID, Git SHA, correlation IDs, timeline, actor, evidence hashes, decision and reopening approval—never
+  raw secrets.
+- Use [Emergency runbooks](docs/runbooks/README.md) for incident-specific authority and recovery rules.
 
-ดูขั้นตอนรายเหตุการณ์ที่ [docs/runbooks/README.md](docs/runbooks/README.md) และบันทึก Incident ID, Trace IDs,
-Git SHA, Timeline, Actor, Evidence hashes, Recovery และ Owner approval โดยไม่บันทึก Secret
+## Disclosure and fix policy
 
-## Disclosure and fixes
-
-- ให้เวลาผู้ดูแลตรวจสอบและออก Fix ก่อนเปิดเผยรายละเอียดสาธารณะ
-- Fix ด้านเงิน/Token/External mutation ต้องมี Regression test, impact review และ recovery/rollback plan
-- Security fix ยังไม่ถือว่าเสร็จจนตรวจ Secret rotation, logs/artifacts/history, database state และ live boundary ที่เกี่ยวข้อง
-- Release note ต้องอธิบายผลกระทบและการตั้งค่า/Migration ที่จำเป็นโดยไม่เปิดเผย Exploit ที่ยังใช้โจมตีได้
+- Give maintainers time to contain and fix an issue before public disclosure.
+- Money, Token, external-mutation, migration or authorization fixes need regression coverage and a recovery/rollback
+  review.
+- A fix is not complete just because tests pass: check affected logs/artifacts/history, database state and the relevant
+  live boundary.
+- Release notes must describe required configuration/migration actions without publishing a usable exploit.

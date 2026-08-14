@@ -2,12 +2,15 @@ import { ActionRowBuilder, ButtonBuilder, ButtonStyle, StringSelectMenuBuilder }
 import { customId } from '../components/custom-id.js';
 
 export const ADMIN_CATEGORIES = Object.freeze([
-  ['overview', 'ภาพรวมร้าน'], ['gates', 'เปิด–ปิดระบบ'], ['catalog', 'จัดการ Quest'],
-  ['pricing', 'ตั้งราคา'], ['promotions', 'โปรโมชั่น'], ['orders', 'งานลูกค้าและคิว'],
-  ['payments', 'รายการเติมเงินที่ต้องตรวจ'], ['wallet', 'ปรับยอดและคืนเครดิต'],
-  ['blocklist', 'ระงับการใช้งาน'], ['monitors', 'บัญชีตรวจสอบ Quest'], ['receivers', 'เบอร์รับเงิน TrueMoney'],
-  ['surfaces', 'ห้องและแผงข้อความ'], ['dlq', 'งานค้างและเหตุขัดข้อง'], ['backup', 'สำรองและกู้ข้อมูล'],
-  ['branding', 'ตั้งค่าหน้าร้าน'], ['secrets', 'สถานะกุญแจระบบ'],
+  ['overview', 'ภาพรวมร้าน'],
+  ['pricing', 'ราคาทำ Quest'],
+  ['promotions', 'โบนัสเติมเงิน'],
+  ['orders', 'งานลูกค้าและคิว'],
+  ['payments', 'เติมเงินที่ต้องตรวจ'],
+  ['wallet', 'ปรับเครดิตและคืนเงิน'],
+  ['monitors', 'บัญชีตรวจสอบ Quest'],
+  ['receivers', 'เบอร์รับเงิน TrueMoney'],
+  ['dlq', 'ปัญหาที่ต้องจัดการ'],
 ]);
 
 export function adminCategoryOptions(selected = null) {

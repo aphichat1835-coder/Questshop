@@ -7,8 +7,8 @@ import { adjustBalance } from '../../src/domain/wallet/service.js';
 import {
   buildQuote, confirmOrder, createSession, getSelectionPage, selectAll,
 } from '../../src/domain/checkout/service.js';
-import { resolveSaleEligibility } from '../../src/domain/catalog/service.js';
-import { openOrderItemReview, setQuestSaleState } from '../../src/domain/admin/operations-service.js';
+import { openOrderItemReview } from '../../src/domain/admin/operations-service.js';
+import { setQuestCategoryPrice } from '../../src/domain/admin/config-service.js';
 import { resolveSubjectReview } from '../../src/domain/reviews/service.js';
 import { questContractHash } from '../../src/quest-engine/schema/contract.js';
 
@@ -20,9 +20,7 @@ const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 test('large checkout reserves all items but materializes one account job', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
-  const trace = uuidv7(); const rule = uuidv7(); const user = 'checkout-user';
-  await pool.query(`INSERT INTO price_rules(id,rule_type,amount_cents,config_version,actor_id,trace_id)
-    VALUES($1,'DEFAULT',500,1,'owner',$2)`, [rule, trace]);
+  const trace = uuidv7(); const user = 'checkout-user';
   const quests = Array.from({ length: 5 }, (_, index) => ({ id: `checkout-${index}`, name: `Quest ${index}`,
     eventName: 'WATCH_VIDEO', secondsNeeded: 60, progressSecs: 0, progress: 0, completed: false,
     completedAt: null, enrolled: true, enrolledAt: new Date().toISOString(), autoSupported: true,
@@ -129,21 +127,6 @@ test('large checkout reserves all items but materializes one account job', async
   const afterCapture = (await pool.query('SELECT * FROM wallets WHERE discord_user_id=$1', [user])).rows[0];
   assert.equal(BigInt(afterCapture.available_cents), 3_000n);
   assert.equal(BigInt(afterCapture.reserved_cents), 1_500n);
-  const questId = order.items[0].quest_id;
-  const paused = await setQuestSaleState({ questId, nextState: 'PAUSED', reason: 'temporary operator pause' },
-    createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
-      guildId: '10000000000000002', idempotencyKey: 'quest-pause' }), { pool });
-  assert.equal(paused.sale_state, 'PAUSED');
-  const pausedAdmission = await resolveSaleEligibility({ questId, allowCustomerAccount: true },
-    context('paused-customer-admission'), { pool });
-  assert.equal(pausedAdmission.eligible, false);
-  assert.equal(pausedAdmission.reason, 'QUEST_NOT_FOR_SALE');
-  await pool.query(`UPDATE quests SET public_test_gate_override=true,
-    public_test_gate_override_contract_hash=current_contract_hash WHERE quest_id=$1`, [questId]);
-  const reopened = await setQuestSaleState({ questId, nextState: 'OPEN', reason: 'validation passed',
-    runnerConcurrency: 3 }, createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
-    guildId: '10000000000000002', idempotencyKey: 'quest-open' }), { pool });
-  assert.equal(reopened.sale_state, 'OPEN');
   const priceChangeUser = 'checkout-user-price-change';
   const priceContext = (keyName) => createContext({ traceId: trace, actorType: 'CUSTOMER', actorId: priceChangeUser,
     guildId: '10000000000000002', idempotencyKey: keyName });
@@ -154,8 +137,12 @@ test('large checkout reserves all items but materializes one account job', async
   priceContext('session-price'), options);
   await selectAll({ sessionId: priceSession.session.id, actorId: priceChangeUser,
     guildId: '10000000000000002' }, priceContext('all-price'), options);
-  await pool.query(`INSERT INTO price_rules(id,rule_type,quest_id,amount_cents,priority,config_version,
-    actor_id,trace_id) VALUES($1,'TEMPORARY','checkout-0',900,100,1,'owner',$2)`, [uuidv7(), trace]);
+  const videoRules = (await pool.query(`SELECT task_type,state_version FROM price_rules WHERE enabled=true
+    AND rule_type='TYPE' AND task_type IN ('WATCH_VIDEO','WATCH_VIDEO_ON_MOBILE')`)).rows;
+  await setQuestCategoryPrice({ category: 'VIDEO', amountCents: 900n,
+    expectedVersions: Object.fromEntries(videoRules.map((row) => [row.task_type, String(row.state_version)])) },
+  createContext({ traceId: trace, actorType: 'ADMIN', actorId: 'admin-user',
+    guildId: '10000000000000002', idempotencyKey: 'price-change' }), { pool });
   await assert.rejects(() => buildQuote({ sessionId: priceSession.session.id, actorId: priceChangeUser,
     guildId: '10000000000000002' }, priceContext('quote-price'), options),
   (error) => error.code === 'QUOTE_EXPIRED');

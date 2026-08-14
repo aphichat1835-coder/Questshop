@@ -107,15 +107,16 @@ Backup-stale/restore-drill alerts and the local backup worker are disabled only 
 can contain ciphertext from an earlier snapshot that Questshop cannot inspect, Data/Voucher key retirement remains
 blocked; retain old key versions rather than pretending they are safe to remove.
 
-Implementation: `src/config/env.js`, deployment migrations, worker manager/alerts, Admin backup panel,
-`scripts/verify-key-retirement.js`, and Aiven-policy regression tests. Live Aiven Console verification remains
-required and is not replaced by source tests.
+Implementation: `src/config/env.js`, deployment migrations, worker manager/alerts,
+`scripts/verify-key-retirement.js`, and Aiven-policy regression tests. Backup has no Admin-panel category; the
+provider remains the operational owner. Live Aiven Console verification remains required and is not replaced by
+source tests.
 
 | Plan section | Source/test evidence | Status and remaining boundary |
 |---|---|---|
 | 1. Scope and runtime | `package.json`, `src/config/env.js`, `src/bootstrap/*`, `Dockerfile` | Source-confirmed. Actual inwcloud memory/deploy evidence remains. |
 | 2. `quest-auto`, `quest-new`, history and setup commands | `src/discord/{commands,interactions,renderers,surfaces}`, `test/security/interactions.test.js`, `test/integration/outbox-dlq.test.js` | Source-confirmed. Real Guild/mobile interaction and persistent-component UAT remain. |
-| 3. Admin, blocklist and four log surfaces | `src/domain/admin`, `src/domain/blocklist`, `src/discord/renderers/projections.js` | Source-confirmed. Owner/Admin role and private-channel UAT remain. |
+| 3. Admin, daily top-up protection and four log surfaces | `src/domain/admin`, `topup_daily_locks`, `src/discord/renderers/projections.js` | Source-confirmed. Manual user block/unblock controls are retired; the automatic daily top-up lock remains. Owner/Admin role and Guild UI UAT remain. |
 | 4. Fixed state machines | domain `states.js`, `migrations/0001_initial.sql`, `test/unit/states.test.js` | Source-confirmed. Production trace sampling remains. |
 | 5. Error classes, retry and backoff budgets | payment, runner, outbox services/workers and their crash/fault tests | Source-confirmed for simulated errors. Provider and Discord error behaviour remains live evidence. |
 | 6. Fair queue, lease, lock and fencing | `src/domain/runner/service.js`, `src/db/leases.js`, concurrency/crash tests | Source-confirmed. Runtime contention at production load remains. |
@@ -130,11 +131,11 @@ required and is not replaced by source tests.
 | 15. Surface setup permissions | `src/bootstrap/startup.js`, `src/discord/surfaces/setup.js`, outbox worker and surface policy tests | Startup requires Bot Administrator once. Surface setup and payment-log delivery do not inspect human channel visibility; Runtime Permission Drift detector/repair remains removed. Owner accepts responsibility for private-channel configuration. |
 | 16. Engine/config versioning | versions, config service, runner pinning and compatibility test | Source-confirmed. N/N-1 deployment drain remains. |
 | 17. Retention and secrets | keyring, retention/key workers, migrations and coverage tests | Source-confirmed. Confirmed checkout sessions (including their selected Quest data) are pruned after seven days; checkout credentials are deleted at confirmation and cascade on session deletion. Expiry and cleanup use `FOR UPDATE SKIP LOCKED` bounded to 500 sessions per batch. Live key rotation plus restore test remains. |
-| 18. Backup and restore | encrypted S3 adapter, backup/restore scripts and fake-S3 contract tests | Source-confirmed. The configured database CA is materialized mode `0600` only while `pg_dump`/`pg_restore` run, then removed; an S3 failure terminates an in-flight dump. Real S3 upload and temporary managed-DB restore drill remain. |
+| 18. Backup and restore | Aiven-managed backup policy, optional compatibility adapter and deployment docs | Source-confirmed for `AIVEN_MANAGED`: Questshop does not run local database backup/restore operations and exposes no backup panel. Aiven Console recovery evidence remains an Owner/live boundary. |
 | 19. Deployment, rollback and pre-launch | Docker, CI workflow, pre-launch scripts/docs, an Owner/Admin-only router guard and append-only SHA-bound release evidence | Source-confirmed. Same-SHA deploy, rollback and Owner closeout remain. |
 | 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. CI creates a disposable `questshop_loadtest` database and enforces the 200-user/100-order capacity gate. External alert delivery and monthly SLO evidence remain. |
 | 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
-| 22. Development sequence and feature gates | feature-gate config, Admin controls and pre-launch document | Source-confirmed. Owner must enable gates in the required live order. |
+| 22. Development sequence and feature gates | feature-gate config, incident workers and pre-launch document | Source-confirmed. Normal capabilities start enabled; gates are internal scoped incident brakes, not an Admin open/close checklist. |
 | 23. Definition of Done and acceptance | definition-of-done, traceability and automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
 
 ## Technical Blueprint plan

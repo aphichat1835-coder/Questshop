@@ -63,10 +63,9 @@ async function renderRefund(pool, projection, { client }) {
 }
 
 async function renderTopupReceipt(pool, projection) {
-  const topup = (await pool.query(`SELECT t.*,w.available_cents,p.name AS promotion_name,
+  const topup = (await pool.query(`SELECT t.*,w.available_cents,
     ledger.available_before_cents,ledger.available_after_cents
     FROM topups t JOIN wallets w ON w.discord_user_id=t.discord_user_id
-    LEFT JOIN promotions p ON p.id=t.promotion_id
     LEFT JOIN LATERAL (SELECT x.available_before_cents,x.available_after_cents
       FROM wallet_transactions x WHERE x.reference_type='TOPUP' AND x.reference_id=t.id::text
         AND x.transaction_type='TOPUP_CREDIT' ORDER BY x.created_at DESC LIMIT 1) ledger ON true
@@ -77,7 +76,6 @@ async function renderTopupReceipt(pool, projection) {
     `**Top-up ID:** \`${topup.id}\``, `**Provider transaction:** \`${escape(topup.provider_transaction_id)}\``,
     `**ยอดก่อนเติม:** ${baht(topup.available_before_cents)}`,
     `**เงินจากซอง:** ${baht(topup.amount_cents)}`, `**โบนัส:** ${baht(topup.bonus_cents)}`,
-    topup.promotion_name ? `**โปรโมชั่น:** ${escape(topup.promotion_name)}` : null,
     `**ได้รับทั้งหมด:** ${baht(total)}`,
     `**ยอดคงเหลือใหม่:** ${baht(topup.available_after_cents ?? topup.available_cents)}`,
   ].filter(Boolean).join('\n');
@@ -168,12 +166,9 @@ async function renderPaymentLog(pool, projection, { env, client }) {
 
 async function renderQuestNew(pool, projection) {
   const quest = (await pool.query(`SELECT q.*,resolved.amount_cents AS price_cents FROM quests q
-    LEFT JOIN LATERAL (SELECT p.amount_cents FROM price_rules p WHERE p.enabled=true
-      AND (p.starts_at IS NULL OR p.starts_at<=clock_timestamp()) AND (p.ends_at IS NULL OR p.ends_at>clock_timestamp())
-      AND ((p.rule_type='TEMPORARY' AND (p.quest_id IS NULL OR p.quest_id=q.quest_id) AND (p.task_type IS NULL OR p.task_type=q.task_type))
-        OR (p.rule_type='QUEST' AND p.quest_id=q.quest_id) OR (p.rule_type='TYPE' AND p.task_type=q.task_type) OR p.rule_type='DEFAULT')
-      ORDER BY CASE p.rule_type WHEN 'TEMPORARY' THEN 1 WHEN 'QUEST' THEN 2 WHEN 'TYPE' THEN 3 ELSE 4 END,
-        p.priority DESC,p.created_at DESC LIMIT 1) resolved ON true WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
+    LEFT JOIN LATERAL (SELECT p.amount_cents FROM price_rules p
+      WHERE p.enabled=true AND p.rule_type='TYPE' AND p.task_type=q.task_type
+      ORDER BY p.created_at DESC LIMIT 1) resolved ON true WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
   if (!quest) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบข้อมูล Quest ใหม่')], allowedMentions: noMentions };
   const price = quest.price_cents == null ? 'ยังไม่กำหนด' : baht(quest.price_cents);
   const questUrl = safeHttpsUrl(quest.url);

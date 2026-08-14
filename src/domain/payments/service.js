@@ -44,23 +44,19 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
   const hashes = allVoucherHmacs(normalized.code, env.VOUCHER_HMAC_KEYS_JSON);
   try {
     return await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const blocked = (await client.query(`
-      SELECT 1 FROM blocklist_entries
-      WHERE discord_user_id = $1 AND block_type = 'TOPUP_BLOCKED' AND revoked_at IS NULL
-        AND starts_at <= clock_timestamp() AND (expires_at IS NULL OR expires_at > clock_timestamp())
-    `, [discordUserId])).rowCount > 0;
-    if (blocked) throw new QuestshopError('TOPUP_BLOCKED', 'บัญชีนี้ถูกระงับการเติมเงิน');
+    const locked = (await client.query(`SELECT 1 FROM topup_daily_locks
+      WHERE discord_user_id=$1 AND expires_at>clock_timestamp()`, [discordUserId])).rowCount > 0;
+    if (locked) throw new QuestshopError('TOPUP_DAILY_LIMIT', 'เติมเงินครบเพดานของวันนี้แล้ว กรุณาลองใหม่หลังเที่ยงคืน');
     const existing = await findVoucher(client, hashes);
     if (existing) return { topup: existing, idempotent: true };
     const receiver = (await client.query(`
       SELECT * FROM receiver_versions WHERE state = 'ACTIVE' FOR SHARE
     `)).rows[0];
     if (!receiver) throw new QuestshopError('RECEIVER_UNAVAILABLE', 'ยังไม่ได้ตั้งค่าบัญชีรับซอง');
-    const promotion = (await client.query(`
-      SELECT * FROM promotions
-      WHERE state = 'ACTIVE' AND starts_at <= clock_timestamp() AND ends_at > clock_timestamp()
-      ORDER BY version DESC LIMIT 1
-    `)).rows[0] ?? null;
+    const promotion = (await client.query(`SELECT * FROM promotions
+      WHERE state='ACTIVE' AND (
+        manual_controlled=true OR (starts_at<=clock_timestamp() AND ends_at>clock_timestamp())
+      ) ORDER BY version DESC LIMIT 1`)).rows[0] ?? null;
     const topupId = uuidv7();
     const encrypted = encryptSecret(
       JSON.stringify({ code: normalized.code, url: normalized.url }),

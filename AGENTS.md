@@ -1,195 +1,173 @@
 # AGENTS.md — Questshop engineering contract
 
-This file applies to the repository root and every descendant path unless a more specific `AGENTS.md`
-exists below it. User instructions override this file when they explicitly change product policy, but an
-agent must call out any conflict with financial integrity, credential safety, destructive scope, or live
-production authority before acting.
+This contract applies from the repository root to every descendant unless a nearer `AGENTS.md` replaces part of it.
+Current explicit Owner instructions take precedence, but an agent must call out a conflict with money integrity,
+credential safety, destructive scope or live-production authority before acting.
 
-## Mission and evidence
+## 1. Mission, evidence and authority
 
-Questshop is a single-guild Discord storefront for automated Quest progress. Preserve these distinctions:
+Questshop is a one-Guild Discord storefront for automated Discord Quest progress. It uses Node.js 22,
+`discord.js`, `pg` and PostgreSQL 16+ as the durable source of truth.
 
-- Source implementation, local tests, GitHub checks, deployment health, and live Discord/provider UAT are
-  separate evidence boundaries.
-- The valid pre-production completion label is `implemented-but-unverified` until every live boundary in
-  `docs/uat/prelaunch.md` passes on one exact Git SHA.
-- Never claim `production-ready`, live Discord success, TrueMoney success, restore success, or deployment
-  success without direct evidence from that environment.
+Keep these evidence boundaries separate:
 
-Authoritative project references:
+1. source implementation and local tests;
+2. GitHub/static-analysis checks;
+3. deployment health on the exact Git SHA;
+4. Discord, TrueMoney, Quest Engine and Owner UAT in the live environment.
 
-1. Current explicit Owner instructions.
-2. `docs/architecture/completion-audit.md` for later policy decisions.
-3. `docs/architecture/traceability.md` and `docs/architecture/definition-of-done.md`.
-4. `docs/state-machines/contracts.md` and domain `states.js` files.
-5. `README.md`, `SECURITY.md`, and runbooks for operational guidance.
+Until every applicable item in [docs/uat/prelaunch.md](docs/uat/prelaunch.md) passes on one exact SHA, the strongest
+allowed completion label is **implemented-but-unverified**. Never claim production-ready, a live provider success,
+restore success, deployment success or command-registration success without direct evidence from that environment.
 
-## Protected product decisions
+Do not deploy, alter inwcloud/Aiven/Discord live settings, register live commands, enable gates, mutate real payment
+or Quest data, open/merge a PR, push, force-push, delete a branch or rewrite published history unless the Owner
+explicitly requests that exact action.
 
-Do not change these without an explicit Owner decision:
+Primary references, in order:
 
-- One production Discord Guild; all-in-one runtime; PostgreSQL 16+ is the durable source of truth.
-- Node.js `>=22.22.0 <23`, JavaScript ESM, `discord.js`, `pg`, and no ORM/Redis in v1.
-- Refunds are Wallet credit only, never cash, transfer, or withdrawal; Wallet credit does not expire.
-- Available and Reserved balances are separate. Confirm reserves per item; verified success captures;
-  definite failure releases; ambiguity remains reserved for review.
-- No customer cancellation or dispute button in v1. Admin/Owner opens Manual Review.
-- No Automatic Claim. Do not add a Claim API, claim mutation, claim retry, or background reward collection.
-  Completed work ends at `READY_TO_CLAIM` with a URL button for manual claim.
-- Customer tokens are not ownership-bound by policy, but one Quest Account ID may have only one active job
-  globally. Do not silently add ownership checks or consent records.
-- Customer tokens are order/session scoped and deleted after terminal use. Monitor tokens are never reused as
-  customer credentials, and customer tokens never become Monitor credentials automatically.
-- Monitor accounts always have both Scan and Test behavior. Do not add capability selection or a required
-  artificial reason to add a Monitor.
-- A Monitor-discovered Quest stays private until one Monitor test passes or an audited Admin **ส่งเลย**
-  override. Try up to three times per Monitor and stop the batch on the first verified pass.
-- A customer-discovered Quest may be cataloged/announced after analysis and admitted for that authenticated
-  Quest account under checkout policy. Backoffice evidence may include the Discord customer and Quest account
-  identity, but never the raw token. Public `quest-new` must not identify the customer.
-- `quest-new` does not show Quest ID, test state, or internal sale state.
-- Quest select option copy stays compact: type, Orbs, progress, and price. Expiry belongs in the quote/review
-  page, not the select option.
-- Final order DM uses one **รับรางวัลทั้งหมด** link to the first successful Quest and keeps
-  **ดูประวัติ Quest ทั้งหมด** linked to the history channel.
-- Branding media is an image/GIF URL in v1; do not build a video subsystem without a new requirement.
-- Runtime Permission Drift detection/repair was intentionally removed. Keep one-time setup permission checks;
-  record Discord 403 incidents and require manual Owner repair.
-- Full voucher links are allowed only in the validated private `LOG_PAYMENTS` surface by Owner policy.
-- Legacy reference directories are local-only and excluded from the root import/test graph.
+1. current explicit Owner instructions;
+2. [docs/architecture/completion-audit.md](docs/architecture/completion-audit.md);
+3. [docs/architecture/traceability.md](docs/architecture/traceability.md) and
+   [docs/architecture/definition-of-done.md](docs/architecture/definition-of-done.md);
+4. [docs/state-machines/contracts.md](docs/state-machines/contracts.md) and each domain `states.js`;
+5. [README.md](README.md), [SECURITY.md](SECURITY.md) and runbooks.
 
-## Architecture boundaries
+## 2. Product decisions that require an Owner decision to change
 
-- Discord handlers validate input, acknowledge exactly once, reauthorize, and call domain services. They must
-  not update Wallet, Ledger, payment, order, runner, catalog sale, review, or outbox business state directly.
-- Domain services own transactions, transitions, idempotency, audit, and outbox writes.
-- Every aggregate transition uses the domain transition map, `state_version`, compare-and-swap, correlation
-  context, and an audit/transition record where required.
-- Financial operations use integer satang (`BIGINT`/`BigInt`), never floating point. Use shared money parsers
-  and formatters.
-- Financial transactions use `SERIALIZABLE` with bounded whole-transaction retry. Queue/outbox acquisition
-  uses `READ COMMITTED`, row locks, and `FOR UPDATE SKIP LOCKED` where established.
-- Do not hold a PostgreSQL transaction across Discord, TrueMoney, Quest API, S3, or another external call.
-- External mutations require a durable intent/checkpoint before send and verification afterward. Never blind
-  retry a mutation that may already have been sent.
-- Worker commits require lease owner, fencing token, and state version. A stale worker must stop after a
-  zero-row update or lease-loss signal.
-- Use PostgreSQL time for money, lease, expiry, deadline, and retention decisions. Node monotonic time is for
-  latency measurement only.
-- Write Discord messages through projection/outbox for durable background delivery. Preserve latest-state-wins
-  coalescing, bounded retry, and DLQ rules.
-- Persistent components route through versioned opaque custom IDs and server-side actor/guild/channel/message/
-  operation/expiry checks. Do not use custom ID contents as authorization.
+- One production Discord Guild, all-in-one runtime, PostgreSQL 16+ durable state; no ORM, Redis, web dashboard,
+  multi-Guild or customer cancellation/dispute flow in v1.
+- Node.js `>=22.22.0 <23`, JavaScript ESM, `discord.js` and `pg` remain the runtime contract.
+- Money uses integer satang only. Wallet credit never expires and cannot be withdrawn or transferred.
+- Confirm reserves each Item; verified success captures; definite failure releases; ambiguity stays reserved for
+  Manual Review. Refunds are Wallet credit only.
+- Ledger and Admin audit are append-only. Corrections use compensating transactions, never an update/delete of
+  historical entries.
+- No Automatic Claim. Do not add claim API/mutation/retry/background collection. Completed work ends at
+  `READY_TO_CLAIM` with a URL button.
+- Customer Token ownership is intentionally not checked, but one Quest Account ID has no more than one active job
+  globally. Customer credentials are session/order scoped and never become Monitor credentials.
+- Monitor accounts always Scan and Test. A Monitor-discovered Quest remains private until one Monitor test passes or
+  an audited Admin **ส่งเลย** override; try a Monitor at most three times and stop on first verified pass.
+- A customer-discovered Quest can be analyzed and admitted for that authenticated Quest account under Checkout policy.
+  Backoffice evidence can identify the Discord customer and Quest account, never the raw Token. Public `quest-new`
+  must not identify the customer.
+- `quest-new` shows no Quest ID, test state or internal sale state. Quest select copy remains type, Orbs, progress and
+  price; expiry belongs on quote/review.
+- Final Order DM uses one **รับรางวัลทั้งหมด** link to the first successful Quest and one **ดูประวัติ Quest ทั้งหมด**
+  link to the history channel.
+- Branding media is an image/GIF URL in v1. Do not invent a video subsystem.
+- Runtime permission-drift detection and automatic repair are deliberately absent. Discord 403 creates/preserves an
+  incident for manual Owner repair; it must not silently alter channel permissions.
+- The Owner intentionally removed human-visibility/privacy preflight checks from backoffice setup and Payment Log
+  delivery. `LOG_PAYMENTS` can contain a full voucher link; no runtime guard verifies who can see that channel.
+  Do not reintroduce such a guard without a new Owner decision. This is a known Owner-accepted exposure risk.
+- Legacy reference folders are local-only and excluded from the root import/test graph.
 
-## Database and migrations
+## 3. Architecture and state ownership
 
-- Never edit an already-applied migration. Add the next zero-padded migration under `migrations/`.
-- Keep migration checksums stable and schema enum/check constraints synchronized with JavaScript state maps.
-- Use Expand → Migrate → Contract across releases for breaking schema changes. Do not add automatic down
-  migrations.
-- Runtime role has no DDL and must not receive `UPDATE`/`DELETE` on `wallet_transactions` or
-  `admin_audit_logs`. Retention goes through the bounded security-definer functions.
-- Preserve separate runtime, migration, backup, and restore roles and TLS `verify-full` in production.
-- Do not destroy or recreate a non-disposable database. `scripts/load-test.js` is allowed only when the database
-  name contains `questshop_loadtest`.
+- Discord handlers validate untrusted input, acknowledge exactly once, reauthorize at each side effect and call a
+  domain service. They must not write Wallet, Ledger, Payment, Order, Runner, Catalog, Review or Outbox state directly.
+- Domain services own transactions, state transitions, idempotency, audit and outbox writes.
+- Every aggregate transition uses its transition map, `state_version`, compare-and-swap, correlation context and
+  required transition/audit evidence. Never overwrite a stale state.
+- Financial operations use PostgreSQL `SERIALIZABLE` transactions with bounded whole-transaction retry. Queue/outbox
+  acquisition uses `READ COMMITTED`, row locks and `FOR UPDATE SKIP LOCKED` where established.
+- Never hold a database transaction over Discord, TrueMoney, Quest API, S3 or other external I/O.
+- External mutations require durable intent/checkpoint before send and fresh verification afterward. A potentially
+  sent mutation is never blindly retried.
+- Worker commits require lease owner, fencing token and state version. A zero-row update or lost lease stops the old
+  worker; a Runtime lease loss must mark not-ready, stop ingress/dequeue, clean up and terminate.
+- PostgreSQL time governs money, lease, expiry, deadlines and retention. Node monotonic time measures latency only.
+- Background Discord messages are projections delivered through Outbox/DLQ. Preserve coalescing, bounded retries and
+  delivery evidence.
+- Persistent components use opaque versioned IDs plus server-side actor/guild/channel/message/operation/expiry checks.
+  A custom ID is routing data, never authorization.
 
-## Money and payment invariants
+## 4. Database, roles and migrations
 
-- Ledger and Admin audit are append-only. Repairs are compensating transactions with reason, actor,
-  correlation ID, preview, fresh authorization, and confirmation.
+- Never edit an applied migration; add the next zero-padded file in `migrations/`.
+- Preserve migration checksums and synchronize enum/check constraints with JavaScript state maps.
+- Breaking schema changes use Expand → Migrate → Contract. Do not add automatic down migrations.
+- Production URLs must use TLS `sslmode=verify-full`. Keep Runtime and Migrator credentials separate.
+- `DATABASE_DIRECT_URL` is for `questshop_migrator` during `npm run deploy`; `DATABASE_POOL_URL` is for
+  `questshop_runtime` while `npm start` runs. They must not be the same role.
+- Aiven/Admin owns role creation, membership, `CONNECT` and schema grants. Questshop migration syncs only objects owned
+  by the effective migrator; it must not create roles, change membership or assume schema grant option.
+- Runtime has no DDL. It must never receive `UPDATE`/`DELETE` on `wallet_transactions`, `admin_audit_logs` or
+  `release_evidence`; retention uses the allowed security-definer functions.
+- Object privilege synchronization runs after every migration loop, including `applied: 0`; a failed effective-grant
+  validation is fail-closed and must not be papered over by changing role membership from application code.
+- Never destroy/recreate a non-disposable database. `scripts/load-test.js` accepts only a database name containing
+  `questshop_loadtest`.
+
+## 5. Money, payment and credential invariants
+
 - Reserved balance changes only through Reserve/Capture/Release domain paths.
-- Voucher identity is protected by versioned HMAC plus a unique constraint. Receiver and Promotion are
-  snapshotted when the top-up is created.
-- `REDEEMED` and `CREDITED` are different states. A crash between them must credit exactly once on recovery.
-- After a TrueMoney request may have been sent, use verification or Owner-only `AMBIGUOUS/MANUAL_REVIEW`;
-  never blind retry.
-- Provider/schema/receiver/amount/currency uncertainty must fail closed without credit.
-- Over-limit vouchers credit the full amount actually received, create a warning, and block additional top-ups
-  until the Bangkok day boundary. Never confiscate or silently hold the excess.
-- Financial/Audit DLQ is replayable but never discardable.
+- Voucher identity uses versioned HMAC and unique constraints. Receiver and Promotion are snapshotted at Top-up
+  creation.
+- `REDEEMED` and `CREDITED` differ. Recovery across their boundary must credit exactly once.
+- Provider/schema/receiver/amount/currency uncertainty fails closed without credit. After a request may have been
+  sent, verify or use Owner-only `AMBIGUOUS/MANUAL_REVIEW`.
+- Over-limit vouchers credit the full amount actually received, record a warning and block more top-ups for that
+  Bangkok day. Never confiscate excess funds.
+- Financial/Audit DLQ can be replayed but never discarded.
+- Never print, log, return, fixture, commit or paste a Bot/User token, cookie, session, voucher code/link, database
+  URL, password, S3 credential, raw keyring or decrypted receiver value.
+- The payment-log projection is the narrow product exception: it can render a full voucher link to `LOG_PAYMENTS`.
+  Owner policy deliberately provides no automated human-visibility check; do not broaden the exception into generic
+  logger/UI output.
+- First-run setup may generate `STATUS_TOKEN`, Data encryption and Voucher HMAC keyrings once. Startup must never
+  silently regenerate/replace them. Use AES-256-GCM with random nonce, versioned keyring and context-specific AAD.
+- Admin has no credential decrypt/read route. Redact structured logs and string messages via the central logger.
 
-## Credential and privacy rules
+## 6. Discord UX and operations
 
-- Never print, log, return, fixture, screenshot, commit, or paste a Discord bot/user token, cookie, session,
-  voucher code/link, database URL, S3 secret, encryption/HMAC key, or decrypted receiver value.
-- First-run setup may generate `STATUS_TOKEN` and independent Data/Voucher/Backup keyrings exactly once.
-  Re-running setup must preserve existing values. Never silently regenerate, derive from a Discord/DB secret,
-  or replace a keyring during startup.
-- The generated `.env` is an owner-only `0600` secret file. Stateless/container deployments must mount it
-  from durable secret storage or transfer its values to a secret manager before redeploying.
-- Exception: a full voucher link may be rendered only by the payment-log projection to the validated private
-  `LOG_PAYMENTS` surface. Do not broaden this exception.
-- Use versioned AES-256-GCM keyrings with random nonces and context-specific AAD for stored secrets.
-- Admin has no credential read/decrypt route. Secret status UI shows versions/health only.
-- Treat custom IDs, modal input, Markdown, URLs, media, provider output, and raw metadata as untrusted.
-- Keep `allowedMentions` deny-by-default and explicitly allow only intended users/roles.
-- Redact structured logs through the central redaction/logger path; do not log raw provider responses.
+- Customer-specific Token, Wallet, selection, quote, top-up and error responses are Ephemeral.
+- Use Thai customer copy, truthful progress and actionable recovery; do not expose raw domain enum values to customers.
+- Store exact progress but edit History only when state, 25% bucket or Claim URL changes.
+- One Quest announcement/history/job summary owns one message and edits it rather than spamming new messages.
+- Respect Discord constraints: custom ID ≤100, button label ≤80, one select per Action Row, ≤5 buttons/row and ≤5 rows.
+- Allow mentions deny-by-default. Treat component/modal/URL/Markdown/provider/raw metadata input as untrusted.
+- Normal Feature gates default open at first install; they are internal incident brakes, not an Admin storefront
+  checklist. Financial incidents close only related gates and preserve evidence. Owner recovery is contextual to the
+  incident and never a global open/close menu.
+- Setup is Owner-only. Re-running setup commands updates/moves the durable surface anchor; it must not create active
+  duplicate panels.
+- Bot Administrator is validated at startup/preflight. Backoffice channel privacy is Owner-managed by the accepted
+  product policy; do not present an automated privacy check as protection.
 
-## Discord UX contract
+## 7. Development and documentation workflow
 
-- Customer-specific Token, Wallet, selection, quote, top-up, and errors stay Ephemeral.
-- Use one dominant primary action per decision surface, truthful Thai copy, semantic colors, and actionable
-  recovery. Do not expose raw enum values to customers.
-- Store exact progress but edit history only when state, 25% bucket, or claim URL changes.
-- One Quest announcement/history/job summary uses one message and edits it rather than spamming updates.
-- Respect Discord limits: custom ID ≤100, button label ≤80, one select per Action Row, ≤5 buttons per Action
-  Row, and ≤5 Action Rows. Test long Thai names and mobile scanning.
-- Defer/acknowledge before work that can exceed the interaction deadline. Each path has one response owner.
-- Disable or replace terminal controls. Re-load and authorize every side effect at the action boundary.
-- Keep backoffice diagnostics detailed, but public/customer surfaces use localized labels and safe explanations.
+Before editing, read relevant source/tests/docs and `git status`. Preserve unrelated dirty work, including the local
+ZIP and legacy reference directories. Use `apply_patch` for manual edits; do not stage `.env`, dumps, backups, ZIPs,
+credentials or user-owned files.
 
-## Feature gates and operations
-
-All feature gates default closed. Immediate financial invariants close only affected gates and preserve
-evidence. Do not enable production gates, alter live Discord permissions, publish commands, deploy, or perform
-real provider mutations without explicit authority.
-
-Startup order, graceful shutdown, health endpoints, backup, restore, retention, alerting, and runbooks are part
-of correctness. A Runtime lease loss must mark not-ready, stop ingress/dequeue, clean up, and terminate; it is
-not a recoverable warning.
-
-## Development workflow
-
-Before editing:
-
-1. Read the nearest code, relevant tests, current branch/status, and applicable docs.
-2. Preserve unrelated dirty/untracked user work. The local ZIP and legacy reference directories are not task
-   inputs unless explicitly requested.
-3. Define observable acceptance and the live boundary. Ask only when a missing choice materially changes money,
-   security, destructive scope, external side effects, or architecture.
-
-During implementation:
-
-- Follow existing ESM, repository layout, SQL style, domain interfaces, correlation context, and error classes.
-- Keep `.env.example` limited to external first-run inputs. Runtime defaults and generated secrets belong to
-  the idempotent setup flow; external S3/database credentials must never be fabricated.
-- Prefer a small coherent change over a parallel framework or speculative abstraction.
-- Use `apply_patch` for manual file edits. Do not rewrite unrelated files or format the whole repository.
-- Add fails-before/passes-after regression coverage for defects and risk-scaled tests for features.
-- Preserve safe startup/shutdown, idempotency, retry budgets, replay evidence, and rollback compatibility.
-
-Required verification for ordinary source changes:
+For source changes, run at minimum:
 
 ```bash
 npm run check
 npm run lint
-TEST_DATABASE_URL=<disposable-postgresql-16-url> npm test
+TEST_DATABASE_URL=<disposable-postgresql-16-url> QUESTSHOP_ALLOW_TEST_DATABASE_RESET=true npm test
 git diff --check
 ```
 
-Use focused tests first, then the full suite for cross-domain, Discord, money, worker, migration, security, or
-recovery changes. For release evidence also run `npm audit --audit-level=high`, the disposable load test,
-Docker build, and the live UAT checklist on the exact SHA.
+For money, migration, worker, Discord, security or recovery changes, add focused regression coverage and run the
+full risk-appropriate suite. Release evidence additionally needs `npm run test:coverage`, `npm run load:test`,
+`npm audit --audit-level=high`, Docker build and the live UAT checklist on one exact SHA.
 
-## Git, release, and protected paths
+When behavior, configuration, security or operations change, update `[Unreleased]` in `CHANGELOG.md` and keep
+`README.md`, `SECURITY.md`, `.env.example`, runbooks and traceability aligned. Documentation must distinguish:
 
-- Do not commit, push, open/update a PR, resolve review threads, merge, deploy, register live commands, or enable
-  gates unless the user explicitly requests that action.
-- Never force-push, rewrite published history, discard user changes, delete branches, or use destructive Git
-  commands without explicit scope and approval.
-- Stage only intended files. Never add `.env`, dumps, backups, ZIP archives, credentials, or local legacy
-  reference projects.
-- Do not claim a check passed from an older SHA or from another environment. Record exact SHA for release/UAT.
-- Update `CHANGELOG.md` under `[Unreleased]` for user-visible, security, migration, configuration, or operational
-  changes. Do not invent a release date or tag.
-- Keep README, `.env.example`, runbooks, traceability, and security policy aligned when behavior changes.
+- commands that are safe/local versus commands that mutate deployment state;
+- Runtime URL versus Direct/Migrator URL;
+- source/test evidence versus live evidence;
+- Owner-accepted risk versus an enforced control.
+
+## 8. Git and publication
+
+- Do not commit/push/open or update a PR/resolve threads/merge unless explicitly asked.
+- Stage only named intended files; never use a broad stage command in a mixed worktree.
+- Do not force-push, reset, checkout away changes, delete branches or use destructive Git commands without explicit
+  scoped approval.
+- Bind deployment/UAT evidence to the exact 40-character `GIT_SHA`; never reuse a passing check from another revision.

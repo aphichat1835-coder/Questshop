@@ -452,23 +452,15 @@ export async function creditRedeemedTopupInTransaction(client, { topupId }, cont
     if (BigInt(daily.total) >= 300_000n) {
       await client.query(`UPDATE topups SET warning_code='DAILY_TOPUP_LIMIT_EXCEEDED',
         updated_at=transaction_timestamp() WHERE id=$1`, [topupId]);
-      // Automatic daily blocks expire at the Bangkok boundary.  Revoke a
-      // previous expired automatic block first, otherwise the partial unique
-      // index would keep an old, harmless row from being replaced tomorrow.
-      await client.query(`UPDATE blocklist_entries SET revoked_at=clock_timestamp(),revoked_by='SYSTEM'
-        WHERE discord_user_id=$1 AND block_type='TOPUP_BLOCKED' AND revoked_at IS NULL
-          AND expires_at<=clock_timestamp()`, [topup.discord_user_id]);
-      const block = (await client.query(`
-        INSERT INTO blocklist_entries(
-          id, discord_user_id, block_type, reason, expires_at, actor_id, trace_id
-        ) VALUES ($1,$2,'TOPUP_BLOCKED','DAILY_TOPUP_LIMIT',$3,'SYSTEM',$4)
-        ON CONFLICT (discord_user_id, block_type) WHERE revoked_at IS NULL DO NOTHING
-        RETURNING *
-      `, [uuidv7(), topup.discord_user_id, bounds.ends_at, context.traceId])).rows[0];
-      if (block) await appendAdminAudit(client, { action: 'BLOCK_CREATED_AUTOMATIC',
+      const lock = (await client.query(`INSERT INTO topup_daily_locks(
+        discord_user_id,expires_at,trace_id
+      ) VALUES($1,$2,$3)
+      ON CONFLICT(discord_user_id) DO UPDATE SET
+        expires_at=EXCLUDED.expires_at,trace_id=EXCLUDED.trace_id,updated_at=clock_timestamp()
+      RETURNING *`, [topup.discord_user_id, bounds.ends_at, context.traceId])).rows[0];
+      await appendAdminAudit(client, { action: 'TOPUP_DAILY_LOCK_CREATED',
         targetType: 'DISCORD_USER', targetId: topup.discord_user_id, actorId: 'SYSTEM',
-        after: { blockType: block.block_type, expiresAt: block.expires_at },
-        reason: 'DAILY_TOPUP_LIMIT', context });
+        after: { expiresAt: lock.expires_at }, reason: 'DAILY_TOPUP_LIMIT', context });
     }
     await enqueueProjection(client, {
       projectionType: await durablePaymentLogType(client, topupId), aggregateType: 'TOPUP', aggregateId: topupId,

@@ -1,143 +1,186 @@
 # Questshop
 
-Questshop คือบอทร้านค้า Discord สำหรับรับทำ Discord Quest อัตโนมัติ ลูกค้าเติมเครดิตด้วย
-TrueMoney Gift, กรอก Token ของบัญชี Quest, เลือก Quest ได้หลายรายการ และติดตามความคืบหน้าใน
-Discord ได้โดยไม่ต้องใช้เว็บไซต์แยก
+Questshop คือบอท Discord สำหรับรับทำ Discord Quest อัตโนมัติใน Discord Guild เดียว ลูกค้าเติมเครดิต
+ด้วย TrueMoney Gift, ส่ง Token ของบัญชี Quest, เลือก Quest ได้หลายรายการ และติดตามสถานะงานผ่าน Discord
+โดยไม่ต้องมีเว็บไซต์แยก
 
-ระบบนี้ออกแบบสำหรับ Discord Guild เดียว ใช้ Node.js 22, `discord.js` และ PostgreSQL 16+
-สถานะสำคัญทั้งหมด—Wallet, Ledger, Payment, Order, Runner, Lease, Outbox และ Manual Review—เก็บแบบ
-durable ใน PostgreSQL เพื่อให้กู้การทำงานต่อได้หลัง Process restart
+ระบบเก็บ Wallet, Ledger, Payment, Order, Runner, Lease, Outbox, Manual Review และ Audit ลง PostgreSQL 16+
+จึงกู้สถานะงานต่อหลัง Process restart ได้ ไม่พึ่งข้อมูลใน memory เพียงอย่างเดียว
+
+> [!WARNING]
+> Quest Engine ใช้ Discord user token/Self-bot behavior ซึ่งอาจขัดเงื่อนไขของ Discord และทำให้บัญชีถูกจำกัด
+> หรือปิดได้ เจ้าของระบบต้องยอมรับและทบทวนความเสี่ยงนี้เองก่อนใช้งาน
 
 > [!IMPORTANT]
-> สถานะปัจจุบันคือ **implemented-but-unverified**: โค้ดและ Automated tests มีหลักฐานครอบคลุม
-> แต่ยังห้ามเรียกว่า Production-ready จนกว่า Discord UAT, TrueMoney จริง, Managed PostgreSQL
-> และ Owner closeout จะผ่านบน Git SHA เดียวกัน การกู้ข้อมูลของ Aiven เป็นขอบเขตภายนอกที่ Questshop
-> ไม่สามารถ Restore drill แทนผู้ให้บริการได้
-> [!WARNING]
-> ระบบ Quest ใช้ Discord user token/Self-bot behavior ซึ่งอาจขัดข้อกำหนดของ Discord และอาจทำให้
-> บัญชีถูกจำกัดหรือปิดใช้งาน เจ้าของระบบยอมรับความเสี่ยงนี้โดยชัดแจ้ง ผู้ติดตั้งต้องทบทวนข้อกำหนด
-> ปัจจุบันของ Discord ด้วยตนเองก่อนใช้งานจริง
+> สถานะ source ปัจจุบันคือ **implemented-but-unverified** การที่บอทขึ้น `Questshop ready` หรือ test ผ่าน
+> ไม่ใช่หลักฐานว่า TrueMoney, Discord Quest, Monitor token หรือการเปิดร้านจริงผ่านครบแล้ว ต้องทำ UAT
+> บน Git SHA เดียวกันตาม [Pre-launch UAT](docs/uat/prelaunch.md) ก่อนถือว่าใช้งานจริงได้
 
-## ความสามารถหลัก
+## ภาพรวมสิ่งที่ระบบทำ
 
-- หน้าร้าน `quest-auto` มีเพียงปุ่ม **เริ่มทำเควส** และ **เติมเงิน**
-- Checkout เป็น Ephemeral: ตรวจ Token, ดึงโปรไฟล์, เลือกหลาย Quest, แบ่งหน้าเกิน 25 รายการ,
-  เลือกทั้งหมด, ตรวจราคา และยืนยันยอดจอง
-- ตัวเลือก Quest แสดงประเภท, Orbs, Progress และราคา; วันหมดอายุแสดงในหน้าตรวจสอบก่อนยืนยัน
-- เติมเครดิตด้วย TrueMoney Gift แบบซองผู้รับคนเดียว พร้อม Voucher HMAC, Receiver snapshot,
-  Promotion, exact-once credit และ Owner-only review เมื่อผลไม่ชัดเจน
-- Wallet ใช้จำนวนเต็มหน่วยสตางค์ แยกเครดิตพร้อมใช้กับเครดิตที่จอง และไม่มี Transfer/Withdrawal
-- คิดค่าบริการทีละ Quest: สำเร็จจึง Capture; ล้มเหลวแน่ชัดจึง Release เครดิตคืน
-- Fair queue, lazy job materialization, durable runner checkpoint, lease และ fencing token
-- รองรับ Quest ประเภทดูวิดีโอและเล่นเกมบน Desktop ตาม Executor registry ปัจจุบัน
-- `quest-new` ใช้หนึ่งข้อความต่อ Quest และแก้ข้อความเดิมเมื่อข้อมูลเปลี่ยน
-- ประวัติใช้หนึ่งข้อความต่อ Order item และแสดง Progress เป็นช่วง `0/25/50/75/100%`
-- เมื่องานสำเร็จ ลูกค้ากดรับรางวัลเอง ไม่มี Automatic Claim API
-- DM สรุปออเดอร์มีปุ่ม **รับรางวัลทั้งหมด** ไปยัง Quest สำเร็จลำดับแรก และปุ่ม
-  **ดูประวัติ Quest ทั้งหมด** ไปยังห้องประวัติ
-- Admin panel แบบ Select menu สำหรับร้าน, ราคา, Promotion, Order, Wallet, Monitor, Receiver,
-  Blocklist, Review, Backup และเหตุขัดข้อง
-- Transactional outbox, coalescing, bounded retry และ DLQ สำหรับการส่งข้อความ Discord
-- Health endpoints, Aiven-managed database-backup policy, retention และ key-version coverage
+- `quest-auto` เป็นหน้าร้านถาวร มีปุ่ม **เริ่มทำเควส** และ **เติมเงิน**
+- Checkout เป็น Ephemeral: ตรวจ Token, โหลด Quest, เลือกหลายรายการ, สร้าง Quote และยืนยันออเดอร์
+- Wallet เก็บเป็นจำนวนเต็มหน่วยสตางค์ แยกยอด `available` และ `reserved` ไม่มีถอนหรือโอนเครดิต
+- ยืนยันออเดอร์แล้วจองเงินแยกต่อ Quest; สำเร็จจึง Capture, ล้มเหลวแน่ชัดจึง Release คืน Wallet
+- TrueMoney Gift มี Voucher HMAC, Receiver snapshot, Promotion และ Owner-only Manual Review เมื่อผลไม่ชัดเจน
+- Queue มี fairness, lease, fencing token, durable mutation checkpoint และ restart recovery
+- Runner รองรับ Video และ Desktop Quest ตาม Executor registry; ไม่มี Automatic Claim
+- `quest-new` และประวัติ Quest แก้ข้อความเดิมแทนการส่ง spam; Progress ที่เห็นเป็น `0/25/50/75/100%`
+- DM ปิดออเดอร์มี **รับรางวัลทั้งหมด** ไปยัง Quest สำเร็จรายการแรก และ **ดูประวัติ Quest ทั้งหมด**
+- Admin panel เหลือ 9 หมวดที่ใช้จริง: ภาพรวม, ราคาทำ Quest, โบนัสเติมเงิน, งานและคิว,
+  เติมเงินที่ต้องตรวจ, ปรับเครดิต/คืนเงิน, Monitor, เบอร์รับเงิน และปัญหาที่ต้องจัดการ
+- Outbox/DLQ ทำให้การส่งข้อความ Discord กู้ต่อได้หลัง restart
+- มี HTTP health endpoints: `/livez`, `/readyz`, `/statusz`
 
-## พฤติกรรมที่ตั้งใจไว้
+## กฎธุรกิจสำคัญ
 
-### เงินและการคืนเครดิต
-
-เมื่อยืนยันออเดอร์ ระบบย้ายยอดจาก `available` ไป `reserved` แยกราย Quest โดยยังไม่ถือเป็นรายได้ร้าน
+### เงิน
 
 ```text
-Confirm → Reserve ราย Item
-Quest สำเร็จและตรวจยืนยันแล้ว → Capture เต็มราคาที่ Quote ไว้
-Quest ล้มเหลวแน่ชัด/หมดอายุก่อนเริ่ม/เสร็จจากที่อื่น → Release คืน Wallet
-ผลไม่ชัดเจน → คง Reserved และเปิด Manual Review
+ลูกค้ายืนยัน Order
+→ Available ลด / Reserved เพิ่ม แยกต่อ Order Item
+→ Quest สำเร็จและยืนยันจาก server แล้ว: Capture เต็มราคา snapshot
+→ ล้มเหลวแน่ชัด, หมดอายุก่อนเริ่ม หรือเสร็จจากภายนอก: Release คืน Wallet
+→ ผลไม่ชัดเจน: คง Reserved และเปิด Manual Review
 ```
 
-Refund ทุกกรณีคืนเป็น Wallet credit ไม่มีวันหมดอายุ ไม่มีการถอนหรือโอนเครดิต และ Admin ห้ามแก้หรือลบ
-Ledger เดิม การแก้ยอดต้องสร้าง Compensating transaction พร้อมเหตุผลและ Audit
+- Refund คืนเป็น Wallet credit เท่านั้นและไม่มีวันหมดอายุ
+- Wallet ห้ามติดลบ และ Ledger/Admin audit เป็น append-only
+- การแก้ยอดต้องเป็น compensating transaction พร้อมเหตุผล, ผู้กระทำ, Correlation ID และ Audit
+- Timeout หลังส่งคำขอ TrueMoney หรือ Quest mutation อาจเกิดผลแล้ว จึงห้าม blind retry
 
-### การค้นพบและทดสอบ Quest
+### Quest, Monitor และ Token
 
-- Quest ที่ Monitor พบจะยังไม่ประกาศหรือเปิดขายทั่วไปจนกว่า Monitor อย่างน้อยหนึ่งบัญชีทดสอบผ่าน
-- แต่ละ Monitor ลองได้สูงสุด 3 ครั้ง แล้วจึงเปลี่ยนไปบัญชีถัดไป และหยุดทันทีเมื่อมีหนึ่งบัญชีผ่าน
-- หากทุก Monitor ล้มเหลว ระบบแจ้งหลังบ้านพร้อม **ส่งเลย** และ **ลองทดสอบอีกครั้ง**
-- Quest ที่พบจาก Token ลูกค้าจะถูกวิเคราะห์และใช้กับบัญชีลูกค้านั้นได้เมื่อเข้าเงื่อนไข Checkout
-  พร้อมบันทึกตัวตนลูกค้า/Quest account ในหลังบ้าน แต่ห้ามบันทึก Token ดิบ
-- `quest-new` สาธารณะไม่เปิดเผยว่าพบจากลูกค้าคนใด และไม่แสดง Quest ID หรือสถานะภายใน
+- Monitor ทุกบัญชีทำทั้ง Scan และ Test โดยไม่มี capability ให้เลือก
+- Quest ที่ Monitor พบจะเป็นข้อมูลหลังบ้านจน Monitor อย่างน้อยหนึ่งบัญชีทดสอบผ่าน หรือ Admin กด
+  **ส่งเลย** แบบมี Audit
+- ระบบลอง Monitor เดิมได้สูงสุด 3 ครั้ง แล้วเปลี่ยน Monitor ตัวถัดไป; หยุดทันทีเมื่อมีหนึ่งบัญชีผ่าน
+- Quest ที่พบจาก Token ลูกค้าอาจแสดงให้บัญชีนั้นเลือกได้ตาม Checkout policy แม้ Monitor ไม่พบ
+- Customer token ใช้เฉพาะ session/order, เข้ารหัส AES-256-GCM และลบเมื่อหมดหน้าที่
+- Monitor token เข้ารหัสและไม่มีทางให้ Admin เปิดอ่านค่า plaintext
+- Quest account เดียวมี active job ซ้อนไม่ได้ทั่วระบบ แม้ผู้ซื้อคนละคน
+- งานเสร็จที่ `READY_TO_CLAIM`; ลูกค้าเป็นผู้กดรับรางวัลเองเสมอ
 
-Monitor ทุกบัญชีทำทั้ง Scan และ Test อัตโนมัติ ไม่มีการเลือก Capability แยก และหน้า Admin มี
-**เช็คระบบ Token** แบบ read-only ซึ่งตรวจ Login/Identity/Quest list โดยไม่เริ่มทำ Quest
+### ราคาและโบนัส
 
-### Token และ Claim
+- ราคาเริ่มต้นของ Quest เล่นเกมและ Quest ดูวิดีโอคือ **5.00 บาท** ต่อ Quest (500 สตางค์)
+- แอดมินเปลี่ยนราคาได้ทีละประเภทเท่านั้น; ไม่มีราคาเฉพาะ Quest, ราคาชั่วคราว หรือวันเริ่ม/จบให้ต้องจัดการ
+- โบนัสเติมเงินตั้งเป็น Tier เช่น `100=10, 300=15`; ใช้จนกว่าแอดมินจะปิดหรือแก้เป็นรุ่นใหม่
+- ระบบยังบังคับเพดานจำนวนใช้ต่อผู้ใช้และโบนัสต่อวันตามค่าที่แอดมินกำหนด
 
-- Customer token: รับ → ตรวจ → เข้ารหัส AES-256-GCM → ใช้เฉพาะ Checkout/Order → ลบเมื่อหมดหน้าที่
-- Monitor token: เข้ารหัสและเปิดดูจาก Admin ไม่ได้; invalid token ถูก Quarantine
-- Token, Cookie, Session, Database URL และ Key material ห้ามปรากฏใน Log หรือ Discord UI
-- Reward claim เป็น Manual เท่านั้น โค้ดใน `src/` ไม่มี `claimQuest()` หรือ Claim retry policy
-
-## สถาปัตยกรรม
+## โครงสร้างระบบ
 
 ```text
-Discord Gateway / Interactions
-           │
-           ▼
-   Interaction Router ──► Domain Services ──► PostgreSQL 16+
-           │                    │                    │
-           │                    ├─ Wallet/Ledger     ├─ Durable state
-           │                    ├─ Payment           ├─ Queue/Lease/Fencing
-           │                    ├─ Catalog/Pricing   ├─ Outbox/DLQ
-           │                    ├─ Checkout/Order    └─ Audit/Reviews
-           │                    └─ Runner
-           │
-           ├─ Payment worker ×1
-           ├─ Runner worker ×3 (ตั้งค่าได้สูงสุด 5)
-           ├─ Outbox worker ×2
-           ├─ Discovery/Test/Maintenance workers
-           └─ HTTP /livez /readyz /statusz
+Discord Gateway
+    │
+    ├── Interaction router ──► Domain services ──► PostgreSQL 16+
+    │                               │                    │
+    │                               ├─ Wallet/Ledger      ├─ Durable state
+    │                               ├─ Payments           ├─ Queue/Lease/Fencing
+    │                               ├─ Catalog/Pricing    ├─ Outbox/DLQ
+    │                               ├─ Checkout/Orders    └─ Audit/Reviews
+    │                               └─ Runner
+    │
+    ├── Payment / Runner / Outbox workers
+    ├── Discovery / Quest test / Maintenance workers
+    └── HTTP health server
 ```
 
-Discord handler มีหน้าที่ Validate/Acknowledge แล้วเรียก Domain service เท่านั้น การเปลี่ยน State หรือยอดเงิน
-ต้องผ่าน Transaction, idempotency, compare-and-swap และ Audit ห้าม Handler เขียนสถานะธุรกิจตรง
+Runtime เป็น all-in-one process แต่ ownership และ state สำคัญอยู่ใน PostgreSQL จึงรองรับ restart ได้
 
-อ่านรายละเอียดเพิ่ม:
+## ข้อกำหนด
 
-- [System architecture](docs/architecture/system.md)
-- [State-machine contracts](docs/state-machines/contracts.md)
-- [PostgreSQL role contract](docs/architecture/postgresql-roles.md)
-- [Requirement traceability](docs/architecture/traceability.md)
-- [Completion audit](docs/architecture/completion-audit.md)
+- Node.js `>=22.22.0 <23` (inwcloud เลือก Node 22.x LTS)
+- PostgreSQL 16+; production URL ต้องมี `sslmode=verify-full`
+- Discord application/bot, Discord Guild เดียว และ Bot ต้องมี `Administrator`
+- Aiven PostgreSQL หรือ Managed PostgreSQL ที่สร้าง role แยกได้
+- `npm` และไฟล์ `package-lock.json` ของ repository
 
-## เทคโนโลยีและข้อกำหนด
+Dependencies ถูก pin ใน [package.json](package.json): `discord.js 14.27.0`, `pg 8.22.0`, `zod 4.4.3`,
+`uuid 14.0.1` และ `pino 10.3.1`
 
-- Node.js `>=22.22.0 <23`
-- npm และ lockfile ที่อยู่ใน repository
-- PostgreSQL 16+
-- Discord application/bot และ Production Guild หนึ่งแห่ง
-- Production URL ต้องใช้ `sslmode=verify-full`; ระบุ TLS CA ได้เมื่อผู้ให้บริการใช้ private CA
-- Aiven for PostgreSQL (แผน Free รองรับ Backup โดยผู้ให้บริการ); S3/`pg_dump` ใช้เฉพาะโหมด Local S3 แบบ legacy
-- หน่วยความจำเป้าหมาย 512 MB; RSS gate ต่ำกว่า 400 MB
+## Environment Variables
 
-Dependencies หลักถูก Pin ใน [package.json](package.json): `discord.js 14.27.0`, `pg 8.22.0`,
-`zod 4.4.3`, `uuid 14.0.1`, `pino 10.3.1` และ AWS SDK สำหรับ S3
+ห้าม commit `.env` หรือส่งค่าจริงลง Discord, issue, PR, log หรือ screenshot
 
-## ติดตั้งสำหรับพัฒนา
+### ค่าที่ต้องมีตอน deploy บน inwcloud
+
+| Variable | ใช้ทำอะไร | หมายเหตุ |
+|---|---|---|
+| `NODE_ENV` | ระบุ environment | Production ใช้ `production` |
+| `DISCORD_BOT_TOKEN` | Login bot และ register commands | Secret |
+| `DISCORD_CLIENT_ID` | Discord Application ID | Snowflake |
+| `DISCORD_GUILD_ID` | Guild เดียวที่บอททำงาน | Snowflake |
+| `OWNER_ID` | Discord User ID ของ Owner | Snowflake |
+| `DATABASE_POOL_URL` | URL ของ role `questshop_runtime` | ต้องมี `sslmode=verify-full` |
+| `DATABASE_DIRECT_URL` | URL ของ role `questshop_migrator` | ต้องมี `sslmode=verify-full`; ต้องใช้ตอน `npm run deploy` |
+| `DATABASE_SSL_CA_BASE64` | CA certificate ของ Aiven แบบ Base64 | ใส่เมื่อ certificate ไม่ได้ chain ไป Node trusted root |
+| `STATUS_TOKEN` | Bearer token ของ `/statusz` | Secret อย่างน้อย 32 ตัวอักษร |
+| `DATA_ENCRYPTION_KEYS_JSON` | Keyring เข้ารหัส Token/credential | Secret JSON ที่ `npm run setup` สร้างได้ |
+| `VOUCHER_HMAC_KEYS_JSON` | Keyring HMAC สำหรับ Voucher | Secret JSON ที่ `npm run setup` สร้างได้ |
+| `BACKUP_MODE` | นโยบาย backup | สำหรับ Aiven ใช้ `AIVEN_MANAGED` |
+| `GIT_SHA` | SHA เต็ม 40 ตัวของ source ที่กำลัง deploy | Production บังคับรูปแบบนี้ |
+
+ค่าที่กำหนดไว้แล้วแต่ปรับได้:
+
+| Variable | ค่า/ความหมาย |
+|---|---|
+| `PRELAUNCH` | `true` เพื่อจำกัดเส้นทางลูกค้าระหว่าง UAT; อย่าเปิดร้านเพียงเพราะบอท start ได้ |
+| `TIMEZONE` | ค่าเริ่มต้นและค่าที่รองรับคือ `Asia/Bangkok` |
+| `RUNNER_CONCURRENCY` | จำนวน Runner พร้อมกัน; ค่าเริ่มต้น `2` |
+| `RUNNER_CONCURRENCY_HARD_MAX` | เพดาน Runner; สูงสุด `5` |
+| `PORT` | HTTP health server; ค่าเริ่มต้น `3000` |
+
+`BACKUP_MODE=AIVEN_MANAGED` หมายถึง Aiven เป็นเจ้าของ backup/recovery ของฐานข้อมูล Questshop จะไม่พยายาม
+เรียก `pg_dump`, `pg_restore` หรือ S3 ใน inwcloud. โหมด `LOCAL_S3` เป็น compatibility mode และต้องมี
+credentials/backup configuration เพิ่มครบชุด; อย่าเปิดโดยไม่ได้วางแผน restore ไว้ก่อน
+
+> [!NOTE]
+> โค้ดปัจจุบันอ่าน `DATABASE_SSL_CA_BASE64` โดยตรงแล้ว ไม่ต้องสร้าง `/tmp/aiven-ca.pem` และไม่ต้องตั้ง
+> `NODE_EXTRA_CA_CERTS`. URL ต้นฉบับยังต้องเป็น `sslmode=verify-full`; ระบบจะลบเฉพาะ SSL query parameters
+> จาก URL สำเนาที่ส่งเข้า `pg` เพื่อป้องกันไม่ให้ CA explicit ถูก override
+
+## PostgreSQL roles ที่ต้องเตรียมครั้งเดียว
+
+ผู้ดูแล Aiven/ฐานข้อมูลต้องสร้างและให้สิทธิ์ก่อน deploy:
+
+| Role | ใช้โดย | สิทธิ์บน `public` |
+|---|---|---|
+| `questshop_migrator` | `DATABASE_DIRECT_URL` ระหว่าง deploy | `USAGE, CREATE` |
+| `questshop_runtime` | `DATABASE_POOL_URL` ระหว่างบอทรัน | `USAGE` เท่านั้น, ไม่มี `CREATE` |
+
+Role ต้องเป็นคนละตัวกัน ห้ามนำ `DATABASE_POOL_URL` ไปใส่เป็น `DATABASE_DIRECT_URL` เพราะ migration จะ fail-closed
+ถ้า migrator และ runtime เป็น role เดียวกัน
+
+หลัง migration ทุกครั้ง Questshop จะ sync object privileges แม้ `applied: 0`:
+
+- ตารางทั่วไป: Runtime อ่าน/เขียนได้ตาม domain ต้องใช้
+- `wallet_transactions`, `admin_audit_logs`, `release_evidence`: Runtime ได้เพียง `SELECT, INSERT`
+- `schema_migrations`, `crypto_key_sentinels`: Runtime อ่านอย่างเดียว
+- Runtime ไม่มี DDL และมีสิทธิ์ execute เฉพาะ retention functions ที่ allowlist
+
+รายละเอียด provisioning อยู่ที่ [PostgreSQL role contract](docs/architecture/postgresql-roles.md)
+
+## เริ่มต้นบนเครื่องพัฒนา
+
+1. ติดตั้ง Node 22 และ PostgreSQL 16 ที่เป็นฐานข้อมูล disposable สำหรับ test
+2. Clone repository และติดตั้ง dependencies
 
 ```bash
-git clone <repository-url>
-cd Questshop
-npm ci --ignore-scripts
+npm ci
+```
+
+3. คัดลอก [.env.example](.env.example) เป็น `.env` แล้วรัน setup แบบ interactive
+
+```bash
 npm run setup
 ```
 
-`npm run setup` จะถามเฉพาะค่าภายนอกที่ระบบสร้างเองไม่ได้ แล้วสร้าง `.env`, Status token และ
-Encryption/HMAC keyrings ให้โดยอัตโนมัติ ไฟล์ถูกตั้ง permission เป็น `0600` และถูก Git ignore
+คำสั่งนี้ถาม Discord IDs/Token, Runtime URL, Direct/Migrator URL และ CA ถ้าจำเป็น จากนั้นสร้าง
+`STATUS_TOKEN`, Data encryption keyring และ Voucher HMAC keyring เพียงครั้งเดียวใน `.env` permission `0600`.
+อย่ารัน setup เพื่อหวังให้มันหมุน key ใหม่; การ rotate เป็น workflow แยก
 
-เตรียม PostgreSQL roles และ schema bootstrap ตาม [postgresql-roles.md](docs/architecture/postgresql-roles.md)
-ก่อนรัน Migration: Aiven/Admin ให้ Migrator มี `USAGE, CREATE` และ Runtime มี `USAGE` แต่ไม่มี `CREATE`
-บน `public` ส่วน `npm run migrate` จะ synchronize สิทธิ์ของ tables, sequences และ Questshop functions ที่
-Migrator เป็นเจ้าของทุกครั้ง แม้ไม่มี migration SQL ใหม่
-
-### เตรียมฐานข้อมูลและคำสั่ง Discord
+4. ตรวจและ deploy schema/commands แล้วเปิด runtime
 
 ```bash
 npm run deploy
@@ -146,220 +189,132 @@ npm run setup:preflight
 npm start
 ```
 
-`npm run deploy` เป็นเจ้าของ Migration และ Command registration เพียงทางเดียว หาก Production มี schema เดิม
-และมี Migration ใหม่ ระบบจะบันทึก Audit ว่าใช้ Aiven-managed backup พร้อม Git SHA โดยไม่กล่าวอ้างว่า
-Questshop ตรวจ Backup หรือ Restore สำเร็จ
-ส่วน `npm start` ใช้เฉพาะ Runtime pooled credential, ตรวจเพียง schema compatibility แบบ read-only และจะปฏิเสธ
-การเริ่มระบบหากยังไม่ได้รัน Deployment step
+`npm run deploy` เท่ากับ `setup:verify → migrate → register` และเป็นคำสั่งเดียวที่ควรรับผิดชอบ migration
+กับการลงทะเบียน command. `npm start` ไม่ migrate และใช้ Runtime credential เท่านั้น
 
-Development mode:
+## รันบน inwcloud + Aiven
+
+1. ตั้ง Runtime เป็น **Node.js 22.x LTS**
+2. ตั้ง Environment Variables ตามตารางด้านบน โดยเก็บ secret ในหน้า Environment Variables ของ inwcloud
+3. ตั้ง repository/branch ให้ตรง SHA ที่ต้องการ deploy และใส่ SHA เต็มนั้นลง `GIT_SHA`
+4. ใช้ Custom Command นี้:
 
 ```bash
-npm run dev
+npm ci --omit=dev && npm run deploy && npm start
 ```
 
-## Environment variables
+5. บันทึกค่าและ restart หนึ่งครั้ง
 
-### ค่าที่เจ้าของร้านต้องกรอก
+ผลลัพธ์ที่ควรเห็นตามลำดับ:
 
-มี 6 ค่าบังคับใน [.env.example](.env.example):
+```text
+setup:verify  → {"ok":true,...}
+migrate       → privilegeSynchronization: { status: 'PASS', ... }
+register      → Registered 8 guild commands
+start         → Questshop ready
+```
 
-| ตัวแปร | หน้าที่ |
+`migration.applied: 0` เป็นเรื่องปกติเมื่อ schema ล่าสุดอยู่แล้ว และยังต้องเห็น
+`privilegeSynchronization.status: 'PASS'` เพราะระบบตรวจ/sync privilege ทุก deploy
+
+หากพบ error เหล่านี้:
+
+| ข้อความ | สาเหตุและวิธีแก้ |
 |---|---|
-| `DISCORD_BOT_TOKEN` | Bot token จาก Discord Developer Portal |
-| `DISCORD_CLIENT_ID` | Discord Application ID |
-| `DISCORD_GUILD_ID` | Server ID ที่ใช้เปิดร้าน |
-| `OWNER_ID` | Discord User ID ของเจ้าของร้าน |
-| `DATABASE_POOL_URL` | URL ของ Runtime role สำหรับ Node `pg` pool ในบอท (บน Aiven Free ใช้ URL จาก Aiven โดยตรง ไม่ได้มี PgBouncer ของ Aiven) |
-| `DATABASE_DIRECT_URL` | PostgreSQL direct URL ของ Migration role |
+| `DATABASE_DIRECT_URL ... undefined` | ยังไม่ได้ตั้ง Migrator URL; เพิ่ม `DATABASE_DIRECT_URL` ที่เป็น role แยก |
+| `POSTGRES_RUNTIME_ROLE_CONTRACT_FAILED` | Runtime มีสิทธิ์เกิน policy; รัน `npm run deploy` ด้วย Migrator role ที่ถูกต้อง แล้วตรวจ Aiven provisioning |
+| `GIT_SHA must be the 40-character...` | ใส่ SHA เต็มของ revision ที่ inwcloud deploy จริง |
+| `Questshop bot must have Discord Administrator permission` | เพิ่ม Administrator ให้ bot แล้ว restart |
+| `Questshop startup failed` หลัง `register` | ดู error code ใน log; command registration สำเร็จไม่ได้แปลว่า runtime/database พร้อม |
 
-`DATABASE_SSL_CA_INPUT` เป็นค่าทางเลือก: ใส่พาธไฟล์ CA PEM หรือ Base64 เฉพาะเมื่อ certificate ของผู้ให้บริการ
-ไม่ได้ chain ไปยัง trusted root ของ Node โดยตรง
+อย่าตั้ง command แบบสร้างไฟล์ CA ชั่วคราวหรือ `NODE_EXTRA_CA_CERTS` สำหรับ source รุ่นปัจจุบัน
 
-รัน `npm run setup` แล้วระบบจะสร้างหรือกำหนดค่าต่อไปนี้เอง:
+## Discord commands ที่ลงทะเบียน
 
-- `STATUS_TOKEN`
-- `DATA_ENCRYPTION_KEYS_JSON`
-- `VOUCHER_HMAC_KEYS_JSON`
-- `DATABASE_SSL_CA_BASE64`
-- `BACKUP_MODE=AIVEN_MANAGED` สำหรับการเริ่มติดตั้ง
-- Default ของ Port, Timezone, Pre-launch, Runner concurrency และ Discord client fingerprint
+Owner ใช้คำสั่งเหล่านี้เพื่อติดตั้งหรือย้ายข้อความถาวรไปยังห้องที่ระบุ (ไม่ระบุ `channel` จะใช้ห้องปัจจุบัน):
 
-Setup เป็น idempotent: การรันซ้ำจะใช้ Secret เดิม ไม่ Rotate หรือสร้าง Key ใหม่ทับข้อมูลที่เข้ารหัสไว้
+```text
+/quest-auto
+/quest-new
+/quest-history
+/admin-panel
+/log-payments
+/log-quest-operations
+/log-admin
+/log-system
+```
 
-Production deployment ต้องส่ง `GIT_SHA` ที่เป็น commit SHA 40 ตัวอักษรจาก CI/Image metadata ไม่ใช่ค่าที่
-เจ้าของร้านต้องสุ่มหรือกรอกเอง ระบบจะปฏิเสธ `unknown` ใน Production เพื่อให้ Migration, Backup และ UAT
-ผูกกับ source revision เดียวกันได้
+การเรียกซ้ำจะ update/move Surface เดิม ไม่ควรสร้าง panel ที่ใช้งานซ้อนกัน
 
 > [!CAUTION]
-> `.env` คือ Secret ถาวรของร้าน ต้องสำรองเข้า Secret manager ที่ปลอดภัย ห้าม Commit, ส่งในแชต,
-> ใส่ Docker image หรือปล่อยหายเมื่อ Redeploy หาก Key สูญหาย Token/Receiver เดิมอาจถอดรหัสไม่ได้
-
-### Backup ของ Aiven และ Local S3 แบบ legacy
-
-ค่าเริ่มต้นใช้ `BACKUP_MODE=AIVEN_MANAGED`: inwcloud ไม่ต้องมี PostgreSQL client, `pg_dump`, `pg_restore`, S3 หรือ
-Backup key เพิ่ม เพราะ Aiven เป็นผู้สำรองฐานข้อมูลอัตโนมัติเอง
-
-หากในอนาคตต้องการกลับไปใช้ Backup ของ Questshop เอง ให้เปลี่ยนเป็น `BACKUP_MODE=LOCAL_S3` และเพิ่ม
-`DATABASE_BACKUP_URL`, `DATABASE_RESTORE_URL`, `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`,
-`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` และ `BACKUP_ENCRYPTION_KEYS_JSON`
-
-ค่า S3 และ Database URL เหล่านี้สร้างอัตโนมัติไม่ได้ เพราะต้องมาจากผู้ให้บริการภายนอก
-
-สำหรับ Docker ให้ Mount `.env` เป็น Secret file หรือย้ายค่าข้างในเข้า Secret manager ของ Platform;
-ไฟล์นี้ไม่ถูก Copy เข้า Image โดยตั้งใจ
-
-สำหรับ Host แบบ stateless ให้สร้าง Runtime bundle ที่ตัด `DATABASE_DIRECT_URL` และ `DATABASE_RESTORE_URL` ออก
-เพื่อลดสิทธิ์ของบอท 24/7 แล้วนำเนื้อหาไฟล์ไปเก็บใน
-Secret manager เป็น `QUESTSHOP_SECRET_BUNDLE`:
-
-```bash
-QUESTSHOP_SECRET_BUNDLE_FILE=/secure/questshop.bundle npm run setup:export-secret-bundle
-```
-
-Deployment job ที่จบกระบวนการหลัง Migrate/Register ใช้ bundle แยกต่างหาก:
-
-```bash
-QUESTSHOP_SECRET_BUNDLE_SCOPE=deployment \
-QUESTSHOP_SECRET_BUNDLE_FILE=/secure/questshop-deployment.bundle npm run setup:export-secret-bundle
-```
-
-Runtime รับเฉพาะค่า allowlist และลบ shared bundle/`DATABASE_DIRECT_URL` ออกจาก process environment หลังโหลด;
-environment variable ที่ Platform กำหนดมีสิทธิ์เหนือกว่า bundle และ bundle ไม่ใช่ช่องทาง Rotate key อัตโนมัติ
-
-> [!IMPORTANT]
-> ระบบใหม่ที่ยังไม่มีข้อมูล Durable จะสร้าง Sentinel แบบอัตโนมัติครั้งแรก สำหรับฐานข้อมูลเก่าที่มีข้อมูลแล้ว
-> แต่ยังไม่มี Sentinel ให้ตรวจ keyrings ด้วย Owner ก่อน แล้วรัน
-> `QUESTSHOP_KEYRING_ADOPTION=VERIFY_KEYS_AND_ADOPT npm run keys:adopt` เพียงครั้งเดียว ห้ามใช้คำสั่งนี้
-> เพื่อเดา/แก้ปัญหา key ที่สูญหาย คำสั่งเดียวกันนี้ใช้เพิ่ม Key version ใหม่หลัง Owner ตรวจค่าใน
-> Secret manager แล้วได้ แต่ไม่ยอมลบหรือแทนที่ Sentinel ของ Key เดิม
-
-หลัง Worker re-encrypt ข้อมูลด้วย Key ใหม่และ Restore drill ผ่านแล้ว ให้ตรวจความพร้อมก่อนนำ Key เก่าออกจาก
-Secret manager ด้วย `QUESTSHOP_RETIRE_DATA_KEY_VERSION=<version> npm run keys:retire:verify`,
-`QUESTSHOP_RETIRE_VOUCHER_KEY_VERSION=<version> npm run keys:retire:verify` หรือ
-`QUESTSHOP_RETIRE_BACKUP_KEY_VERSION=<version> npm run keys:retire:verify` คำสั่งนี้ไม่แก้ Secret เอง
-เพื่อป้องกันการลบ Key ที่ยังมีข้อมูลหรือรายการ Review อ้างอิงอยู่
+> Owner เลือกให้นำ runtime privacy/permission-drift check ออกแล้ว รวมถึงไม่มี preflight ตรวจสิทธิ์มนุษย์ก่อน
+> ส่ง Payment Log. `LOG_PAYMENTS` อาจมี full voucher link ตาม policy ของ Owner ดังนั้น **Owner ต้องตั้งห้อง
+> หลังบ้านให้ถูกต้องเอง** และต้องไม่เปิดให้บุคคลที่ไม่เกี่ยวข้องเห็น Bot จะบันทึก Discord 403 เป็น incident
+> แต่จะไม่แก้ permission หรือปิด surface ให้อัตโนมัติ
 
 ## Health endpoints
 
-```bash
-curl http://127.0.0.1:3000/livez
-curl http://127.0.0.1:3000/readyz
-STATUS_TOKEN=$(node --env-file=.env -e "process.stdout.write(process.env.STATUS_TOKEN)")
-curl -H "Authorization: Bearer $STATUS_TOKEN" http://127.0.0.1:3000/statusz
-```
+Health server ฟังที่ `PORT` (ค่าเริ่มต้น `3000`):
 
-- `/livez`: Process ยังตอบสนอง
-- `/readyz`: Config, Schema, Database, Discord และ Runtime lease พร้อม
-- `/statusz`: รายละเอียด Worker, Queue, Backup และ Incident; ต้องใช้ Bearer token
+| Path | ต้องใช้ token | ความหมาย |
+|---|---|---|
+| `/livez` | ไม่ต้อง | Process ยังตอบได้ |
+| `/readyz` | ไม่ต้อง | DB, schema, Discord และ runtime lease พร้อมหรือไม่ |
+| `/statusz` | ต้องใช้ | รายละเอียด workers/gates/incidents แบบจำกัด |
 
-## ติดตั้ง Discord surfaces
-
-คำสั่งต่อไปนี้ใช้ได้เฉพาะ `OWNER_ID` และมี option `channel` หากไม่ระบุจะใช้ห้องปัจจุบัน:
-
-| คำสั่ง | Surface |
-|---|---|
-| `/quest-auto` | หน้าร้านสำหรับเริ่ม Quest และเติมเงิน |
-| `/quest-new` | ห้องประกาศ Quest ใหม่ |
-| `/quest-history` | ประวัติและ Progress ราย Quest |
-| `/admin-panel` | แผงควบคุม Owner/Admin |
-| `/log-payments` | Log การเติมเงินและลิงก์ซองเต็ม; ต้องเป็นห้องลับ |
-| `/log-quest-operations` | Discovery, Test, Queue, Runner และ Settlement |
-| `/log-admin` | Append-only Admin audit |
-| `/log-system` | Incident และ Recovery เท่านั้น |
-
-เรียกคำสั่งซ้ำจะ Update/Move surface เดิม ไม่ควรสร้าง Panel ที่ใช้งานได้ซ้ำหลายชุด Persistent components
-ถูก Route จาก Server-side session และกลับมาทำงานหลัง Restart
-
-## เปิดร้านครั้งแรก
-
-Feature gates ทุกตัวเริ่มต้นเป็น `false`:
-
-1. ติดตั้ง Surface และตรวจว่าห้อง Log เป็นห้องลับจริง
-2. ตั้ง Admin role, Branding/GIF, Receiver, Monitor, ราคา และ Promotion
-3. ใช้ปุ่ม **เช็คระบบ Token** ตรวจ Monitor ทุกบัญชี
-4. รัน Automated verification และบันทึก Git SHA
-5. ทำ [Pre-launch UAT](docs/uat/prelaunch.md) พร้อม
-   [evidence template](docs/uat/evidence-template.md)
-6. ทดสอบ TrueMoney จริงยอดต่ำ, Quest จริง, Restart recovery, Backup และ Restore drill
-7. ปิดรอบทดสอบด้วย Compensating transactions:
+ตัวอย่าง `/statusz`:
 
 ```bash
-CONFIRM_PRELAUNCH_CLOSEOUT=I_UNDERSTAND_COMPENSATING_TRANSACTIONS npm run prelaunch:closeout
+curl -H 'Authorization: Bearer YOUR_STATUS_TOKEN' http://127.0.0.1:3000/statusz
 ```
 
-8. Owner เปิด Gates ทีละส่วนตามลำดับใน UAT document ห้ามเปิดทุก Gate พร้อมกัน
+อย่าใส่ `STATUS_TOKEN` ลง shell history, ticket หรือ screenshot. หากเปิด Domain ใน inwcloud ให้ map Domain
+มายัง `PORT` เดียวกับ health server
 
-## Verification
+## การทดสอบ source
 
-Automated integration tests ต้องใช้ PostgreSQL disposable database และจะ Fail ชัดเจนถ้าไม่ได้กำหนด URL:
-
-```bash
-export TEST_DATABASE_URL=postgresql://postgres:password@127.0.0.1:5432/questshop_ci
-npm run verify
-```
-
-คำสั่งแยก:
+`TEST_DATABASE_URL` ต้องชี้ไป PostgreSQL 16 ที่ทิ้งได้เท่านั้น และชื่อฐานข้อมูลต้องเข้ากับ guard ของ project
+เช่น `questshop_ci` หรือ `questshop_test`; test จะ reset schema `public`
 
 ```bash
 npm run check
 npm run lint
-npm run test:unit
-npm run test:integration
+TEST_DATABASE_URL='postgresql://.../questshop_test' \
+QUESTSHOP_ALLOW_TEST_DATABASE_RESET=true npm test
+git diff --check
 ```
 
-Load test ใช้ฐานข้อมูลที่ทิ้งได้และชื่อฐานข้อมูลต้องมี `questshop_loadtest`:
+Full verification ใช้ coverage และ load test เพิ่ม:
 
 ```bash
-LOAD_TEST_DATABASE_URL=postgresql://postgres:password@127.0.0.1:5432/questshop_loadtest npm run load:test
+TEST_DATABASE_URL='postgresql://.../questshop_ci' \
+QUESTSHOP_ALLOW_TEST_DATABASE_RESET=true npm run test:coverage
+
+LOAD_TEST_DATABASE_URL='postgresql://.../questshop_loadtest' npm run load:test
+npm audit --audit-level=high
+docker build -t questshop:local .
 ```
 
-CI ตรวจ Syntax, ESLint, PostgreSQL tests, 2× capacity load test, `npm audit` และ Docker build
+ห้ามชี้ `TEST_DATABASE_URL` หรือ `LOAD_TEST_DATABASE_URL` ไปฐานข้อมูล Aiven/Production
 
-## Backup และ Restore
+## เอกสารอ้างอิง
 
-ค่าเริ่มต้นของ Questshop คือ Aiven-managed backup: ระบบบอทไม่สร้างไฟล์ Backup เอง และหน้า Admin จะแสดง
-สถานะนี้อย่างชัดเจน การกู้คืนต้องทำผ่าน Aiven Console ตามขีดจำกัดของแผนที่ใช้งาน
+- [Architecture](docs/architecture/system.md)
+- [Completion audit](docs/architecture/completion-audit.md)
+- [Deploy on inwcloud + Aiven](docs/deployment/inwcloud-aiven.md)
+- [PostgreSQL role contract](docs/architecture/postgresql-roles.md)
+- [State-machine contracts](docs/state-machines/contracts.md)
+- [Runbooks](docs/runbooks/README.md)
+- [Pre-launch UAT](docs/uat/prelaunch.md)
+- [Security policy](SECURITY.md)
+- [Engineering contract](AGENTS.md)
 
-คำสั่งด้านล่างมีไว้เฉพาะ `BACKUP_MODE=LOCAL_S3`:
+## ขอบเขตที่ยังต้องพิสูจน์ใน Live environment
 
-```bash
-npm run backup
-npm run backup:reconcile
-npm run restore:drill
-```
+- Discord desktop/mobile, setup panels, persistent components และ Gateway/REST failure handling
+- TrueMoney success, ambiguous-after-send และ provider schema drift ด้วยหลักฐานจริง
+- Video/Desktop Quest execution และผลของ Monitor token จริง
+- Aiven TLS/role provisioning, restart recovery และ health endpoint ผ่าน inwcloud
+- Owner pre-launch closeout, Admin UX และการกู้ incident เฉพาะส่วนที่ระบบปิดตัวเอง
 
-Backup ใช้ `pg_dump --format=custom` แบบ streaming → QSBK1 AES-256-GCM → S3 multipart upload → checksum/
-manifest verification ส่วน Restore drill สร้างฐานข้อมูลชั่วคราว ตรวจ Schema, Wallet/Ledger, Reservation,
-Payment, Queue, Outbox และ Crypto แล้วลบฐานข้อมูลชั่วคราว
-
-หาก Pre-migration backup อัปโหลดสำเร็จแต่ Migration ล้มก่อนบันทึกใน PostgreSQL ให้ Owner ใช้
-`npm run backup:reconcile` จาก deployment/DR environment เพื่ออ่าน Manifest ที่ยืนยันแล้วบน S3 กลับเข้า
-`backup_runs` ก่อน Restore drill; Runtime bot ปกติไม่มี Restore credential.
-
-ใน Aiven-managed mode Migration จะมี Audit ว่าไม่ได้สร้าง Local backup; จึงห้ามตีความว่า Questshop
-ยืนยันความพร้อมกู้คืนของ Aiven แล้ว
-
-## ขอบเขต v1
-
-ไม่มี Web dashboard, Redis, Multi-guild, Automatic Claim, Customer cancellation, Customer dispute button,
-Wallet transfer/withdrawal, ช่องทางเติมเงินอื่น หรือ Automated TrueMoney reconciliation ใน v1
-
-TrueMoney Direct เป็น Integration ที่ไม่มี Contract รับประกัน หาก Response/schema/receiver/amount ยืนยันไม่ได้
-ระบบต้องไม่ Credit และจะเปิด Circuit breaker/Manual Review ตามความเหมาะสม
-
-## ความปลอดภัย
-
-อ่าน [SECURITY.md](SECURITY.md) ก่อน Deploy หรือรายงานช่องโหว่ โดยเฉพาะ:
-
-- ห้ามเปิด Public issue ที่มี Token, Voucher URL เต็ม, Database URL หรือ Key material
-- `log-payments` เป็น Surface เดียวที่อนุญาตลิงก์ซองเต็ม และต้องเป็นห้องลับ
-- Ambiguous payment ให้ Owner ตรวจจาก TrueMoney app; ห้าม Blind retry
-- Financial/Audit DLQ ห้าม Discard
-- Runtime Permission Drift auto-repair ถูกถอดตามนโยบาย Owner; การแก้ Discord permission ทำด้วย Owner เอง
-
-## สถานะ Release
-
-Package version ปัจจุบันคือ `0.1.0` แต่ยังไม่มีหลักฐาน Production release ที่ผ่าน Live boundaries ครบ
-ดูการเปลี่ยนแปลงที่ [CHANGELOG.md](CHANGELOG.md) และห้ามใช้คำว่า Production-ready ก่อนผ่าน
-[Definition of Done](docs/architecture/definition-of-done.md) บน SHA เดียวกัน
+ห้ามเรียกโปรเจกต์นี้ว่า production-ready ก่อนหลักฐานทั้งหมดข้างต้นอยู่บน Git SHA เดียวกัน

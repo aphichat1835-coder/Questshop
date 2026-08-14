@@ -3,7 +3,6 @@ import { QuestshopError } from '../../shared/errors.js';
 import { evaluateExpiryAdmission } from '../catalog/expiry.js';
 import { SALE_TRANSITIONS } from '../catalog/states.js';
 import { resolvePrice } from '../pricing/resolver.js';
-import { hasCurrentTestPass } from '../catalog/test-gate.js';
 import { enqueueProjection } from '../outbox/service.js';
 import { openReview } from '../reviews/service.js';
 import { assertTransition, recordTransition } from '../shared/transition.js';
@@ -11,54 +10,9 @@ import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
 import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
 import { appendAdminAudit } from './audit.js';
 
-export async function setQuestSaleState({ questId, nextState, runnerConcurrency = 2,
-  reason }, context, options = {}) {
-  if (!['OPEN', 'PAUSED', 'EXPIRED'].includes(nextState) || !reason?.trim()) {
-    throw new TypeError('invalid Quest sale change');
-  }
-  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [questId])).rows[0];
-    if (!quest) throw new QuestshopError('QUEST_NOT_FOUND', 'ไม่พบ Quest');
-    if (quest.sale_state === nextState) return quest;
-    assertTransition(SALE_TRANSITIONS, quest.sale_state, nextState);
-    if (nextState === 'OPEN') {
-      const price = await resolvePrice(client, { questId, taskType: quest.task_type });
-      const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency });
-      const testPassed = await hasCurrentTestPass(client, quest);
-      if (quest.analysis_state !== 'SUPPORTED' || !quest.executor_id || !price || !expiry.eligible || !testPassed) {
-        const reasonCode = !testPassed ? 'MONITOR_TEST_NOT_PASSED' : (expiry.reason ?? 'ข้อมูล/Executor/ราคาไม่ครบ');
-        throw new QuestshopError('QUEST_NOT_SALE_ELIGIBLE', `เปิดขายไม่ได้: ${reasonCode}`);
-      }
-    }
-    const updated = (await client.query(`UPDATE quests SET sale_state=$2,sale_version=sale_version+1,
-      analysis_state=CASE WHEN $2='EXPIRED' AND analysis_state IN ('UNSUPPORTED','MANUAL_REVIEW','SUPPORTED')
-        THEN 'EXPIRED' ELSE analysis_state END,
-      analysis_version=analysis_version+CASE WHEN $2='EXPIRED'
-        AND analysis_state IN ('UNSUPPORTED','MANUAL_REVIEW','SUPPORTED') THEN 1 ELSE 0 END,
-      updated_at=transaction_timestamp() WHERE quest_id=$1 AND sale_version=$3 RETURNING *`,
-    [questId, nextState, quest.sale_version])).rows[0];
-    if (!updated) throw new QuestshopError('STALE_STATE', 'Quest เปลี่ยนพร้อมกัน');
-    await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: questId,
-      fromState: quest.sale_state, toState: nextState, stateVersion: updated.sale_version,
-      reasonCode: 'ADMIN_SALE_CHANGE', context });
-    if (nextState === 'EXPIRED' && ['UNSUPPORTED', 'MANUAL_REVIEW', 'SUPPORTED'].includes(quest.analysis_state)) {
-      await recordTransition(client, { aggregateType: 'QUEST_ANALYSIS', aggregateId: questId,
-        fromState: quest.analysis_state, toState: 'EXPIRED', stateVersion: updated.analysis_version,
-        reasonCode: 'ADMIN_EXPIRED', context });
-    }
-    await appendAdminAudit(client, { action: 'QUEST_SALE_CHANGE', targetType: 'QUEST', targetId: questId,
-      actorId: context.actorId, before: { saleState: quest.sale_state },
-      after: { saleState: nextState }, reason, context });
-    await enqueueProjection(client, { projectionType: 'QUEST_NEW', aggregateType: 'QUEST',
-      aggregateId: questId, aggregateVersion: updated.sale_version,
-      surfaceKey: 'QUEST_NEW', context });
-    return updated;
-  });
-}
-
-// This is deliberately separate from setQuestSaleState.  The only approved
-// bypass for the Monitor gate is the auditable button on that Quest's failed
-// test alert; it never changes a failed run into TEST_PASSED.
+// The only approved public-sale bypass for the Monitor gate is the auditable
+// button on that Quest's failed-test alert; it never changes a failed run into
+// TEST_PASSED and there is no generic manual catalog-sale control.
 export async function forcePublishFailedMonitorTest({ alertId, reason }, context, options = {}) {
   if (!reason?.trim()) throw new TypeError('force publish reason is required');
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {

@@ -2,6 +2,8 @@ import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { v7 as uuidv7 } from 'uuid';
 import { resolvePrice } from '../../src/domain/pricing/resolver.js';
+import { setQuestCategoryPrice } from '../../src/domain/admin/config-service.js';
+import { createContext } from '../../src/shared/correlation.js';
 import { resolvePromotionBonus } from '../../src/domain/promotions/resolver.js';
 import { bangkokDayBounds } from '../../src/db/postgres-time.js';
 import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS, TEST_TRANSITIONS } from '../../src/domain/catalog/states.js';
@@ -36,35 +38,50 @@ test('PostgreSQL enum checks remain synchronized with domain state graphs', asyn
   assert.deepEqual(await databaseStates('manual_reviews', 'state'), graphStates(REVIEW_TRANSITIONS));
 });
 
-test('price resolver applies Temporary then Quest then Type then Default and exactly one rule', async (t) => {
+test('new store resolves all four supported task types from two 5-baht categories', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
-  const trace = uuidv7();
-  await pool.query(`INSERT INTO quests(quest_id,analysis_state,sale_state,name,task_type,task_target,url,expires_at)
-    VALUES('price-q','SUPPORTED','OPEN','Price Quest','WATCH_VIDEO',60,'https://discord.com/quests/price-q',
-    clock_timestamp()+interval '1 day')`);
-  const rows = [
-    ['DEFAULT', null, null, 1000, 0],
-    ['TYPE', null, 'WATCH_VIDEO', 900, 0],
-    ['QUEST', 'price-q', null, 800, 0],
-    ['TEMPORARY', 'price-q', null, 700, 1],
-    ['TEMPORARY', 'price-q', null, 650, 0],
-  ];
-  for (const [type, quest, task, amount, priority] of rows) {
-    await pool.query(`INSERT INTO price_rules(id,rule_type,quest_id,task_type,amount_cents,priority,
-      config_version,actor_id,trace_id) VALUES($1,$2,$3,$4,$5,$6,1,'test',$7)`,
-    [uuidv7(), type, quest, task, amount, priority, trace]);
+  for (const taskType of ['PLAY_ON_DESKTOP', 'PLAY_ON_DESKTOP_V2', 'WATCH_VIDEO', 'WATCH_VIDEO_ON_MOBILE']) {
+    const price = await resolvePrice(pool, { taskType });
+    assert.equal(price.rule_type, 'TYPE');
+    assert.equal(BigInt(price.amount_cents), 500n);
   }
-  const price = await resolvePrice(pool, { questId: 'price-q', taskType: 'WATCH_VIDEO' });
-  assert.equal(price.rule_type, 'TEMPORARY');
-  assert.equal(BigInt(price.amount_cents), 700n);
+});
+
+test('changing GAME price is atomic, versioned, and never changes VIDEO', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const before = (await pool.query(`SELECT task_type,state_version FROM price_rules
+    WHERE enabled=true AND rule_type='TYPE' AND task_type IN ('PLAY_ON_DESKTOP','PLAY_ON_DESKTOP_V2')`)).rows;
+  const context = createContext({ actorType: 'ADMIN', actorId: 'price-admin', guildId: 'guild',
+    idempotencyKey: `category-price:${uuidv7()}` });
+  await setQuestCategoryPrice({ category: 'GAME', amountCents: 750n,
+    expectedVersions: Object.fromEntries(before.map((row) => [row.task_type, String(row.state_version)])) }, context, { pool });
+  for (const taskType of ['PLAY_ON_DESKTOP', 'PLAY_ON_DESKTOP_V2']) {
+    assert.equal(BigInt((await resolvePrice(pool, { taskType })).amount_cents), 750n);
+  }
+  for (const taskType of ['WATCH_VIDEO', 'WATCH_VIDEO_ON_MOBILE']) {
+    assert.equal(BigInt((await resolvePrice(pool, { taskType })).amount_cents), 500n);
+  }
+  const active = await pool.query(`SELECT task_type,count(*)::integer AS count FROM price_rules
+    WHERE enabled=true AND rule_type='TYPE' GROUP BY task_type`);
+  assert.ok(active.rows.every((row) => row.count === 1));
+});
+
+test('legacy default, Quest and temporary price rows never override the two category prices', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  await pool.query(`INSERT INTO price_rules(id,rule_type,amount_cents,priority,enabled,config_version,actor_id,trace_id)
+    VALUES($1,'DEFAULT',1,999,true,1,'test',$2)`, [uuidv7(), uuidv7()]);
+  await pool.query(`INSERT INTO price_rules(id,rule_type,quest_id,amount_cents,priority,enabled,config_version,actor_id,trace_id)
+    VALUES($1,'QUEST','legacy-quest',1,999,true,1,'test',$2)`, [uuidv7(), uuidv7()]);
+  await pool.query(`INSERT INTO price_rules(id,rule_type,task_type,amount_cents,priority,enabled,config_version,actor_id,trace_id)
+    VALUES($1,'TEMPORARY','WATCH_VIDEO',1,999,true,1,'test',$2)`, [uuidv7(), uuidv7()]);
+  assert.equal(BigInt((await resolvePrice(pool, { taskType: 'WATCH_VIDEO' })).amount_cents), 500n);
 });
 
 test('promotion selects highest tier, rounds half-up, caps daily bonus and enforces user limit', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const promotionId = uuidv7(); const trace = uuidv7(); const user = '10000000000000123';
-  await pool.query(`INSERT INTO promotions(id,version,name,state,starts_at,ends_at,max_uses_per_user,
-    max_bonus_per_day_cents,actor_id,trace_id) VALUES($1,1,'tiers','ACTIVE',clock_timestamp()-interval '1 day',
-    clock_timestamp()+interval '1 day',2,5000,'test',$2)`, [promotionId, trace]);
+  await pool.query(`INSERT INTO promotions(id,version,name,state,starts_at,ends_at,manual_controlled,max_uses_per_user,
+    max_bonus_per_day_cents,actor_id,trace_id) VALUES($1,1,'internal-version','ACTIVE',NULL,NULL,true,2,5000,'test',$2)`, [promotionId, trace]);
   for (const [minimum, points] of [[10_000, 1000], [30_000, 1500], [60_000, 2000]]) {
     await pool.query(`INSERT INTO promotion_tiers(id,promotion_id,minimum_amount_cents,basis_points)
       VALUES($1,$2,$3,$4)`, [uuidv7(), promotionId, minimum, points]);
