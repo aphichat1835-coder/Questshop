@@ -1522,15 +1522,11 @@ async function handleDlqPick({ interaction, route, runtime, gates: _gates }) {
     payload: { dlqId: item.id }, configVersion: runtime.config.version },
   contextFor(interaction, 'dlq_detail_session'), { pool: runtime.pool });
   const discardAllowed = !['FINANCIAL', 'AUDIT'].includes(item.category) && interaction.user.id === runtime.env.OWNER_ID;
-  const categoryLabel = dlqCategoryLabel(item.category);
-  const sourceLabel = dlqSourceLabel(item.source_type);
-  const errorLabel = item.error_code ? 'ระบบบันทึกรายละเอียดข้อผิดพลาดไว้แล้ว' : 'ไม่ระบุ';
   const description = [
-    `ประเภท: **${categoryLabel}** / ${sourceLabel}`,
-    `สถานะ: **${displayState(item.state)}**`,
-    `สาเหตุล่าสุด: ${errorLabel}`,
-    `สร้างเมื่อ: <t:${Math.floor(new Date(item.created_at).getTime() / 1000)}:R>`,
-    ['FINANCIAL', 'AUDIT'].includes(item.category) ? 'รายการนี้เกี่ยวข้องกับเงินหรือ Audit จึงปิดทิ้งไม่ได้' : 'Owner สามารถปิดทิ้งได้เมื่อยืนยันว่าไม่ต้อง Retry',
+    '**รายละเอียดงานค้าง**',
+    'ระบบตรวจสอบสิทธิ์และสถานะของรายการนี้แล้ว',
+    'เลือกลองส่งใหม่เพื่อให้ระบบสร้าง Attempt ใหม่ หรือปิดงานเมื่อยืนยันว่าไม่ต้องดำเนินการต่อ',
+    'รายการการเงินและ Audit จะไม่สามารถปิดทิ้งได้',
   ].join('\n');
   return interaction.editReply({ content: description, components: [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(customId('dlq_replay', detail.id)).setLabel('ลองส่งงานนี้ใหม่').setStyle(ButtonStyle.Primary)
