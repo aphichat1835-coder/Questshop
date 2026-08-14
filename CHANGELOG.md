@@ -70,6 +70,9 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
 
 ### Changed
 
+- Admin audit JSONB writes now serialize arrays and `BIGINT` satang values safely. Schema compatibility now requires
+  migration 0026, and the Admin router no longer renders raw DLQ provider/error fields into Discord content.
+
 - Simplified the Admin panel to nine operational categories. Normal store functions now start enabled automatically;
   the retired global gate, manual Quest sale, manual blocklist, backup, branding and key-status panels no longer
   appear. Incident recovery remains scoped to the affected subsystem.

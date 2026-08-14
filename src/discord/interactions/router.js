@@ -96,6 +96,14 @@ function breakerStateLabel(value) {
   return { CLOSED: 'เปิดทำงานปกติ', OPEN: 'หยุดรับรายการอัตโนมัติ', HALF_OPEN: 'กำลังทดสอบการกลับมาใช้งาน' }[value]
     ?? 'กำลังตรวจสอบ';
 }
+function dlqCategoryLabel(category) {
+  if (category === 'FINANCIAL') return 'การเงิน';
+  if (category === 'AUDIT') return 'บันทึก Audit';
+  return 'งานระบบ';
+}
+function dlqSourceLabel(sourceType) {
+  return sourceType === 'OUTBOX' ? 'Discord' : 'Worker';
+}
 function websocketPing(client) {
   const ping = client.ws?.ping;
   return Number.isFinite(ping) && ping >= 0 ? `${ping} ms` : 'กำลังเชื่อมต่อ';
@@ -205,12 +213,13 @@ function listRows(rows, formatter, empty = 'ไม่มี') {
 }
 
 function deadLetterLine(row) {
-  return `• \`${row.id}\` • ${row.category === 'FINANCIAL' ? 'เกี่ยวกับเงิน' : 'การแจ้งเตือนทั่วไป'} • ${displayState(row.state)} • รหัสตรวจสอบ \`${row.error_code ?? 'ไม่ระบุ'}\``;
+  const errorStatus = row.error_code ? 'มีรายละเอียดข้อผิดพลาด' : 'ไม่มีรหัสข้อผิดพลาด';
+  return `• ${dlqCategoryLabel(row.category)} • ${displayState(row.state)} • ${errorStatus}`;
 }
 
 function incidentLine(row) {
   const severity = { CRITICAL: 'วิกฤต', HIGH: 'รุนแรง', WARNING: 'เฝ้าระวัง', INFO: 'แจ้งข้อมูล' }[row.severity] ?? 'ตรวจสอบ';
-  return `• ${severity} • **${row.scope ?? 'ระบบ'}** • รหัสตรวจสอบ \`${row.incident_code}\``;
+  return `• ${severity} • มีเหตุขัดข้องที่ต้องตรวจสอบ`;
 }
 
 function dlqSummary(dlq, incidents) {
@@ -266,8 +275,8 @@ async function renderPricingPanel(interaction, runtime) {
     ORDER BY task_type,created_at DESC`)).rows;
   const byType = new Map(rows.map((row) => [row.task_type, row]));
   const categoryLine = (category) => {
-    const rules = QUEST_PRICE_CATEGORIES[category].map((taskType) => byType.get(taskType)).filter(Boolean);
-    const amount = rules[0]?.amount_cents ?? 500;
+    const rule = QUEST_PRICE_CATEGORIES[category].map((taskType) => byType.get(taskType)).find(Boolean);
+    const amount = rule?.amount_cents ?? 500;
     return `• **${category === 'GAME' ? 'Quest เล่นเกม' : 'Quest ดูวิดีโอ'}** — ${money(amount)}`;
   };
   return adminReply(interaction, 'pricing', { embeds: [panelEmbed(0x5865f2, 'ราคาทำ Quest',
@@ -288,9 +297,16 @@ async function renderPromotionsPanel(interaction, runtime) {
   const tierText = tiers.length
     ? tiers.map((tier) => `${money(tier.minimum_amount_cents)} = ${(Number(tier.basis_points) / 100).toFixed(2)}%`).join('\n')
     : 'ยังไม่ได้ตั้งโบนัสเติมเงิน';
-  const description = promotion
-    ? `สถานะ: **${promotion.state === 'ACTIVE' ? 'เปิดใช้งาน' : 'ปิดอยู่'}**\n${tierText}\n\nจำกัดต่อผู้ใช้ตลอดรุ่นนี้: **${promotion.max_uses_per_user ?? 'ไม่จำกัด'} ครั้ง**\nโบนัสสูงสุดต่อผู้ใช้ต่อวัน: **${promotion.max_bonus_per_day_cents == null ? 'ไม่จำกัด' : money(promotion.max_bonus_per_day_cents)}**`
-    : tierText;
+  const status = promotion?.state === 'ACTIVE' ? 'เปิดใช้งาน' : 'ปิดอยู่';
+  const userLimit = promotion?.max_uses_per_user ?? 'ไม่จำกัด';
+  const dailyBonusLimit = promotion?.max_bonus_per_day_cents == null
+    ? 'ไม่จำกัด'
+    : money(promotion.max_bonus_per_day_cents);
+  const description = promotion ? [
+    `สถานะ: **${status}**`, tierText, '',
+    `จำกัดต่อผู้ใช้ตลอดรุ่นนี้: **${userLimit} ครั้ง**`,
+    `โบนัสสูงสุดต่อผู้ใช้ต่อวัน: **${dailyBonusLimit}**`,
+  ].join('\n') : tierText;
   return adminReply(interaction, 'promotions', { embeds: [panelEmbed(0x5865f2, 'โบนัสเติมเงิน', description)],
   components: [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(customId('promo_set')).setLabel(promotion ? 'แก้โบนัสเติมเงิน' : 'ตั้งโบนัสเติมเงิน').setStyle(ButtonStyle.Primary),
@@ -452,8 +468,12 @@ async function renderOrdersPanel(interaction, runtime, offset = 0) {
         .setDisabled(offset + pageSize >= total),
     ));
   }
+  const itemSummary = listRows(items,
+    (item) => `• **${escapedText(item.quest_name)}** • ${orderStateLabel(item.state)} • ${item.progress_bucket}%`,
+    'ไม่มีงาน Quest ที่กำลังดำเนินการ');
+  const pageSummary = `หน้า ${Math.floor(offset / pageSize) + 1} • ทั้งหมด ${total} งาน`;
   return adminReply(interaction, 'orders', { embeds: [panelEmbed(0x5865f2, 'งานลูกค้าและคิว',
-    `${listRows(items, (item) => `• **${item.quest_name}** • ${orderStateLabel(item.state)} • ${item.progress_bucket}%`, 'ไม่มีงาน Quest ที่กำลังดำเนินการ')}\n\nหน้า ${Math.floor(offset / pageSize) + 1} • ทั้งหมด ${total} งาน`)],
+    [itemSummary, pageSummary].join('\n\n'))],
   components: actionRows });
 }
 
@@ -472,7 +492,7 @@ async function renderDlqPanel(interaction, runtime) {
     controls.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
       .setCustomId(customId('dlq_pick', session.id)).setPlaceholder('เลือกรายการปัญหาเพื่อดูและจัดการ')
       .addOptions(dlq.map((item) => ({
-        label: `${item.category} • ${item.source_type}`.slice(0, 100), value: item.id,
+        label: `${dlqCategoryLabel(item.category)} • ${dlqSourceLabel(item.source_type)}`.slice(0, 100), value: item.id,
         description: `${displayState(item.state)} • ${String(item.id).slice(0, 8)}`.slice(0, 100),
       })))));
   }
@@ -480,8 +500,11 @@ async function renderDlqPanel(interaction, runtime) {
     controls.push(new ActionRowBuilder().addComponents(new ButtonBuilder()
       .setCustomId(customId('breaker_prepare')).setLabel('ตรวจสอบและเปิดระบบรับซองอีกครั้ง').setStyle(ButtonStyle.Danger)));
   }
-  return adminReply(interaction, 'dlq', { embeds: [panelEmbed(0xf23f43, 'ปัญหาที่ต้องจัดการ',
-    `${dlqSummary(dlq, activeIncidents)}${breaker?.state === 'OPEN' ? `\n\n**ระบบรับซอง:** ${breakerStateLabel(breaker.state)}` : ''}`)], components: controls });
+  const breakerSummary = breaker?.state === 'OPEN'
+    ? `**ระบบรับซอง:** ${breakerStateLabel(breaker.state)}`
+    : null;
+  const description = [dlqSummary(dlq, activeIncidents), breakerSummary].filter(Boolean).join('\n\n');
+  return adminReply(interaction, 'dlq', { embeds: [panelEmbed(0xf23f43, 'ปัญหาที่ต้องจัดการ', description)], components: controls });
 }
 
 async function renderOverviewPanel(interaction, runtime) {
@@ -1444,7 +1467,9 @@ if (route.route === 'monitor_toggle' && interaction.isButton()) {
 }
 
 async function handleDlqAction({ interaction, route, runtime, gates: _gates }) {
-if (!['dlq_replay', 'dlq_discard'].includes(route.route) || !interaction.isButton()) return;
+  if (!['dlq_replay', 'dlq_discard'].includes(route.route) || !interaction.isButton()) {
+    return;
+  }
   const replay = route.route === 'dlq_replay';
   if (!replay && interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'การปิดงานค้างใช้ได้เฉพาะเจ้าของร้าน');
   const selected = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
@@ -1480,7 +1505,9 @@ if (['dlq_replay_submit', 'dlq_discard_submit'].includes(route.route) && interac
 }
 
 async function handleDlqPick({ interaction, route, runtime, gates: _gates }) {
-if (route.route !== 'dlq_pick' || !interaction.isStringSelectMenu()) return;
+  if (route.route !== 'dlq_pick' || !interaction.isStringSelectMenu()) {
+    return;
+  }
   await interaction.deferReply({ ephemeral: true });
   const selection = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'DLQ_SELECT' },
@@ -1495,10 +1522,13 @@ if (route.route !== 'dlq_pick' || !interaction.isStringSelectMenu()) return;
     payload: { dlqId: item.id }, configVersion: runtime.config.version },
   contextFor(interaction, 'dlq_detail_session'), { pool: runtime.pool });
   const discardAllowed = !['FINANCIAL', 'AUDIT'].includes(item.category) && interaction.user.id === runtime.env.OWNER_ID;
+  const categoryLabel = dlqCategoryLabel(item.category);
+  const sourceLabel = dlqSourceLabel(item.source_type);
+  const errorLabel = item.error_code ? 'ระบบบันทึกรายละเอียดข้อผิดพลาดไว้แล้ว' : 'ไม่ระบุ';
   const description = [
-    `ประเภท: **${escapedText(item.category)}** / ${escapedText(item.source_type)}`,
-    `สถานะ: **${displayState(item.state)}**`, `รหัสรายการ: \`${item.id}\``,
-    `สาเหตุล่าสุด: ${escapedText(item.error_code ?? 'ไม่ระบุ')}`,
+    `ประเภท: **${categoryLabel}** / ${sourceLabel}`,
+    `สถานะ: **${displayState(item.state)}**`,
+    `สาเหตุล่าสุด: ${errorLabel}`,
     `สร้างเมื่อ: <t:${Math.floor(new Date(item.created_at).getTime() / 1000)}:R>`,
     ['FINANCIAL', 'AUDIT'].includes(item.category) ? 'รายการนี้เกี่ยวข้องกับเงินหรือ Audit จึงปิดทิ้งไม่ได้' : 'Owner สามารถปิดทิ้งได้เมื่อยืนยันว่าไม่ต้อง Retry',
   ].join('\n');

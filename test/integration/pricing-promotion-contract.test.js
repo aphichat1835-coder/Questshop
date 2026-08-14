@@ -68,6 +68,7 @@ test('changing GAME price is atomic, versioned, and never changes VIDEO', async 
 
 test('legacy default, Quest and temporary price rows never override the two category prices', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  await pool.query("INSERT INTO quests(quest_id,analysis_state) VALUES('legacy-quest','DETECTED')");
   await pool.query(`INSERT INTO price_rules(id,rule_type,amount_cents,priority,enabled,config_version,actor_id,trace_id)
     VALUES($1,'DEFAULT',1,999,true,1,'test',$2)`, [uuidv7(), uuidv7()]);
   await pool.query(`INSERT INTO price_rules(id,rule_type,quest_id,amount_cents,priority,enabled,config_version,actor_id,trace_id)

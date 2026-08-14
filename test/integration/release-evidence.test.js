@@ -23,8 +23,9 @@ test('pre-launch gate changes preserve an append-only Git-SHA release evidence r
   assert.equal(evidence.git_sha, release.gitSha);
   assert.equal(evidence.prelaunch, true);
   assert.equal(evidence.evidence.enabled, true);
+  const orderGate = (await pool.query("SELECT * FROM feature_gates WHERE gate='ORDER_ACCEPTING'")).rows[0];
   await assert.rejects(() => updateFeatureGate({ gate: 'ORDER_ACCEPTING', enabled: true,
-    expectedVersion: 1, reason: 'missing deploy sha', release: { ...release, gitSha: 'unknown' } }, context, { pool }),
+    expectedVersion: orderGate.version, reason: 'missing deploy sha', release: { ...release, gitSha: 'unknown' } }, context, { pool }),
   (error) => error.code === 'RELEASE_SHA_REQUIRED');
   assert.equal(Number((await pool.query('SELECT count(*) AS count FROM release_evidence')).rows[0].count), 1);
 });
