@@ -1,8 +1,9 @@
 import {
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder, escapeMarkdown,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder,
 } from 'discord.js';
 import { customId } from '../components/custom-id.js';
 import { questTypeLabel, topupStateLabel } from './labels.js';
+import { DISCORD_LIMITS, safeDiscordText, truncateDiscordText } from '../payload.js';
 
 function discordColor(hex) {
   return Number.parseInt(hex, 16);
@@ -28,8 +29,12 @@ export function baht(cents) {
 }
 
 function escape(value, fallback = 'ไม่ระบุ') {
-  return escapeMarkdown(String(value ?? fallback).replaceAll('@', '@\u200b'));
+  return safeDiscordText(value, { fallback, maximum: 1_000 });
 }
+
+const boundedDescription = (value) => truncateDiscordText(value, DISCORD_LIMITS.embedDescription);
+const optionLabel = (value) => truncateDiscordText(value, DISCORD_LIMITS.selectOptionLabel);
+const optionDescription = (value) => truncateDiscordText(value, DISCORD_LIMITS.selectOptionDescription);
 
 function timestamp(value, style = 'R') {
   const millis = new Date(value).getTime();
@@ -39,7 +44,8 @@ function timestamp(value, style = 'R') {
 function safeHttpsUrl(value) {
   try {
     const url = new URL(String(value));
-    return url.protocol === 'https:' ? url.toString() : null;
+    const normalized = url.protocol === 'https:' ? url.toString() : null;
+    return normalized && normalized.length <= 512 ? normalized : null;
   } catch {
     return null;
   }
@@ -54,7 +60,7 @@ function questOptionDescription(row) {
   const orbs = row.orbs == null ? 'ไม่ระบุ Orbs' : `${row.orbs} Orbs`;
   const progress = `${Math.max(0, Math.min(100, Number(row.progress_actual ?? 0))).toFixed(0)}%`;
   const type = row.task_type?.startsWith('PLAY_ON_DESKTOP') ? 'เล่นเกม' : 'ดูวิดีโอ';
-  return `${type} • ${orbs} • ${progress} • ${baht(row.price_cents)}`.slice(0, 100);
+  return optionDescription(`${type} • ${orbs} • ${progress} • ${baht(row.price_cents)}`);
 }
 
 export function renderSelection(page) {
@@ -62,7 +68,7 @@ export function renderSelection(page) {
   const select = new StringSelectMenuBuilder().setCustomId(customId('quest_select', page.session.id))
     .setPlaceholder('เลือก Quest ในหน้านี้').setMinValues(0).setMaxValues(Math.max(1, rows.length));
   if (rows.length) select.addOptions(rows.map((row) => ({
-    label: String(row.quest_name).slice(0, 100), value: row.line_id,
+    label: optionLabel(safeDiscordText(row.quest_name, { maximum: DISCORD_LIMITS.selectOptionLabel })), value: row.line_id,
     description: questOptionDescription(row), default: row.selected,
   })));
   const description = [
@@ -77,7 +83,7 @@ export function renderSelection(page) {
     page.count ? `หน้า **${page.page + 1}/${page.pages}** • เลือกได้หลายรายการ` : 'บัญชีนี้ยังไม่มี Quest ที่ระบบรับทำได้ในขณะนี้',
   ].join('\n');
   const embed = new EmbedBuilder().setColor(COLOR.primary).setTitle('เลือก Quest ที่ต้องการ')
-    .setDescription(description).setFooter({ text: 'ระบบจะตรวจราคา สถานะ และเวลาคงเหลืออีกครั้งก่อนยืนยัน' });
+    .setDescription(boundedDescription(description)).setFooter({ text: 'ระบบจะตรวจราคา สถานะ และเวลาคงเหลืออีกครั้งก่อนยืนยัน' });
   const avatarUrl = safeHttpsUrl(page.session.payload.avatarUrl);
   if (avatarUrl) embed.setThumbnail(avatarUrl);
   const selectionComponents = rows.length
@@ -119,7 +125,7 @@ export function renderQuote(quote) {
     `**ยอดพร้อมใช้หลังยืนยัน:** ${walletAfter(quote.walletAvailableCents, quote.totalCents)}`,
   ].join('\n');
   const embed = new EmbedBuilder().setColor(COLOR.success).setTitle('ตรวจสอบและยืนยันรายการ')
-    .setDescription(description.slice(0, 4096))
+    .setDescription(boundedDescription(description))
     .setFooter({ text: 'สำเร็จจึงคิดค่าบริการ • ล้มเหลวจะคืนเครดิตของ Quest นั้นอัตโนมัติ' });
   const avatarUrl = safeHttpsUrl(quote.session.payload.avatarUrl);
   if (avatarUrl) embed.setThumbnail(avatarUrl);
@@ -149,7 +155,7 @@ export function renderOrderConfirmation(result, historyLink) {
     'ระบบจะคิดค่าบริการเฉพาะ Quest ที่สำเร็จ และคืนเครดิตของ Quest ที่ล้มเหลวโดยอัตโนมัติ',
   ].join('\n');
   const embed = new EmbedBuilder().setColor(COLOR.success).setTitle('✅ รับรายการเรียบร้อยแล้ว')
-    .setDescription(description).setFooter({ text: 'เก็บ Order ID ไว้สำหรับติดต่อ Support' });
+    .setDescription(boundedDescription(description)).setFooter({ text: 'เก็บ Order ID ไว้สำหรับติดต่อ Support' });
   const avatarUrl = safeHttpsUrl(result.order?.account_avatar_url);
   if (avatarUrl) embed.setThumbnail(avatarUrl);
   const components = historyLink
@@ -161,7 +167,7 @@ export function renderOrderConfirmation(result, historyLink) {
 
 export function renderPaymentMethod(walletAvailableCents, sessionId) {
   const embed = new EmbedBuilder().setColor(COLOR.primary).setTitle('เติมเครดิต Questshop')
-    .setDescription(`**ยอดคงเหลือปัจจุบัน:** ${baht(walletAvailableCents)}\n\nเลือกช่องทางการชำระเงินด้านล่าง`)
+    .setDescription(boundedDescription(`**ยอดคงเหลือปัจจุบัน:** ${baht(walletAvailableCents)}\n\nเลือกช่องทางการชำระเงินด้านล่าง`))
     .setFooter({ text: 'ขณะนี้รองรับ TrueMoney Gift แบบซองผู้รับคนเดียว' });
   const select = new StringSelectMenuBuilder().setCustomId(customId('payment_method', sessionId))
     .setPlaceholder('เลือกช่องทางเติมเครดิต')
@@ -171,7 +177,7 @@ export function renderPaymentMethod(walletAvailableCents, sessionId) {
 
 export function renderTopupProcessing(topupId) {
   return { embeds: [new EmbedBuilder().setColor(COLOR.warning).setTitle('⏳ กำลังตรวจสอบซอง')
-    .setDescription(`ระบบรับรายการแล้วและกำลังตรวจสอบกับ TrueMoney\n\n**Top-up ID:** \`${topupId}\`\nกรุณารอสักครู่ ไม่ต้องส่งซองซ้ำ`)],
+    .setDescription(boundedDescription(`ระบบรับรายการแล้วและกำลังตรวจสอบกับ TrueMoney\n\n**Top-up ID:** \`${escape(topupId)}\`\nกรุณารอสักครู่ ไม่ต้องส่งซองซ้ำ`))],
   components: [], allowedMentions: noMentions };
 }
 
@@ -200,21 +206,21 @@ export function renderTopupResult(topup) {
     ];
     if (topup.promotion_name) lines.splice(4, 0, `**โปรโมชั่น:** ${escape(topup.promotion_name)}`);
     return { embeds: [new EmbedBuilder().setColor(COLOR.success).setTitle('✅ เติมเครดิตสำเร็จ')
-      .setDescription(lines.join('\n')).setFooter({ text: 'ใบเสร็จฉบับเต็มจะส่งทาง DM อีกครั้ง' })],
+      .setDescription(boundedDescription(lines.join('\n'))).setFooter({ text: 'ใบเสร็จฉบับเต็มจะส่งทาง DM อีกครั้ง' })],
     components: [], allowedMentions: noMentions };
   }
   if (['AMBIGUOUS', 'MANUAL_REVIEW', 'REDEEMED'].includes(topup.status)) {
     const received = topup.status === 'REDEEMED' ? '\nระบบรับเงินจากซองแล้ว แต่ยังเพิ่มเครดิตไม่เสร็จ' : '';
     return { embeds: [new EmbedBuilder().setColor(COLOR.warning).setTitle('🟠 กำลังตรวจสอบรายการ')
-      .setDescription(`**สถานะ:** ${topupStateLabel(topup.status)}${received}\n**Top-up ID:** \`${topup.id}\`\n\nห้ามส่งซองเดิมซ้ำ เจ้าของร้านจะตรวจสอบหลักฐานและดำเนินการต่อ`)],
+      .setDescription(boundedDescription(`**สถานะ:** ${topupStateLabel(topup.status)}${received}\n**Top-up ID:** \`${escape(topup.id)}\`\n\nห้ามส่งซองเดิมซ้ำ เจ้าของร้านจะตรวจสอบหลักฐานและดำเนินการต่อ`))],
     components: [], allowedMentions: noMentions };
   }
   if (['INVALID', 'EXPIRED', 'ALREADY_REDEEMED', 'FAILED', 'REJECTED', 'REVERSED'].includes(topup.status)) {
     return { embeds: [new EmbedBuilder().setColor(COLOR.danger).setTitle('❌ เติมเครดิตไม่สำเร็จ')
-      .setDescription(`**สถานะ:** ${topupStateLabel(topup.status)}\n**Top-up ID:** \`${topup.id}\`\n\n${topupFailureDescription(topup)}`)],
+      .setDescription(boundedDescription(`**สถานะ:** ${topupStateLabel(topup.status)}\n**Top-up ID:** \`${escape(topup.id)}\`\n\n${topupFailureDescription(topup)}`))],
     components: [], allowedMentions: noMentions };
   }
   return { embeds: [new EmbedBuilder().setColor(COLOR.warning).setTitle('⏳ ระบบยังดำเนินการอยู่')
-    .setDescription(`**สถานะ:** ${topupStateLabel(topup.status)}\n**Top-up ID:** \`${topup.id}\`\n\nคุณปิดข้อความนี้ได้ ระบบยังทำงานต่อและจะส่งใบเสร็จทาง DM เมื่อเสร็จ`)],
+    .setDescription(boundedDescription(`**สถานะ:** ${topupStateLabel(topup.status)}\n**Top-up ID:** \`${escape(topup.id)}\`\n\nคุณปิดข้อความนี้ได้ ระบบยังทำงานต่อและจะส่งใบเสร็จทาง DM เมื่อเสร็จ`))],
   components: [], allowedMentions: noMentions };
 }

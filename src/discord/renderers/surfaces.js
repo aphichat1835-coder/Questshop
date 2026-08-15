@@ -3,14 +3,23 @@ import {
 } from 'discord.js';
 import { customId } from '../components/custom-id.js';
 import { adminCategoryOptions } from './admin.js';
+import { DISCORD_LIMITS, truncateDiscordText } from '../payload.js';
 
 const COLORS = Object.freeze({ primary: 0x5865f2, success: 0x23a55a, warning: 0xf0b232, danger: 0xf23f43 });
 
+function safeHttpsUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'https:' && url.toString().length <= 512 ? url.toString() : null;
+  } catch { return null; }
+}
+
 export function renderQuestAuto(config = {}) {
   const embed = new EmbedBuilder().setColor(COLORS.primary)
-    .setTitle(config.title ?? 'Discord Quest — ทำเควสอัตโนมัติ')
-    .setDescription(config.description ?? 'เติมเครดิต เลือก Quest ที่ต้องการ แล้วติดตามความคืบหน้าได้อัตโนมัติ\nระบบคิดค่าบริการเฉพาะ Quest ที่ทำสำเร็จเท่านั้น');
-  if (config.mediaUrl) embed.setImage(config.mediaUrl);
+    .setTitle(truncateDiscordText(config.title ?? 'Discord Quest — ทำเควสอัตโนมัติ', DISCORD_LIMITS.embedTitle))
+    .setDescription(truncateDiscordText(config.description ?? 'เติมเครดิต เลือก Quest ที่ต้องการ แล้วติดตามความคืบหน้าได้อัตโนมัติ\nระบบคิดค่าบริการเฉพาะ Quest ที่ทำสำเร็จเท่านั้น', DISCORD_LIMITS.embedDescription));
+  const mediaUrl = safeHttpsUrl(config.mediaUrl);
+  if (mediaUrl) embed.setImage(mediaUrl);
   return {
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(
@@ -41,7 +50,7 @@ export function renderSurfaceAnchor(surfaceKey, config = {}) {
     LOG_QUEST_OPERATIONS: 'บันทึกการทำ Quest', LOG_ADMIN: 'บันทึกการทำงานของแอดมิน', LOG_SYSTEM: 'เหตุขัดข้องของระบบ',
   };
   return {
-    embeds: [new EmbedBuilder().setColor(COLORS.primary).setTitle(names[surfaceKey] ?? surfaceKey)
+    embeds: [new EmbedBuilder().setColor(COLORS.primary).setTitle(truncateDiscordText(names[surfaceKey] ?? surfaceKey, DISCORD_LIMITS.embedTitle))
       .setDescription('Questshop ดูแลข้อความในห้องนี้และกู้การแจ้งเตือนที่ค้างอยู่ให้อัตโนมัติหลังระบบเริ่มใหม่')],
     allowedMentions: { parse: [] },
   };

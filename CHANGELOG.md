@@ -70,6 +70,23 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
 
 ### Changed
 
+- Discord interaction routing is now governed by one explicit contract per persistent route (audience, component
+  type and customer gate). Backoffice actions remain usable while customer intake is closed, forged component types
+  fail closed, and long non-modal actions acknowledge before database or provider work.
+- Surface setup, reconciliation and Outbox delivery share Discord error classification: only a confirmed `404/10008`
+  permits anchor replacement. Permission, rate-limit, server and network failures preserve the existing pointer and
+  retry/incident evidence instead of creating duplicate messages. Surface markers are searched in bounded pages and
+  all eight deterministic nonces fit Discord's 25-character limit.
+- Discord renderers now apply common content/embed/select/component limits and escape untrusted dynamic text before
+  it reaches Builder validation. Payment Log retains the Owner-required full voucher link and renders it before
+  optional long details.
+- Multi-step Admin flows advance their durable session by atomically terminalizing the parent before creating the
+  child, preventing replay/double-click reuse while retaining confirmation and financial idempotency checks.
+
+- Surface setup and reconciliation now use Discord-compatible deterministic nonces, force-fetch their stored anchor,
+  and recreate only on a confirmed `Unknown Message`. A replacement atomically updates the stored message ID, while
+  permission and network failures still surface instead of risking a duplicate panel.
+
 - Admin audit JSONB writes now serialize arrays and `BIGINT` satang values safely. Schema compatibility now requires
   migration 0026, and the Admin router no longer renders raw DLQ provider/error fields into Discord content.
 

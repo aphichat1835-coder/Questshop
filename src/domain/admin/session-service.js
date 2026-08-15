@@ -13,6 +13,37 @@ export async function createAdminSession({ actorId, guildId, channelId, messageI
   ));
 }
 
+export async function advanceAdminSession({
+  parentSession,
+  actorId,
+  guildId,
+  child,
+}, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {
+    const current = (await client.query(`SELECT *,expires_at>clock_timestamp() AS fresh
+      FROM interaction_sessions WHERE id=$1 FOR UPDATE`,
+      [parentSession.id])).rows[0];
+    if (!current?.fresh || current.actor_id !== actorId || current.guild_id !== guildId || current.state !== 'ACTIVE'
+      || Number(current.state_version) !== Number(parentSession.state_version)) {
+      throw new QuestshopError('STALE_SESSION', 'เซสชันถูกใช้หรือหมดอายุแล้ว');
+    }
+    const terminated = (await client.query(`UPDATE interaction_sessions SET state='TERMINAL',
+        state_version=state_version+1,updated_at=clock_timestamp()
+        WHERE id=$1 AND state='ACTIVE' AND state_version=$2 RETURNING *`,
+    [current.id, current.state_version])).rows[0];
+    if (!terminated) throw new QuestshopError('STALE_SESSION', 'เซสชันถูกแก้ไขระหว่างดำเนินการ');
+    await recordTransition(client, { aggregateType: 'INTERACTION_SESSION', aggregateId: current.id,
+      fromState: current.state, toState: terminated.state, stateVersion: terminated.state_version, context });
+    const next = (await client.query(`INSERT INTO interaction_sessions(id,actor_id,guild_id,channel_id,message_id,
+        operation,config_version,payload,trace_id,expires_at)
+      VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp()+make_interval(mins=>$9)) RETURNING *`, [
+      actorId, guildId, child.channelId, child.messageId ?? null, child.operation,
+      child.configVersion, child.payload ?? {}, context.traceId, child.ttlMinutes ?? 5,
+    ])).rows[0];
+    return next;
+  });
+}
+
 export async function loadAdminSession({ sessionId, actorId, guildId, channelId = null,
   messageId = null, operation }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {

@@ -4,16 +4,17 @@ import { renderProjection } from '../discord/renderers/projections.js';
 import { FencingLostError } from '../shared/errors.js';
 import { recordTransition } from '../domain/shared/transition.js';
 import { setTimeout as delay } from 'node:timers/promises';
+import { discordErrorKind, fetchDiscordMessage, findDiscordMessageByNonce } from '../discord/transport.js';
 
 const BACKOFF = [1, 5, 15, 60, 300, 900];
 
 function errorDetails(error) {
-  const status = Number(error.status);
-  const code = Number(error.code);
+  const kind = discordErrorKind(error);
+  const code = Number(error?.code);
   return {
-    forbidden: status === 403 || code === 50013,
-    missing: status === 404 || error.code === 'DISCORD_404' || [10003, 10008].includes(code),
-    missingChannel: error.code === 'DISCORD_404' || code === 10003,
+    forbidden: kind === 'FORBIDDEN',
+    missing: kind === 'MISSING',
+    missingChannel: error?.code === 'DISCORD_404' || code === 10003,
   };
 }
 
@@ -180,24 +181,18 @@ async function applyQuestAnnouncementPing(pool, projection, body) {
   return true;
 }
 
-async function findMessageByNonce(channel, nonce) {
-  const messages = await channel.messages.fetch({ limit: 25 }).catch(() => null);
-  if (!messages?.values) return null;
-  return [...messages.values()].find((message) => String(message.nonce ?? '') === String(nonce)) ?? null;
-}
-
-async function publishProjection(channel, projection, body) {
-  const message = projection.message_id ? await channel.messages.fetch(projection.message_id).catch(() => null) : null;
+export async function publishProjection(channel, projection, body) {
+  const message = projection.message_id ? await fetchDiscordMessage(channel, projection.message_id) : null;
   if (message) return message.edit(body);
   // `send` can fail after Discord accepted the create.  Reconcile by the
   // stable nonce before creating, and once more after an unknown result, so a
   // retry does not fill a durable projection with duplicate messages.
-  const existing = await findMessageByNonce(channel, projection.nonce);
+  const existing = await findDiscordMessageByNonce(channel, projection.nonce, { maximum: 100 });
   if (existing) return existing;
   try {
     return await channel.send({ ...body, nonce: projection.nonce, enforceNonce: true });
   } catch (error) {
-    const reconciled = await findMessageByNonce(channel, projection.nonce);
+    const reconciled = await findDiscordMessageByNonce(channel, projection.nonce, { maximum: 100 });
     if (reconciled) return reconciled;
     throw error;
   }

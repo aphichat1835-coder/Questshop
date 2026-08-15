@@ -3,14 +3,19 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createTestPool } from '../fixtures/postgres.js';
 import { customId, parseCustomId } from '../../src/discord/components/custom-id.js';
-import { authorizeRoute } from '../../src/discord/interactions/router.js';
 import {
+  ROUTE_HANDLERS, authorizeRoute, formatInteractionError, interactionMatchesContract,
+} from '../../src/discord/interactions/router.js';
+import { ADMIN, CUSTOMER, OWNER, ROUTE_CONTRACTS, routeContract } from '../../src/discord/interactions/contracts.js';
+import {
+  advanceAdminSession,
   bindSessionMessage,
   createAdminSession,
   loadAdminSession,
   terminateAdminSession,
 } from '../../src/domain/admin/session-service.js';
 import { createContext } from '../../src/shared/correlation.js';
+import { QuestshopError } from '../../src/shared/errors.js';
 import { expireSessions } from '../../src/domain/checkout/service.js';
 
 let pool;
@@ -23,6 +28,61 @@ test('component custom IDs are versioned opaque and reject forged input', () => 
   assert.equal(parseCustomId(value).route, 'quest_confirm');
   assert.equal(parseCustomId('qs:v2:quest_confirm:not-a-session'), null);
   assert.equal(parseCustomId('qs:v1:../../admin:00000000-0000-0000-0000-000000000000'), null);
+});
+
+test('every persistent route has an explicit audience and valid interaction contract', () => {
+  assert.deepEqual(Object.keys(ROUTE_CONTRACTS).sort(), Object.keys(ROUTE_HANDLERS).sort());
+  for (const [route, definition] of Object.entries(ROUTE_CONTRACTS)) {
+    assert.ok([CUSTOMER, ADMIN, OWNER].includes(definition.access), `${route} has an audience`);
+    assert.ok(['BUTTON', 'STRING_SELECT', 'USER_SELECT', 'MODAL_SUBMIT'].includes(definition.interaction), `${route} has interaction type`);
+    assert.ok(['REPLY', 'UPDATE', 'MODAL'].includes(definition.response), `${route} has acknowledgement shape`);
+  }
+  assert.equal(routeContract('payment_review_pick').access, ADMIN);
+  assert.equal(routeContract('orders_page').access, ADMIN);
+  assert.equal(routeContract('topup_review_credit').access, OWNER);
+  assert.equal(routeContract('admin_refresh_overview').access, ADMIN);
+});
+
+test('a forged custom ID cannot change a route component type', () => {
+  const button = {
+    isButton: () => true,
+    isStringSelectMenu: () => false,
+    isUserSelectMenu: () => false,
+    isModalSubmit: () => false,
+  };
+  assert.equal(interactionMatchesContract(button, ROUTE_CONTRACTS.quest_confirm.interaction), true);
+  assert.equal(interactionMatchesContract(button, ROUTE_CONTRACTS.payment_review_pick.interaction), false);
+  assert.equal(interactionMatchesContract(button, ROUTE_CONTRACTS.voucher_submit.interaction), false);
+});
+
+test('backoffice route stays available when customer store gates are closed', async () => {
+  const runtime = {
+    env: { PRELAUNCH: false, OWNER_ID: 'owner' },
+    config: { values: { adminRoleId: 'admin-role' }, gates: {
+      STORE_OPEN: false, CUSTOMER_INTERACTIONS_ENABLED: false, TOPUP_ACCEPTING: false, ORDER_ACCEPTING: false,
+    } },
+    pool: { query: async () => ({ rows: [] }) },
+  };
+  const admin = {
+    user: { id: 'admin' }, member: { roles: { cache: { has: (id) => id === 'admin-role' } } },
+    isButton: () => false,
+  };
+  await assert.doesNotReject(() => authorizeRoute(admin, { route: 'payment_review_pick' }, runtime));
+  await assert.rejects(() => authorizeRoute(admin, { route: 'topup_review_credit' }, runtime),
+    (error) => error.code === 'OWNER_ONLY');
+});
+
+test('interaction errors expose only safe business copy and a bounded support code', () => {
+  const internal = new Error('password=not-for-customer postgresql://user:password@db.example/questshop');
+  const rendered = formatInteractionError(internal, '123456789012345678');
+  assert.match(rendered, /เกิดข้อผิดพลาดภายใน/);
+  assert.doesNotMatch(rendered, /postgresql:|password=/i);
+  assert.ok(rendered.length <= 2_000);
+  const safe = formatInteractionError(new QuestshopError('STORE_CLOSED', 'ร้านปิดชั่วคราว'), '123456789012345678');
+  assert.match(safe, /ร้านปิดชั่วคราว/);
+  const invalid = formatInteractionError(new TypeError('internal parser detail'), '123456789012345678');
+  assert.match(invalid, /ข้อมูลที่กรอกไม่ถูกต้อง/);
+  assert.doesNotMatch(invalid, /internal parser detail/);
 });
 
 test('pre-launch keeps customer routes limited to Owner or Admin even when UAT gates are open', async () => {
@@ -104,6 +164,22 @@ test('session message binding and terminal transition are domain-owned compare-a
     WHERE aggregate_type='INTERACTION_SESSION' AND aggregate_id=$1 AND to_state='TERMINAL'`, [session.id])).rows[0].count), 1);
   await assert.rejects(() => terminateAdminSession({ sessionId: session.id, actorId: 'actor-a', guildId: 'guild-a',
     expectedVersion: terminal.state_version }, context, { pool }), (error) => error.code === 'STALE_SESSION');
+});
+
+test('admin session advances parent to terminal before creating one child session', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const context = createContext({ actorType: 'ADMIN', actorId: 'actor-a', guildId: 'guild-a',
+    idempotencyKey: 'session-advance' });
+  const parent = await createAdminSession({ actorId: 'actor-a', guildId: 'guild-a', channelId: 'channel-a',
+    messageId: 'message-a', operation: 'PARENT', payload: {}, configVersion: 1 }, context, { pool });
+  const child = await advanceAdminSession({ parentSession: parent, actorId: 'actor-a', guildId: 'guild-a', child: {
+    channelId: 'channel-a', messageId: 'message-a', operation: 'CHILD', payload: { selected: true }, configVersion: 1,
+  } }, context, { pool });
+  assert.equal(child.operation, 'CHILD');
+  assert.equal((await pool.query('SELECT state FROM interaction_sessions WHERE id=$1', [parent.id])).rows[0].state, 'TERMINAL');
+  await assert.rejects(() => advanceAdminSession({ parentSession: parent, actorId: 'actor-a', guildId: 'guild-a', child: {
+    channelId: 'channel-a', operation: 'SECOND_CHILD', payload: {}, configVersion: 1,
+  } }, context, { pool }), (error) => error.code === 'STALE_SESSION');
 });
 
 test('confirmed checkout sessions and their encrypted credentials are pruned after seven days', async (t) => {

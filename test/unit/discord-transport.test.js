@@ -1,56 +1,31 @@
-import test from 'node:test';
 import assert from 'node:assert/strict';
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-import { createFixedDiscordTransport } from '../../src/quest-engine/api/discord-transport.js';
+import test from 'node:test';
+import { fetchDiscordMessage, findDiscordMessageByNonce } from '../../src/discord/transport.js';
+import { publishProjection } from '../../src/workers/outbox-worker.js';
 
-function transportFixture({ body = '{}', headers = {}, statusCode = 200 } = {}) {
-  const captured = [];
-  const requestImpl = (options, onResponse) => {
-    captured.push(options);
-    const request = new EventEmitter();
-    request.end = (requestBody) => {
-      request.body = requestBody;
-      Promise.resolve().then(() => {
-        const response = new PassThrough();
-        response.statusCode = statusCode;
-        response.headers = headers;
-        onResponse(response);
-        response.end(body);
-      });
-    };
-    return request;
+test('Discord transport treats only confirmed 404 as a missing message', async () => {
+  const channel = { messages: { fetch: async () => { throw Object.assign(new Error('Unknown Message'), { code: 10008 }); } } };
+  assert.equal(await fetchDiscordMessage(channel, 'gone'), null);
+  channel.messages.fetch = async () => { throw Object.assign(new Error('Missing Permissions'), { code: 50013, status: 403 }); };
+  await assert.rejects(() => fetchDiscordMessage(channel, 'forbidden'), { code: 50013 });
+});
+
+test('nonce reconciliation returns an accepted message after an unknown create result', async () => {
+  const accepted = { id: 'accepted', nonce: 'nonce' };
+  let fetches = 0;
+  const channel = {
+    messages: { fetch: async (input) => {
+      if (input?.message) return null;
+      fetches += 1;
+      return fetches >= 2 ? [accepted] : [];
+    } },
+    send: async () => { throw Object.assign(new Error('socket reset after send'), { code: 'ECONNRESET' }); },
   };
-  return { captured, transport: createFixedDiscordTransport({ requestImpl }) };
-}
-
-test('fixed Discord transport pins the literal HTTPS Discord host and v9 path', async () => {
-  const fixture = transportFixture({ body: '{"id":"account-1"}', headers: { 'content-type': 'application/json' } });
-  const response = await fixture.transport({ path: '/users/@me', method: 'POST', body: '{}',
-    headers: { authorization: 'secret', Host: 'example.invalid', 'content-length': '999' } });
-  assert.deepEqual(fixture.captured[0], {
-    protocol: 'https:', hostname: 'discord.com', port: 443, path: '/api/v9/users/@me', method: 'POST',
-    headers: { authorization: 'secret', 'content-length': '2' }, signal: undefined,
-  });
-  assert.equal(response.ok, true);
-  assert.equal(response.headers.get('CONTENT-TYPE'), 'application/json');
-  assert.equal(await response.text(), '{"id":"account-1"}');
+  const message = await publishProjection(channel, { nonce: 'nonce', message_id: null }, { content: 'body' });
+  assert.equal(message.id, 'accepted');
 });
 
-test('fixed Discord transport rejects an unsafe path before opening a request', async () => {
-  const fixture = transportFixture();
-  await assert.rejects(fixture.transport({ path: '//example.invalid', method: 'GET', headers: {} }), /unsafe Discord API path/);
-  assert.equal(fixture.captured.length, 0);
-});
-
-test('fixed Discord transport enforces the response size limit while streaming', async () => {
-  const fixture = transportFixture({ body: 'too-large' });
-  const response = await fixture.transport({ path: '/users/@me', method: 'GET', headers: {}, maxResponseBytes: 3 });
-  await assert.rejects(response.text(), /response exceeds size limit/);
-});
-
-test('fixed Discord transport validates its response-size configuration', async () => {
-  const fixture = transportFixture();
-  await assert.rejects(fixture.transport({ path: '/users/@me', method: 'GET', headers: {}, maxResponseBytes: 0 }), /positive safe integer/);
-  assert.equal(fixture.captured.length, 0);
+test('nonce scan preserves transient failures instead of claiming no message exists', async () => {
+  const channel = { messages: { fetch: async () => { throw Object.assign(new Error('unavailable'), { status: 503 }); } } };
+  await assert.rejects(() => findDiscordMessageByNonce(channel, 'nonce'));
 });

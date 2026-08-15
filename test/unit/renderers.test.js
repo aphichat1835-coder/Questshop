@@ -29,6 +29,16 @@ test('quest-new projection does not expose internal sale state', async () => {
   assert.match(body.embeds[0].data.description, /ดู Quest ได้ที่นี่/);
 });
 
+test('dynamic projection metadata stays inside Discord embed limits', async () => {
+  const long = `ชื่อ Quest ที่ยาวมาก ${'x'.repeat(10_000)}`;
+  const pool = { query: async () => ({ rows: [{ quest_id: 'q', task_type: 'WATCH_VIDEO', task_target: 60,
+    orbs: 10, price_cents: 500, name: long, detected_at: new Date(), updated_at: new Date(),
+    expires_at: new Date(), url: 'https://discord.com/quests/q', sale_state: 'OPEN' }] }) };
+  const body = await renderProjection(pool, { projection_type: 'QUEST_NEW', aggregate_id: 'q' });
+  assert.ok(body.embeds[0].data.title.length <= 256);
+  assert.ok(body.embeds[0].data.description.length <= 4_096);
+});
+
 test('refund and quest-new projections render safe fallbacks when their aggregate row disappeared', async () => {
   const pool = { query: async () => ({ rows: [] }) };
   const client = { users: { fetch: async () => { throw new Error('must not fetch a missing refund user'); } } };
@@ -70,4 +80,29 @@ test('order DM uses Discord link buttons instead of markdown action links', asyn
     ['รับรางวัลทั้งหมด', 'ดูประวัติ Quest ทั้งหมด']);
   assert.deepEqual(body.components[0].components.map((button) => button.data.url),
     ['https://discord.com/quests/first', 'https://discord.com/channels/guild/history']);
+});
+
+test('operational projections bound untrusted evidence without Discord builder failures', async () => {
+  const now = new Date();
+  const long = '@everyone `evidence` '.repeat(800);
+  const pool = { query: async (sql) => {
+    if (sql.includes('FROM runner_jobs')) return { rows: [{ id: 'job', state: 'FAILED', quest_name: long,
+      item_state: 'WAITING_RETRY', progress_actual: 23.125, progress_bucket: 0, price_cents: 500,
+      account_id: 'account', account_username: long, attempt_count: 3, updated_at: now }] };
+    if (sql.includes('FROM incidents')) return { rows: [{ id: 'incident', incident_code: long, state: 'OPEN',
+      severity: 'CRITICAL', scope: long, trace_id: '019fc886-ffcd-70e3-bd14-fb61772e84c7', evidence: { long }, updated_at: now }] };
+    if (sql.includes('FROM admin_audit_logs')) return { rows: [{ id: 'audit', actor_id: '123456789012345678',
+      target_type: long, target_id: long, reason: long, correlation_code: 'support', action: long, created_at: now }] };
+    if (sql.includes('FROM manual_reviews')) return { rows: [{ id: 'review', subject_type: 'ORDER_ITEM', subject_id: 'item',
+      opened_reason: long, financial: true, owner_only: false, assigned_to: long, available_cents: 500,
+      reserved_cents: 100, attempt_count: 3, last_error_class: long, evidence_count: 4,
+      trace_id: '019fc886-ffcd-70e3-bd14-fb61772e84c7', remind_at: now, state: 'OPEN', created_at: now }] };
+    throw new Error(`unexpected query: ${sql}`);
+  } };
+  for (const projectionType of ['RUNNER_SUMMARY', 'SYSTEM_INCIDENT', 'ADMIN_AUDIT', 'MANUAL_REVIEW']) {
+    const body = await renderProjection(pool, { projection_type: projectionType, aggregate_id: projectionType });
+    assert.ok(body.embeds[0].data.title.length <= 256);
+    assert.ok(body.embeds[0].data.description.length <= 4_096);
+    assert.doesNotMatch(body.embeds[0].data.description, /@everyone/);
+  }
 });

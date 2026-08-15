@@ -1,4 +1,4 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, escapeMarkdown } from 'discord.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } from 'discord.js';
 import { decryptSecret } from '../../adapters/crypto/keyring.js';
 import { supportCode } from '../../shared/correlation.js';
 import {
@@ -10,9 +10,12 @@ import {
   terminalReasonLabel,
 } from './labels.js';
 import { baht } from './checkout.js';
+import { DISCORD_LIMITS, safeDiscordText, truncateDiscordText } from '../payload.js';
 
 const color = { pending: 0xf0b232, success: 0x23a55a, failure: 0xf23f43, info: 0x5865f2 };
-const escape = (value) => escapeMarkdown(String(value ?? 'ไม่ระบุ').replaceAll('@', '@\u200b')).slice(0, 1000);
+const escape = (value) => safeDiscordText(value, { maximum: 1_000 });
+const title = (value) => truncateDiscordText(value, DISCORD_LIMITS.embedTitle);
+const boundedDescription = (value) => truncateDiscordText(value, DISCORD_LIMITS.embedDescription);
 const timestamp = (value, style = 'F') => value ? `<t:${Math.floor(new Date(value).getTime() / 1000)}:${style}>` : 'ไม่ระบุ';
 const noMentions = { parse: [] };
 function orderItemLine(item) {
@@ -33,8 +36,8 @@ function setSafeImage(embed, value) {
   const url = safeHttpsUrl(value);
   if (url) embed.setImage(url);
 }
-function missingProjection(title) {
-  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle(title)], allowedMentions: noMentions };
+function missingProjection(message) {
+  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle(title(message))], allowedMentions: noMentions };
 }
 
 async function renderRefund(pool, projection, { client }) {
@@ -55,7 +58,7 @@ async function renderRefund(pool, projection, { client }) {
     `**Refund ID:** \`${refund.id}\``, `**Wallet transaction:** \`${refund.transaction_id}\``, `**Trace:** \`${refund.trace_id}\``,
   ];
   const embed = new EmbedBuilder().setColor(color.success).setTitle('↩️ คืนเงิน Order Item')
-    .setDescription(lines.join('\n')).setTimestamp(refund.created_at);
+    .setDescription(boundedDescription(lines.join('\n'))).setTimestamp(refund.created_at);
   if (user) setSafeThumbnail(embed, user.displayAvatarURL({ size: 128 }));
   const users = /^\d{17,20}$/.test(refund.actor_id)
     ? [refund.discord_user_id, refund.actor_id] : [refund.discord_user_id];
@@ -80,7 +83,7 @@ async function renderTopupReceipt(pool, projection) {
     `**ยอดคงเหลือใหม่:** ${baht(topup.available_after_cents ?? topup.available_cents)}`,
   ].filter(Boolean).join('\n');
   return { embeds: [new EmbedBuilder().setColor(color.success).setTitle('ใบเสร็จเติมเงิน Questshop')
-    .setDescription(description).setFooter({ text: 'ใบเสร็จ Discord Embed — ไม่ใช่ใบกำกับภาษี' }).setTimestamp(topup.credited_at)],
+    .setDescription(boundedDescription(description)).setFooter({ text: 'ใบเสร็จ Discord Embed — ไม่ใช่ใบกำกับภาษี' }).setTimestamp(topup.credited_at)],
   allowedMentions: noMentions };
 }
 
@@ -125,7 +128,7 @@ async function renderOrderDm(pool, projection, { env = {} } = {}) {
     : [];
   const components = [...claimButtons, ...navigationButtons].length
     ? [new ActionRowBuilder().addComponents(...claimButtons, ...navigationButtons)] : [];
-  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('สรุป Order Questshop').setDescription(description.slice(0, 4000))],
+  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('สรุป Order Questshop').setDescription(boundedDescription(description))],
     components, allowedMentions: noMentions };
 }
 
@@ -150,16 +153,18 @@ async function renderPaymentLog(pool, projection, { env, client }) {
   const logTitle = topup.status === 'CREDITED' ? '✅ เติมเงินสำเร็จ' : `⚠️ Top-up ${escape(topup.status)}`;
   const voucherUrl = sensitive?.url ?? 'encrypted payload ถูกลบตามอายุข้อมูลแล้ว';
   const description = [
-    `**ผู้เติม:** <@${topup.discord_user_id}> (\`${topup.discord_user_id}\`)`, `**Top-up ID:** \`${topup.id}\``,
+    `**Top-up ID:** \`${topup.id}\``,
+    `**ลิงก์ซอง:** ${voucherUrl}`,
+    `**ผู้เติม:** <@${topup.discord_user_id}> (\`${topup.discord_user_id}\`)`,
     `**Provider transaction:** \`${escape(topup.provider_transaction_id)}\``,
     `**Wallet transaction:** \`${escape(topup.wallet_transaction_id)}\``, `**ยอดเงินต้น:** ${baht(topup.amount_cents)}`,
     `**โบนัส:** ${baht(topup.bonus_cents)}`, `**Wallet ก่อน/หลัง:** ${baht(topup.available_before)} → ${baht(topup.available_after)}`,
     `**Reserved ก่อน/หลัง:** ${baht(topup.reserved_before)} → ${baht(topup.reserved_after)}`, `**Attempts:** ${topup.attempts}`,
     `**Receiver snapshot:** \`${receiverPhone}\``, `**เจ้าของซอง:** ${escape(topup.sender_name)} / ${escape(topup.sender_phone)}`,
-    `**ลิงก์ซอง:** ${voucherUrl}`, `**Warning/Error:** ${escape(topup.warning_code ?? topup.failure_code)}`,
+    `**Warning/Error:** ${escape(topup.warning_code ?? topup.failure_code)}`,
   ].join('\n');
   const embed = new EmbedBuilder().setColor(topup.status === 'CREDITED' ? color.success : color.failure)
-    .setTitle(logTitle).setDescription(description).setTimestamp(topup.updated_at);
+    .setTitle(title(logTitle)).setDescription(boundedDescription(description)).setTimestamp(topup.updated_at);
   if (user) setSafeThumbnail(embed, user.displayAvatarURL({ size: 128 }));
   return { embeds: [embed], allowedMentions: { users: [topup.discord_user_id], parse: [] } };
 }
@@ -181,9 +186,9 @@ async function renderQuestNew(pool, projection) {
     `**ตรวจพบ:** ${timestamp(quest.detected_at)}`, `**อัปเดต:** ${timestamp(quest.updated_at, 'R')}`,
     `**หมดอายุ:** ${timestamp(quest.expires_at)}`,
   ].filter(Boolean).join('\n');
-  const title = `🎉 พบ Quest ใหม่: ${escape(quest.name)}`.slice(0, 256);
-  const embed = new EmbedBuilder().setColor(color.info).setTitle(title)
-    .setDescription(description).setTimestamp(quest.updated_at);
+  const questTitle = title(`🎉 พบ Quest ใหม่: ${escape(quest.name)}`);
+  const embed = new EmbedBuilder().setColor(color.info).setTitle(questTitle)
+    .setDescription(boundedDescription(description)).setTimestamp(quest.updated_at);
   if (questUrl) embed.setURL(questUrl);
   setSafeImage(embed, quest.artwork_url);
   return { embeds: [embed], allowedMentions: noMentions };
@@ -200,7 +205,7 @@ async function renderQuestOperation(pool, projection) {
     `**Executor:** ${escape(quest.executor_id)} / ${escape(quest.executor_version)}`, `**Contract:** ${escape(quest.contract_version)}`,
     `**Background tests:** ${quest.test_attempts} • ${escape(quest.latest_test_state)}`, '**Trace source:** ดู Attempts/Evidence ฉบับเต็มใน PostgreSQL',
   ].join('\n');
-  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('Quest Operation Summary').setDescription(description)
+  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('Quest Operation Summary').setDescription(boundedDescription(description))
     .setTimestamp(quest.updated_at)], allowedMentions: noMentions };
 }
 
@@ -219,7 +224,7 @@ async function renderCheckoutAudit(pool, projection) {
     `**หมดอายุ:** ${timestamp(session.expires_at, 'R')}`,
   ].join('\n');
   const embed = new EmbedBuilder().setColor(color.info).setTitle('Checkout • ตรวจ Token')
-    .setDescription(description).setTimestamp(session.created_at);
+    .setDescription(boundedDescription(description)).setTimestamp(session.created_at);
   setSafeThumbnail(embed, profile.avatarUrl);
   return { embeds: [embed], allowedMentions: noMentions };
 }
@@ -239,7 +244,7 @@ async function renderCustomerQuestDiscovery(pool, projection) {
     `**Checkout session:** \`${found.checkout_session_id}\``, `**Trace:** \`${found.trace_id}\``,
   ].join('\n');
   const embed = new EmbedBuilder().setColor(color.pending).setTitle('🔎 พบ Quest ใหม่จาก Checkout ลูกค้า')
-    .setDescription(description).setTimestamp(found.created_at);
+    .setDescription(boundedDescription(description)).setTimestamp(found.created_at);
   setSafeThumbnail(embed, found.account_avatar_url);
   return { embeds: [embed], allowedMentions: { users: [found.discord_user_id], parse: [] } };
 }
@@ -257,7 +262,7 @@ async function renderQuestTestFailure(pool, projection) {
     `**Quest:** ${escape(alert.name)} (\`${escape(alert.quest_id)}\`)`,
     `**ประเภท:** ${escape(alert.task_type)}`, `**ผลทดสอบ:** ไม่ผ่านหลัง ${alert.attempts} attempt / ${alert.monitor_count} Monitor`,
     `**เหตุผลล่าสุด:** ${escape(failure)}`, `**สถานะขาย:** ${escape(alert.sale_state)}`,
-    `**Batch:** \`${alert.batch_id}\``, `**Trace:** \`${alert.trace_id}\``,
+    `**Trace:** \`${alert.trace_id}\``,
     'หากเลือก **ส่งเลย** ระบบจะเปิดขายและประกาศโดยบันทึกว่า Admin override; จะไม่ปลอมผลเป็น TEST_PASSED.',
   ].join('\n');
   const isOpen = alert.state === 'OPEN';
@@ -265,9 +270,9 @@ async function renderQuestTestFailure(pool, projection) {
     .setLabel('ส่งเลย').setStyle(ButtonStyle.Danger).setDisabled(!isOpen);
   const retry = new ButtonBuilder().setCustomId(`qs:v1:test_fail_retry:${alert.id}`)
     .setLabel('ลองทดสอบอีกครั้ง').setStyle(ButtonStyle.Primary).setDisabled(!isOpen);
-  const title = alert.state === 'OPEN' ? '⚠️ Monitor ทดสอบ Quest ไม่ผ่าน' : `Monitor Test • ${escape(alert.state)}`;
-  return { embeds: [new EmbedBuilder().setColor(color.failure).setTitle(title)
-    .setDescription(description).setTimestamp(alert.updated_at)],
+  const alertTitle = alert.state === 'OPEN' ? '⚠️ Monitor ทดสอบ Quest ไม่ผ่าน' : `Monitor Test • ${escape(alert.state)}`;
+  return { embeds: [new EmbedBuilder().setColor(color.failure).setTitle(title(alertTitle))
+    .setDescription(boundedDescription(description)).setTimestamp(alert.updated_at)],
   components: [new ActionRowBuilder().addComponents(send, retry)], allowedMentions: noMentions };
 }
 
@@ -301,7 +306,7 @@ async function renderManualReview(pool, projection) {
     `**Evidence:** ${review.evidence_count}`, `**Trace:** \`${review.trace_id}\``, `**เตือนอีกครั้ง:** ${timestamp(review.remind_at, 'R')}`,
   ].join('\n');
   return { embeds: [new EmbedBuilder().setColor(review.financial ? color.failure : color.pending)
-    .setTitle(`Manual Review • ${escape(review.state)}`).setDescription(description).setTimestamp(review.created_at)], allowedMentions: noMentions };
+    .setTitle(title(`Manual Review • ${escape(review.state)}`)).setDescription(boundedDescription(description)).setTimestamp(review.created_at)], allowedMentions: noMentions };
 }
 
 async function renderRunnerSummary(pool, projection) {
@@ -317,8 +322,8 @@ async function renderRunnerSummary(pool, projection) {
     `**Quest:** ${escape(job.quest_name)}`, `**Item state:** ${escape(job.item_state)}`,
     `**Progress:** ${job.progress_bucket}% (${escape(job.progress_actual)}%)`, `**ราคา:** ${baht(job.price_cents)}`, `**Attempts:** ${job.attempt_count}`,
   ].join('\n');
-  return { embeds: [new EmbedBuilder().setColor(runnerColor).setTitle(`Runner • ${escape(job.state)}`)
-    .setDescription(description).setTimestamp(job.updated_at)], allowedMentions: noMentions };
+  return { embeds: [new EmbedBuilder().setColor(runnerColor).setTitle(title(`Runner • ${escape(job.state)}`))
+    .setDescription(boundedDescription(description)).setTimestamp(job.updated_at)], allowedMentions: noMentions };
 }
 
 async function renderIncident(pool, projection) {
@@ -329,8 +334,8 @@ async function renderIncident(pool, projection) {
     `**สถานะ:** ${escape(incident.state)}`, `**Severity:** ${escape(incident.severity)}`,
     `**Scope:** ${escape(incident.scope)}`, `**Trace:** \`${incident.trace_id}\``, `**Evidence:** \`${escape(JSON.stringify(incident.evidence))}\``,
   ].join('\n');
-  return { embeds: [new EmbedBuilder().setColor(incidentColor).setTitle(`System • ${escape(incident.incident_code)}`)
-    .setDescription(description).setTimestamp(incident.updated_at)], allowedMentions: noMentions };
+  return { embeds: [new EmbedBuilder().setColor(incidentColor).setTitle(title(`System • ${escape(incident.incident_code)}`))
+    .setDescription(boundedDescription(description)).setTimestamp(incident.updated_at)], allowedMentions: noMentions };
 }
 
 async function renderAdminAudit(pool, projection) {
@@ -343,8 +348,8 @@ async function renderAdminAudit(pool, projection) {
     `**เหตุผล:** ${escape(audit.reason)}`, `**Correlation:** \`${audit.correlation_code}\``,
   ].join('\n');
   const allowedMentions = actorIsUser ? { users: [audit.actor_id], parse: [] } : noMentions;
-  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle(`Admin • ${escape(audit.action)}`)
-    .setDescription(description).setTimestamp(audit.created_at)], allowedMentions };
+  return { embeds: [new EmbedBuilder().setColor(color.info).setTitle(title(`Admin • ${escape(audit.action)}`))
+    .setDescription(boundedDescription(description)).setTimestamp(audit.created_at)], allowedMentions };
 }
 
 async function renderQuestHistory(pool, projection) {
@@ -365,7 +370,7 @@ async function renderQuestHistory(pool, projection) {
     `${orderStateIcon(item.state)} **${escape(item.quest_name)} — ${item.progress_bucket}%**`, `**Support:** \`${supportCode(item.trace_id)}\``,
     item.terminal_reason ? `**เหตุผล:** ${terminalReasonLabel(item.terminal_reason)}` : null,
   ].filter(Boolean).join('\n');
-  const embed = new EmbedBuilder().setColor(status.tone).setTitle(status.title).setDescription(description).setTimestamp(item.updated_at);
+  const embed = new EmbedBuilder().setColor(status.tone).setTitle(title(status.title)).setDescription(boundedDescription(description)).setTimestamp(item.updated_at);
   setSafeThumbnail(embed, item.account_avatar_url);
   const components = item.state === 'READY_TO_CLAIM' && claimUrl
     ? [new ActionRowBuilder().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(claimUrl).setLabel('รับรางวัล Quest นี้'))]
@@ -374,8 +379,8 @@ async function renderQuestHistory(pool, projection) {
 }
 
 function renderFallback(_pool, projection) {
-  const embed = new EmbedBuilder().setColor(color.info).setTitle(escape(projection.projection_type))
-    .setDescription(`Aggregate: **${escape(projection.aggregate_id)}**\nอัปเดตจากสถานะล่าสุดใน PostgreSQL`).setTimestamp();
+  const embed = new EmbedBuilder().setColor(color.info).setTitle(title(escape(projection.projection_type)))
+    .setDescription(boundedDescription(`Aggregate: **${escape(projection.aggregate_id)}**\nอัปเดตจากสถานะล่าสุดใน PostgreSQL`)).setTimestamp();
   return { embeds: [embed], allowedMentions: noMentions };
 }
 

@@ -46,6 +46,18 @@ test('selection omits the Discord select component when no eligible Quest exists
     ['ก่อนหน้า', 'ถัดไป', 'เลือกทั้งหมด', 'ตรวจสอบรายการ']);
 });
 
+test('customer checkout payloads bound long untrusted Quest text to Discord limits', () => {
+  const longQuest = '@everyone **'.repeat(500);
+  const body = renderSelection({ session: { ...session, payload: { ...session.payload, username: longQuest } },
+    count: 1, selectedCount: 1, selectedTotalCents: 500, walletAvailableCents: 2_000, page: 0, pages: 1,
+    rows: [{ line_id: 'line', quest_name: longQuest, task_type: 'PLAY_ON_DESKTOP', orbs: 10,
+      progress_actual: 25, price_cents: 500, selected: true }] });
+  const select = body.components[0].toJSON().components[0];
+  assert.ok(body.embeds[0].data.description.length <= 4_096);
+  assert.ok(select.options[0].label.length <= 100);
+  assert.doesNotMatch(select.options[0].label, /@everyone/);
+});
+
 test('quote keeps the explicit revalidation boundary with edit and confirm actions', () => {
   const body = renderQuote({ session, walletAvailableCents: 2_000, totalCents: 500, items: [
     { quest_name: 'Dolly’s Factory', task_type: 'PLAY_ON_DESKTOP', orbs: 10,

@@ -6,7 +6,7 @@ import { processOutbox } from '../../src/workers/outbox-worker.js';
 import { createContext } from '../../src/shared/correlation.js';
 import { replayDeadLetter, discardDeadLetter } from '../../src/domain/outbox/dlq-service.js';
 import { acquireDelivery, recordDelivery, enqueueProjection } from '../../src/domain/outbox/service.js';
-import { reconcileSurfaceAnchors } from '../../src/discord/surfaces/setup.js';
+import { reconcileSurfaceAnchors, setupSurface } from '../../src/discord/surfaces/setup.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -283,12 +283,13 @@ test('payment log delivers without a channel privacy preflight', async (t) => {
 test('surface reconciliation refreshes existing anchors after config version changes', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   await pool.query("UPDATE surfaces SET state='DISABLED' WHERE surface_key<>'QUEST_AUTO'");
+  await pool.query("DELETE FROM surfaces WHERE surface_key='QUEST_AUTO'");
   await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state,rendered_config_version)
     VALUES('QUEST_AUTO','guild','channel','anchor','ACTIVE',1)`);
   const edits = [];
   const message = { id: 'anchor', edit: async (body) => { edits.push(body); return message; } };
   const channel = { isTextBased: () => true, isDMBased: () => false,
-    messages: { fetch: async (input) => (input === 'anchor' ? message : new Map()) } };
+    messages: { fetch: async (input) => (input?.message === 'anchor' ? message : []) } };
   const guild = { channels: { fetch: async () => channel } };
   const client = { guilds: { fetch: async () => guild } };
   const context = createContext({ actorType: 'SYSTEM', actorId: 'runtime', guildId: 'guild',
@@ -300,4 +301,68 @@ test('surface reconciliation refreshes existing anchors after config version cha
   assert.equal(result[0].refreshed, true);
   const surface = (await pool.query("SELECT * FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0];
   assert.equal(Number(surface.rendered_config_version), 2);
+});
+
+test('surface reconciliation persists a replacement when an anchor disappears during refresh', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  await pool.query("UPDATE surfaces SET state='DISABLED' WHERE surface_key<>'QUEST_AUTO'");
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state,rendered_config_version)
+    VALUES('QUEST_AUTO','guild','channel','deleted-anchor','RECONCILING',1)
+    ON CONFLICT(surface_key) DO UPDATE SET guild_id=EXCLUDED.guild_id,channel_id=EXCLUDED.channel_id,
+      message_id=EXCLUDED.message_id,state=EXCLUDED.state,rendered_config_version=EXCLUDED.rendered_config_version`);
+  const deleted = { id: 'deleted-anchor', edit: async () => {
+    throw Object.assign(new Error('Unknown Message'), { code: 10008, status: 404 });
+  } };
+  const replacement = { id: 'replacement-anchor' };
+  const channel = { isTextBased: () => true, isDMBased: () => false,
+    messages: { fetch: async (input) => (input?.message === 'deleted-anchor' ? deleted : []) },
+    send: async () => replacement };
+  const guild = { channels: { fetch: async () => channel } };
+  const client = { guilds: { fetch: async () => guild } };
+  const context = createContext({ actorType: 'SYSTEM', actorId: 'runtime', guildId: 'guild',
+    idempotencyKey: 'surface-refresh-replacement' });
+  const result = await reconcileSurfaceAnchors({ client, pool,
+    env: { DISCORD_GUILD_ID: 'guild' }, config: { version: 2, values: {} } }, context);
+  assert.equal(result[0].recreated, true);
+  const surface = (await pool.query("SELECT * FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0];
+  assert.equal(surface.message_id, 'replacement-anchor');
+  assert.equal(Number(surface.rendered_config_version), 2);
+});
+
+test('setup reuses an anchor, moves it atomically, and records old-anchor cleanup failure', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  await pool.query("UPDATE surfaces SET state='DISABLED' WHERE surface_key<>'QUEST_AUTO'");
+  await pool.query("DELETE FROM surfaces WHERE surface_key='QUEST_AUTO'");
+  const created = { id: 'setup-anchor', edit: async (body) => { created.edits.push(body); return created; }, edits: [] };
+  const firstChannel = {
+    id: 'setup-first', isTextBased: () => true, isDMBased: () => false,
+    client: { user: { id: 'bot' } }, messages: { fetch: async () => [] }, send: async () => created,
+  };
+  const context = createContext({ actorType: 'OWNER', actorId: 'owner', guildId: 'guild',
+    idempotencyKey: 'setup-anchor' });
+  const firstInteraction = {
+    guildId: 'guild', user: { id: 'owner' }, channel: firstChannel,
+    options: { getChannel: () => firstChannel }, guild: { channels: { fetch: async () => firstChannel } },
+  };
+  await setupSurface({ interaction: firstInteraction, surfaceKey: 'QUEST_AUTO', config: { version: 1, values: {} } }, context, { pool });
+  assert.equal((await pool.query("SELECT message_id FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0].message_id, 'setup-anchor');
+
+  const replacement = { id: 'setup-replacement', edit: async () => replacement };
+  const secondChannel = {
+    id: 'setup-second', isTextBased: () => true, isDMBased: () => false,
+    client: { user: { id: 'bot' } }, messages: { fetch: async () => [] }, send: async () => replacement,
+  };
+  const oldChannel = {
+    isTextBased: () => true,
+    messages: { fetch: async () => { throw Object.assign(new Error('Missing Permissions'), { status: 403, code: 50013 }); } },
+  };
+  const moveInteraction = {
+    guildId: 'guild', user: { id: 'owner' }, channel: secondChannel,
+    options: { getChannel: () => secondChannel }, guild: { channels: { fetch: async () => oldChannel } },
+  };
+  await setupSurface({ interaction: moveInteraction, surfaceKey: 'QUEST_AUTO', config: { version: 2, values: {} } }, context, { pool });
+  const moved = (await pool.query("SELECT channel_id,message_id FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0];
+  assert.deepEqual(moved, { channel_id: 'setup-second', message_id: 'setup-replacement' });
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM incidents
+    WHERE incident_code='DISCORD_SURFACE_RECONCILE_FAILED' AND scope='QUEST_AUTO'`)).rows[0].count), 1);
 });
