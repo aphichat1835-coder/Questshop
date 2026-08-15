@@ -36,7 +36,6 @@ export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, e
       return { message: await message.edit(body), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
-      message = null;
     }
   }
   message = await findSurfaceMarker(channel, surfaceKey);
