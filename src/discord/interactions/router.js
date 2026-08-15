@@ -1906,7 +1906,9 @@ function startInteractionMetrics(interaction, runtime) {
   return {
     complete(error = null) {
       const operation = isBackoffice(interaction, runtime) ? 'PANEL_REQUEST' : 'CUSTOMER_INTERACTION';
-      const outcome = error ? (error instanceof QuestshopError ? 'REJECTED' : 'ERROR') : 'SUCCESS';
+      let outcome = 'SUCCESS';
+      if (error instanceof QuestshopError) outcome = 'REJECTED';
+      else if (error) outcome = 'ERROR';
       write(operation, outcome, performance.now() - started,
         error?.category ?? error?.code ?? error?.name ?? null);
       if (!acknowledged) write('INTERACTION_ACK', 'ACK_FAILED', performance.now() - started,
