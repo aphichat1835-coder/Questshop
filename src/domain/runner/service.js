@@ -11,6 +11,7 @@ import { selectQuestExecutor } from '../../quest-engine/executors/registry.js';
 import { getPersistentDiscordRateLimitCoordinator } from '../../quest-engine/rate-limits/coordinator.js';
 import { evaluateExpiryAdmission } from '../catalog/expiry.js';
 import { enqueueProjection } from '../outbox/service.js';
+import { reconcileIncident } from '../incidents/service.js';
 import { openReview } from '../reviews/service.js';
 import { assertTransition, recordTransition } from '../shared/transition.js';
 import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
@@ -285,10 +286,8 @@ export async function requeueDueRunnerJobsInTransaction(client, context, { inclu
 
 export async function containRunnerQueueMismatch(client, job, context, reasonCode) {
   const evidence = { jobState: job.state, itemState: job.item_state, reasonCode };
-  await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-    VALUES(gen_random_uuid(),'RUNNER_QUEUE_STATE_MISMATCH',$1,'OPEN','CRITICAL',$2,$3)
-    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-      evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`, [job.id, evidence, job.trace_id]);
+  await reconcileIncident({ code: 'RUNNER_QUEUE_STATE_MISMATCH', scope: job.id, active: true,
+    severity: 'CRITICAL', evidence }, context, { client });
   const currentItem = (await client.query('SELECT * FROM order_items WHERE id=$1 FOR UPDATE', [job.order_item_id])).rows[0];
   const canReviewJob = (RUNNER_JOB_TRANSITIONS[job.state] ?? []).includes('MANUAL_REVIEW');
   const canReviewItem = currentItem && (ORDER_ITEM_TRANSITIONS[currentItem.state] ?? []).includes('MANUAL_REVIEW');
@@ -932,11 +931,8 @@ async function pauseQuestAfterContractFailure(client, job, error, context) {
 }
 
 async function recordQuestContractIncident(client, job, error, context) {
-  await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-    VALUES(gen_random_uuid(),'QUEST_CONTRACT_FAILURE',$1,'OPEN','CRITICAL',$2,$3)
-    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
-    DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-  [job.order_item_id, { errorCode: error.code ?? error.name }, context.traceId]);
+  await reconcileIncident({ code: 'QUEST_CONTRACT_FAILURE', scope: job.order_item_id, active: true,
+    severity: 'CRITICAL', evidence: { errorCode: error.code ?? error.name } }, context, { client });
 }
 
 async function moveRunnerReviewTransaction(client, { job, context, error, contractFailure }) {

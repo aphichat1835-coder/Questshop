@@ -8,6 +8,7 @@ import { executeQuestExecutor } from '../quest-engine/executors/contract.js';
 import { createContext } from '../shared/correlation.js';
 import { FencingLostError } from '../shared/errors.js';
 import { ingestDiscovery } from '../domain/catalog/service.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
 import { secureJitter } from '../shared/random.js';
 import { withTransaction } from '../db/transaction.js';
 import { RUNNER_VERSION_COMPATIBILITY } from '../config/versions.js';
@@ -377,11 +378,8 @@ async function updateMonitorForFailure(database, monitor, error, context) {
       ELSE cooldown_until END,updated_at=clock_timestamp()
     WHERE id=$1 AND state<>'DISABLED' RETURNING state`, [monitor.id, state, failures])).rows[0];
   if (updated?.state !== 'QUARANTINED') return;
-  await database.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-    VALUES(gen_random_uuid(),'MONITOR_QUARANTINED',$1,'OPEN','ERROR',$2,$3)
-    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
-    DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-  [monitor.id, { errorCode: error.code ?? error.name }, context.traceId]);
+  await reconcileIncident({ code: 'MONITOR_QUARANTINED', scope: monitor.id, active: true,
+    severity: 'ERROR', evidence: { errorCode: error.code ?? error.name } }, context, { client: database });
 }
 
 async function queueAlternativeMonitorTest(pool, run, monitor, error) {

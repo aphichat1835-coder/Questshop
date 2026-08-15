@@ -5,6 +5,7 @@ import { FencingLostError } from '../shared/errors.js';
 import { recordTransition } from '../domain/shared/transition.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { discordErrorKind, fetchDiscordMessage, findDiscordMessageByNonce } from '../discord/transport.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
 
 const BACKOFF = [1, 5, 15, 60, 300, 900];
 
@@ -60,11 +61,11 @@ async function recordSurfaceFailure(client, event, projection, error, details) {
     // A delivery 403 is an operational delivery failure. Keep the surface
     // anchor unchanged and preserve an incident for an administrator to
     // inspect manually; no runtime permission-drift feature is involved.
-    await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-      VALUES(gen_random_uuid(),'DISCORD_SURFACE_FORBIDDEN',$1,'OPEN','ERROR',$2,$3)
-      ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-        evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-    [projection.surface_key, { source: 'DISCORD_403', code: error.code }, event.trace_id]);
+    await reconcileIncident({ code: 'DISCORD_SURFACE_FORBIDDEN', scope: projection.surface_key, active: true,
+      severity: 'ERROR', evidence: { source: 'DISCORD_403', code: error.code } }, {
+      traceId: event.trace_id, causationId: event.causation_id ?? null, actorType: 'SYSTEM', actorId: 'outbox-worker',
+      guildId: 'SYSTEM', idempotencyKey: `outbox-forbidden:${event.id}`,
+    }, { client });
   }
   if (details.missingChannel) {
     await client.query(`UPDATE surfaces SET state='RECONCILING',state_version=state_version+1,

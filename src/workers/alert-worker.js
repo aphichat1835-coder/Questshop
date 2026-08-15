@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { v7 as uuidv7 } from 'uuid';
 import { RUNNER_VERSION_COMPATIBILITY, isRunnerVersionCompatible } from '../config/versions.js';
 import { usesApplicationBackup } from '../config/env.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -20,15 +21,10 @@ async function memoryLimitBytes() {
 }
 
 async function setIncident(client, { code, scope, active, severity, evidence }) {
-  if (active) {
-    await client.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-      VALUES($1,$2,$3,'OPEN',$4,$5,$6) ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
-      DO UPDATE SET severity=EXCLUDED.severity,evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-    [uuidv7(), code, scope, severity, evidence, uuidv7()]);
-    return;
-  }
-  await client.query(`UPDATE incidents SET state='RESOLVED',resolved_at=clock_timestamp(),
-    updated_at=clock_timestamp() WHERE incident_code=$1 AND scope=$2 AND state<>'RESOLVED'`, [code, scope]);
+  return reconcileIncident({ code, scope, active, severity, evidence }, {
+    traceId: uuidv7(), causationId: null, actorType: 'SYSTEM', actorId: 'alert-worker',
+    guildId: 'SYSTEM', idempotencyKey: `alert:${code}:${scope}`,
+  }, { pool: client });
 }
 
 async function collectRuntimeMetrics(pool, eventLoopMonitor) {
@@ -76,10 +72,17 @@ async function collectAlertSnapshot(pool, { applicationBackupEnabled }) {
     pool.query(`SELECT COALESCE(max(EXTRACT(EPOCH FROM clock_timestamp()-available_at)*1000),0)::bigint AS lag_ms,
       count(*)::integer AS queued FROM runner_jobs
       WHERE state='QUEUED' AND available_at<=clock_timestamp()`),
-    pool.query(`SELECT count(*)::integer AS stuck FROM outbox_events WHERE state IN ('PENDING','LEASED','RETRY_WAIT')
-      AND GREATEST(created_at,available_at)<clock_timestamp()-interval '5 minutes'`),
-    pool.query(`SELECT count(*)::integer AS total,count(*) FILTER (WHERE outcome<>'SUCCESS')::integer AS failed
-      FROM operation_metrics WHERE created_at>=clock_timestamp()-interval '5 minutes'`),
+    pool.query(`SELECT count(*) FILTER (WHERE state IN ('PENDING','LEASED','RETRY_WAIT')
+        AND GREATEST(created_at,available_at)<clock_timestamp()-interval '5 minutes')::integer AS stuck,
+      COALESCE(max(EXTRACT(EPOCH FROM clock_timestamp()-GREATEST(created_at,available_at))*1000)
+        FILTER (WHERE state IN ('PENDING','LEASED','RETRY_WAIT')),0)::bigint AS oldest_age_ms,
+      count(*) FILTER (WHERE state='PENDING')::integer AS pending,
+      count(*) FILTER (WHERE state='LEASED')::integer AS leased,
+      count(*) FILTER (WHERE state='RETRY_WAIT')::integer AS retry_wait
+      FROM outbox_events`),
+    pool.query(`SELECT count(*)::integer AS total,count(*) FILTER (WHERE outcome='ERROR')::integer AS failed
+      FROM operation_metrics WHERE operation IN ('PANEL_REQUEST','CUSTOMER_INTERACTION')
+        AND outcome IN ('SUCCESS','ERROR') AND created_at>=clock_timestamp()-interval '5 minutes'`),
     backupResult, restoreResult, backupCorruptionResult, restoreFailureResult,
     pool.query(`SELECT (SELECT count(*)::integer FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')) AS queue,
       (SELECT count(*)::integer FROM outbox_events WHERE state IN ('PENDING','LEASED','RETRY_WAIT')) AS outbox,
@@ -172,8 +175,14 @@ async function applyOperationalAlerts(pool, snapshot, health, runtime) {
     severity: 'CRITICAL', evidence: { count: snapshot.backupCorruption } });
   await setIncident(pool, { code: 'RESTORE_DRILL_FAILED', scope: 'DATABASE', active: backupChecks && snapshot.restoreFailure > 0,
     severity: 'CRITICAL', evidence: { count: snapshot.restoreFailure } });
-  const staleWorkers = Object.entries(health.workers).filter(([, worker]) => worker.lastTick
-    && Date.now() - Date.parse(worker.lastTick) > 120_000).map(([name]) => name);
+  const staleWorkers = Object.entries(health.workers).filter(([, worker]) => worker.lastHeartbeatAt
+    && Date.now() - Date.parse(worker.lastHeartbeatAt) > 120_000).map(([name, worker]) => ({
+    name,
+    inFlight: Boolean(worker.inFlight),
+    inFlightSince: worker.inFlightSince ?? null,
+    lastHeartbeatAt: worker.lastHeartbeatAt,
+    lastCompletedAt: worker.lastCompletedAt ?? null,
+  }));
   await setIncident(pool, { code: 'WORKER_HEARTBEAT_MISSING', scope: 'RUNTIME', active: staleWorkers.length > 0,
     severity: 'ERROR', evidence: { workers: staleWorkers } });
   const sustained = (await pool.query(`SELECT count(*) FILTER (WHERE operation='SYSTEM:MEMORY_PERCENT' AND outcome='ERROR'

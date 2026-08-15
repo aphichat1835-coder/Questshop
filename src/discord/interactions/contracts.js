@@ -13,7 +13,8 @@ const owner = (interaction, response = 'REPLY') => contract(OWNER, interaction, 
 // This is deliberately exhaustive. A new component route must choose its
 // audience and acknowledgement shape before it can be dispatched.
 export const ROUTE_CONTRACTS = Object.freeze({
-  start: customer('BUTTON', ['ORDER_ACCEPTING'], 'MODAL'),
+  start: customer('BUTTON', ['ORDER_ACCEPTING']),
+  token_open: customer('BUTTON', ['ORDER_ACCEPTING'], 'MODAL'),
   topup: customer('BUTTON', ['TOPUP_ACCEPTING']),
   payment_method: customer('STRING_SELECT', ['TOPUP_ACCEPTING'], 'MODAL'),
   voucher_submit: customer('MODAL_SUBMIT', ['TOPUP_ACCEPTING']),

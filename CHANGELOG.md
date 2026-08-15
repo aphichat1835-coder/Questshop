@@ -27,6 +27,14 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
 
 ### Added
 
+- Discord reliability closure: persistent routes now declare their acknowledgement strategy, normal routes defer before
+  PostgreSQL work, and Modal launchers open before durable session preparation. Session creation/advance accepts an
+  explicit opaque child ID so a fast Modal submit remains actor/guild/channel-bound without using process memory as
+  durable truth.
+- Interaction response-state ownership, correlated Support codes, rejection-aware metrics, heartbeat-in-flight health,
+  versioned incident projections, and source-SHA verification when Git metadata is available.
+- Migration 0027 adds versioned incident projections and safe route/acknowledgement diagnostics for operation metrics.
+
 - Deployment migration now performs a fail-closed, transactional Runtime object-privilege synchronization after
   every migration check (including `applied: 0`). It preserves provider-owned role/schema bootstrap boundaries,
   enforces append-only Wallet/Audit/Release evidence access, and validates effective grants inherited through
@@ -69,6 +77,12 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
 - Automated unit, PostgreSQL integration, concurrency, crash, security, contract, recovery และ load tests
 
 ### Changed
+
+- Expected business rejections such as insufficient wallet credit are logged and measured as `REJECTED`, not as a
+  system failure. `ERROR_RATE_HIGH` now counts only failed customer/admin operations, while Outbox incidents include
+  state counts and oldest pending age for diagnosis.
+- A recovered Discord surface now resolves its prior `DISCORD_SURFACE_RECONCILE_FAILED` incident and updates the
+  existing LOG_SYSTEM projection. Worker liveness is based on an active heartbeat rather than only completed work.
 
 - Discord interaction routing is now governed by one explicit contract per persistent route (audience, component
   type and customer gate). Backoffice actions remain usable while customer intake is closed, forged component types

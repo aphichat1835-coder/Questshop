@@ -3,7 +3,7 @@ import {
   StringSelectMenuBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder,
 } from 'discord.js';
 import { v7 as uuidv7 } from 'uuid';
-import { createContext } from '../../shared/correlation.js';
+import { createContext, supportCode } from '../../shared/correlation.js';
 import { safeError } from '../../shared/redaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { submitVoucher } from '../../domain/payments/service.js';
@@ -40,6 +40,7 @@ import {
 import { loadTestFailureAlert, retryFailedTestAlert } from '../../domain/catalog/test-gate.js';
 import { discardDeadLetter, replayDeadLetter } from '../../domain/outbox/dlq-service.js';
 import { loadRuntimeConfig } from '../../config/runtime-config.js';
+import { DEFAULT_FEATURE_GATES } from '../../config/feature-gates.js';
 import {
   baht,
   renderOrderConfirmation,
@@ -55,6 +56,9 @@ import { orderStateLabel } from '../renderers/labels.js';
 import { QUEST_PRICE_CATEGORIES } from '../../domain/pricing/categories.js';
 import { customerErrorText, DISCORD_LIMITS, safeDiscordText, truncateDiscordText } from '../payload.js';
 import { ADMIN, CUSTOMER, OWNER, assertRouteContractCoverage, routeContract } from './contracts.js';
+import {
+  ACKNOWLEDGEMENT, acknowledgementOf, acknowledgeByContract, ephemeralResponse, installResponseController,
+} from './response-controller.js';
 
 function money(cents) { return baht(cents); }
 function escapedText(value, fallback = 'ไม่ระบุ') {
@@ -156,7 +160,7 @@ function actorTypeFor(interaction, runtime) {
 function contextFor(interaction, operation) {
   const runtime = interaction.client.questshop;
   const actorType = actorTypeFor(interaction, runtime);
-  return createContext({ actorType,
+  return createContext({ traceId: interaction.__questshopTraceId ?? uuidv7(), actorType,
     actorId: interaction.user.id, guildId: interaction.guildId,
     idempotencyKey: `${operation}:${interaction.id}`,
     messageId: interaction.message?.id ?? null });
@@ -186,7 +190,7 @@ const CUSTOMER_ERROR_CODES = new Set([
   'INVALID_VOUCHER_CODE', 'ROUTE_INTERACTION_INVALID',
 ]);
 export function formatInteractionError(error, interactionId) {
-  const support = error?.traceId?.slice(0, 8) ?? interactionId.slice(-8);
+  const support = supportCode(error?.traceId ?? interactionId);
   let detail = 'เกิดข้อผิดพลาดภายใน ระบบบันทึกรหัสสำหรับตรวจสอบแล้ว';
   if (error instanceof QuestshopError && CUSTOMER_ERROR_CODES.has(error.code)) {
     detail = truncateDiscordText(error.message, 1_700);
@@ -196,14 +200,57 @@ export function formatInteractionError(error, interactionId) {
   return customerErrorText(`ไม่สามารถดำเนินการได้: ${detail}`, support);
 }
 async function ephemeralError(interaction, error) {
-  const message = formatInteractionError(error, interaction.id);
-  const updatedExistingMessage = interaction.__questshopAcknowledgement === 'deferUpdate'
-    || interaction.__questshopAcknowledgement === 'update';
-  if ((interaction.deferred || interaction.replied) && updatedExistingMessage && typeof interaction.followUp === 'function') {
-    return interaction.followUp({ content: message, ephemeral: true, allowedMentions: { parse: [] } });
+  const message = formatInteractionError(error, interaction.__questshopTraceId ?? interaction.id);
+  const acknowledgement = acknowledgementOf(interaction);
+  if (acknowledgement === ACKNOWLEDGEMENT.MODAL) return null;
+  if ([ACKNOWLEDGEMENT.DEFER_UPDATE, ACKNOWLEDGEMENT.UPDATE].includes(acknowledgement)
+    && typeof interaction.followUp === 'function') {
+    return interaction.followUp(ephemeralResponse({ content: message, allowedMentions: { parse: [] } }));
   }
-  if (interaction.deferred || interaction.replied) return interaction.editReply({ content: message, embeds: [], components: [] });
-  return interaction.reply({ content: message, ephemeral: true });
+  if ([ACKNOWLEDGEMENT.DEFER_REPLY, ACKNOWLEDGEMENT.REPLY].includes(acknowledgement)) {
+    return interaction.editReply({ content: message, embeds: [], components: [] });
+  }
+  return interaction.reply(ephemeralResponse({ content: message, allowedMentions: { parse: [] } }));
+}
+
+function pendingModalPreparations(runtime) {
+  runtime.pendingModalPreparations ??= new Map();
+  return runtime.pendingModalPreparations;
+}
+
+async function waitForModalPreparation(runtime, sessionId) {
+  const pending = pendingModalPreparations(runtime).get(sessionId);
+  if (pending) await pending;
+}
+
+async function showPreparedModal({ interaction, runtime, route, modal, sessionId = uuidv7(), prepare }) {
+  const preparations = pendingModalPreparations(runtime);
+  let resolvePreparation;
+  let rejectPreparation;
+  const pending = new Promise((resolve, reject) => {
+    resolvePreparation = resolve;
+    rejectPreparation = reject;
+  });
+  pending.catch(() => {});
+  preparations.set(sessionId, pending);
+  try {
+    await interaction.showModal(modal(sessionId));
+  } catch (error) {
+    preparations.delete(sessionId);
+    rejectPreparation(error);
+    throw error;
+  }
+  try {
+    await authorizeRoute(interaction, route, runtime);
+    const value = await prepare(sessionId);
+    resolvePreparation(value);
+    return value;
+  } catch (error) {
+    rejectPreparation(error);
+    throw error;
+  } finally {
+    preparations.delete(sessionId);
+  }
 }
 function tokenModal(sessionId) {
   const input = new TextInputBuilder().setCustomId('token').setStyle(TextInputStyle.Paragraph)
@@ -640,12 +687,6 @@ async function consumeCustomerButtonRateLimit(interaction, route, runtime) {
   }
 }
 
-async function loadAuthorizationGates(runtime) {
-  if (runtime.config.gates) return runtime.config.gates;
-  const result = await runtime.pool.query('SELECT gate, enabled FROM feature_gates');
-  return Object.fromEntries(result.rows.map((row) => [row.gate, row.enabled]));
-}
-
 function assertRouteRole(interaction, contract, runtime) {
   if (contract.access === OWNER && interaction.user.id !== runtime.env.OWNER_ID) {
     throw new QuestshopError('OWNER_ONLY', 'เมนูนี้ใช้ได้เฉพาะ Owner');
@@ -667,15 +708,20 @@ function assertCustomerRouteGates(contract, gates) {
   }
 }
 
-export async function authorizeRoute(interaction, route, runtime) {
-  await assertSurfaceBinding(interaction, route, runtime);
+export function preAuthorizeRoute(interaction, route, runtime) {
   const contract = routeContract(route.route);
   if (!contract) return null;
   assertPrelaunchRouteAccess(interaction, contract, runtime);
-  await consumeCustomerButtonRateLimit(interaction, route, runtime);
-  const gates = await loadAuthorizationGates(runtime);
+  const gates = runtime.config?.gates ?? DEFAULT_FEATURE_GATES;
   assertRouteRole(interaction, contract, runtime);
   if (contract.access === CUSTOMER) assertCustomerRouteGates(contract, gates);
+  return gates;
+}
+
+export async function authorizeRoute(interaction, route, runtime) {
+  const gates = preAuthorizeRoute(interaction, route, runtime);
+  await assertSurfaceBinding(interaction, route, runtime);
+  await consumeCustomerButtonRateLimit(interaction, route, runtime);
   return gates;
 }
 
@@ -688,11 +734,27 @@ if (route.route === 'start' && interaction.isButton()) {
   const wallet = (await runtime.pool.query('SELECT available_cents FROM wallets WHERE discord_user_id = $1', [interaction.user.id])).rows[0];
   if (BigInt(wallet?.available_cents ?? 0) < BigInt(minimum)) throw new QuestshopError('WALLET_INSUFFICIENT', `ต้องมีเครดิตขั้นต่ำ ${money(minimum)}`);
   const entry = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'TOKEN_ENTRY',
+    channelId: interaction.channelId, messageId: null, operation: 'TOKEN_ENTRY',
     payload: {}, configVersion: runtime.config.version, ttlMinutes: 15 },
   contextFor(interaction, 'token_entry'), { pool: runtime.pool });
-  return interaction.showModal(tokenModal(entry.id));
+  const reply = await interaction.editReply({ content: 'เครดิตพร้อมแล้ว กรุณากรอก Token ของบัญชีที่ต้องการทำ Quest',
+    components: [new ActionRowBuilder().addComponents(new ButtonBuilder()
+      .setCustomId(customId('token_open', entry.id)).setLabel('กรอก Token').setStyle(ButtonStyle.Primary))] });
+  await bindSessionMessage({ sessionId: entry.id, actorId: interaction.user.id, guildId: interaction.guildId,
+    messageId: reply.id, expectedVersion: entry.state_version },
+  contextFor(interaction, 'token_entry_message'), { pool: runtime.pool });
+  return reply;
 }
+}
+
+async function handleTokenOpen({ interaction, route, runtime, gates: _gates }) {
+  if (route.route !== 'token_open' || !interaction.isButton()) return;
+  return showPreparedModal({ interaction, runtime, route, sessionId: route.sessionId,
+    modal: tokenModal,
+    prepare: () => loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+      guildId: interaction.guildId, channelId: interaction.channelId, messageId: interaction.message?.id ?? null,
+      operation: 'TOKEN_ENTRY' },
+    contextFor(interaction, 'token_entry_open'), { pool: runtime.pool }) });
 }
 
 async function handleTopup({ interaction, route, runtime, gates: _gates }) {
@@ -716,11 +778,14 @@ if (route.route === 'topup' && interaction.isButton()) {
 
 async function handlePaymentMethod({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'payment_method' && interaction.isStringSelectMenu()) {
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOPUP_ENTRY' }, contextFor(interaction, 'topup_entry_load'), { pool: runtime.pool });
-  await assertRateLimitAvailable({ discordUserId: interaction.user.id, operation: 'VOUCHER_INVALID' },
-    contextFor(interaction, 'voucher_invalid_check'), { pool: runtime.pool });
-  return interaction.showModal(voucherModal(route.sessionId));
+  return showPreparedModal({ interaction, runtime, route, sessionId: route.sessionId,
+    modal: voucherModal,
+    prepare: async () => {
+      await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+        guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOPUP_ENTRY' }, contextFor(interaction, 'topup_entry_load'), { pool: runtime.pool });
+      return assertRateLimitAvailable({ discordUserId: interaction.user.id, operation: 'VOUCHER_INVALID' },
+        contextFor(interaction, 'voucher_invalid_check'), { pool: runtime.pool });
+    } });
 }
 }
 
@@ -886,12 +951,13 @@ if (route.route === 'wallet_adjust' && interaction.isButton()) {
 
 async function handleWalletUserSearch({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'wallet_user_search' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ADMIN_WALLET_SEARCH',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'wallet_search_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('wallet_user_search_submit', session.id, 'ค้นหาผู้ใช้ด้วย Discord ID', [
-    { id: 'discord_user_id', label: 'Discord User ID', max: 20 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('wallet_user_search_submit', sessionId, 'ค้นหาผู้ใช้ด้วย Discord ID', [
+      { id: 'discord_user_id', label: 'Discord User ID', max: 20 },
+    ]),
+    prepare: (sessionId) => createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'ADMIN_WALLET_SEARCH',
+      payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'wallet_search_session'), { pool: runtime.pool }) });
 }
 }
 
@@ -915,29 +981,33 @@ if (route.route === 'wallet_user_search_submit' && interaction.isModalSubmit()) 
 
 async function handleWalletAdjustFromSearch({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'wallet_adjust_from_search' && interaction.isButton()) {
-  await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_PREPARE' },
-  contextFor(interaction, 'wallet_search_prepare_load'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('wallet_adjust_submit', route.sessionId, 'ปรับเครดิตลูกค้า', [
-    { id: 'amount', label: 'จำนวนบาท (+ เพิ่ม / - ลด)', placeholder: '100.00 หรือ -50.00', max: 24 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route, sessionId: route.sessionId,
+    modal: (sessionId) => fieldsModal('wallet_adjust_submit', sessionId, 'ปรับเครดิตลูกค้า', [
+      { id: 'amount', label: 'จำนวนบาท (+ เพิ่ม / - ลด)', placeholder: '100.00 หรือ -50.00', max: 24 },
+      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+    ]),
+    prepare: () => loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+      guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_PREPARE' },
+    contextFor(interaction, 'wallet_search_prepare_load'), { pool: runtime.pool }) });
 }
 }
 
 async function handleWalletUserPick({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'wallet_user_pick' && interaction.isUserSelectMenu()) {
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_USER' },
-  contextFor(interaction, 'wallet_user_load'), { pool: runtime.pool });
-  const prepare = await advanceInteractionSession(session, interaction, runtime, {
-    messageId: interaction.message?.id ?? null, operation: 'ADMIN_WALLET_PREPARE',
-    payload: { discordUserId: interaction.values[0] }, configVersion: runtime.config.version,
-  }, 'wallet_prepare_selected');
-  return interaction.showModal(fieldsModal('wallet_adjust_submit', prepare.id, 'ปรับเครดิตลูกค้า', [
-    { id: 'amount', label: 'จำนวนบาท (+ เพิ่ม / - ลด)', placeholder: '100.00 หรือ -50.00', max: 24 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('wallet_adjust_submit', sessionId, 'ปรับเครดิตลูกค้า', [
+      { id: 'amount', label: 'จำนวนบาท (+ เพิ่ม / - ลด)', placeholder: '100.00 หรือ -50.00', max: 24 },
+      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+    ]),
+    prepare: async (sessionId) => {
+      const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+        guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_USER' },
+      contextFor(interaction, 'wallet_user_load'), { pool: runtime.pool });
+      return advanceInteractionSession(session, interaction, runtime, {
+        id: sessionId, messageId: interaction.message?.id ?? null, operation: 'ADMIN_WALLET_PREPARE',
+        payload: { discordUserId: interaction.values[0] }, configVersion: runtime.config.version,
+      }, 'wallet_prepare_selected');
+    } });
 }
 }
 
@@ -1009,16 +1079,19 @@ if (route.route === 'refund_prepare' && interaction.isButton()) {
 
 async function handleRefundItemPick({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'refund_item_pick' && interaction.isStringSelectMenu()) {
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REFUND_SELECT' },
-  contextFor(interaction, 'refund_item_load'), { pool: runtime.pool });
-  const prepare = await advanceInteractionSession(session, interaction, runtime, {
-    messageId: interaction.message?.id ?? null, operation: 'ADMIN_REFUND_PREPARE',
-    payload: { orderItemId: interaction.values[0] }, configVersion: runtime.config.version,
-  }, 'refund_prepare_selected');
-  return interaction.showModal(fieldsModal('refund_prepare_submit', prepare.id, 'คืนเครดิตงาน Quest', [
-    { id: 'reason', label: 'เหตุผลการคืนเงิน', long: true, max: 500 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('refund_prepare_submit', sessionId, 'คืนเครดิตงาน Quest', [
+      { id: 'reason', label: 'เหตุผลการคืนเงิน', long: true, max: 500 },
+    ]),
+    prepare: async (sessionId) => {
+      const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+        guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REFUND_SELECT' },
+      contextFor(interaction, 'refund_item_load'), { pool: runtime.pool });
+      return advanceInteractionSession(session, interaction, runtime, {
+        id: sessionId, messageId: interaction.message?.id ?? null, operation: 'ADMIN_REFUND_PREPARE',
+        payload: { orderItemId: interaction.values[0] }, configVersion: runtime.config.version,
+      }, 'refund_prepare_selected');
+    } });
 }
 }
 
@@ -1094,20 +1167,23 @@ if (route.route === 'payment_review_pick' && interaction.isStringSelectMenu()) {
 async function handleTopupReviewDecision({ interaction, route, runtime, gates: _gates }) {
 if (['topup_review_credit', 'topup_review_reject'].includes(route.route) && interaction.isButton()) {
   ownerOnly(interaction, runtime, 'รายการเติมเงินที่ผลไม่ชัดเจนให้ Owner ตัดสินเท่านั้น');
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOPUP_REVIEW_DETAIL' },
-  contextFor(interaction, 'topup_review_action_load'), { pool: runtime.pool });
   const credit = route.route === 'topup_review_credit';
-  const decision = await advanceInteractionSession(session, interaction, runtime, {
-    messageId: interaction.message?.id ?? null, operation: 'TOPUP_REVIEW_DECISION',
-    payload: { ...session.payload, decision: credit ? 'CREDIT' : 'REJECT' }, configVersion: runtime.config.version,
-  }, 'topup_review_decision_session');
-  return interaction.showModal(fieldsModal('topup_review_decision_submit', decision.id,
-    credit ? 'ยืนยันเพิ่มเครดิตจากซอง' : 'ปฏิเสธรายการเติมเงิน', credit ? [
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('topup_review_decision_submit', sessionId,
+      credit ? 'ยืนยันเพิ่มเครดิตจากซอง' : 'ปฏิเสธรายการเติมเงิน', credit ? [
       { id: 'amount', label: 'ยอดที่ยืนยันได้ (บาท)', max: 24 },
       { id: 'provider_id', label: 'เลขธุรกรรม TrueMoney', max: 200 },
       { id: 'reason', label: 'หลักฐานและเหตุผล', long: true, max: 500 },
-    ] : [{ id: 'reason', label: 'เหตุผลที่ปฏิเสธ', long: true, max: 500 }]));
+    ] : [{ id: 'reason', label: 'เหตุผลที่ปฏิเสธ', long: true, max: 500 }]),
+    prepare: async (sessionId) => {
+      const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+        guildId: interaction.guildId, channelId: interaction.channelId, operation: 'TOPUP_REVIEW_DETAIL' },
+      contextFor(interaction, 'topup_review_action_load'), { pool: runtime.pool });
+      return advanceInteractionSession(session, interaction, runtime, {
+        id: sessionId, messageId: interaction.message?.id ?? null, operation: 'TOPUP_REVIEW_DECISION',
+        payload: { ...session.payload, decision: credit ? 'CREDIT' : 'REJECT' }, configVersion: runtime.config.version,
+      }, 'topup_review_decision_session');
+    } });
 }
 }
 
@@ -1131,12 +1207,13 @@ if (route.route === 'topup_review_decision_submit' && interaction.isModalSubmit(
 }
 async function handleOrderReview({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'adminorder_review' && interaction.isButton()) {
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ORDER_ITEM_DETAIL' },
-  contextFor(interaction, 'order_review_load_detail'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('adminorder_review_submit', session.id, 'เปิดรายการตรวจสอบงาน Quest', [
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route, sessionId: route.sessionId,
+    modal: (sessionId) => fieldsModal('adminorder_review_submit', sessionId, 'เปิดรายการตรวจสอบงาน Quest', [
+      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+    ]),
+    prepare: () => loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+      guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ORDER_ITEM_DETAIL' },
+    contextFor(interaction, 'order_review_load_detail'), { pool: runtime.pool }) });
 }
 }
 
@@ -1218,17 +1295,20 @@ if (route.route === 'price_category_pick' && interaction.isStringSelectMenu()) {
   const category = interaction.values[0];
   const taskTypes = QUEST_PRICE_CATEGORIES[category];
   if (!taskTypes) throw new TypeError('ประเภท Quest ไม่ถูกต้อง');
-  const rules = (await runtime.pool.query(`SELECT task_type,amount_cents,state_version FROM price_rules
-    WHERE enabled=true AND rule_type='TYPE' AND task_type=ANY($1::text[])`, [taskTypes])).rows;
-  if (rules.length !== taskTypes.length) throw new QuestshopError('PRICE_CONFIGURATION_MISSING', 'ยังตั้งราคาประเภทนี้ไม่ครบ');
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PRICE_CATEGORY_PREPARE',
-    payload: { category, expectedVersions: Object.fromEntries(rules.map((rule) => [rule.task_type, String(rule.state_version)])) },
-    configVersion: runtime.config.version }, contextFor(interaction, 'price_category_prepare'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('price_category_submit', session.id,
-    category === 'GAME' ? 'ตั้งราคา Quest เล่นเกม' : 'ตั้งราคา Quest ดูวิดีโอ', [
-      { id: 'amount', label: 'ราคาใหม่ (บาท)', placeholder: money(rules[0].amount_cents), max: 24 },
-    ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('price_category_submit', sessionId,
+      category === 'GAME' ? 'ตั้งราคา Quest เล่นเกม' : 'ตั้งราคา Quest ดูวิดีโอ', [
+        { id: 'amount', label: 'ราคาใหม่ (บาท)', placeholder: '5.00', max: 24 },
+      ]),
+    prepare: async (sessionId) => {
+      const rules = (await runtime.pool.query(`SELECT task_type,amount_cents,state_version FROM price_rules
+        WHERE enabled=true AND rule_type='TYPE' AND task_type=ANY($1::text[])`, [taskTypes])).rows;
+      if (rules.length !== taskTypes.length) throw new QuestshopError('PRICE_CONFIGURATION_MISSING', 'ยังตั้งราคาประเภทนี้ไม่ครบ');
+      return createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+        channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PRICE_CATEGORY_PREPARE',
+        payload: { category, expectedVersions: Object.fromEntries(rules.map((rule) => [rule.task_type, String(rule.state_version)])) },
+        configVersion: runtime.config.version }, contextFor(interaction, 'price_category_prepare'), { pool: runtime.pool });
+    } });
 }
 }
 
@@ -1269,14 +1349,15 @@ if (route.route === 'price_category_confirm' && interaction.isButton()) {
 
 async function handlePromotionSet({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'promo_set' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PROMOTION_TERMS_PREPARE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'promotion_terms_prepare'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('promo_set_submit', session.id, 'ตั้งโบนัสเติมเงิน', [
-    { id: 'tiers', label: 'ยอดเติม=โบนัสเปอร์เซ็นต์', placeholder: '100=10, 300=15, 600=20', max: 300 },
-    { id: 'uses', label: 'จำนวนครั้งต่อผู้ใช้ตลอดรุ่นนี้', placeholder: 'เว้นว่างได้', required: false, max: 10 },
-    { id: 'daily_cap', label: 'โบนัสสูงสุดต่อผู้ใช้ต่อวัน (บาท)', placeholder: 'เว้นว่างได้', required: false, max: 24 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('promo_set_submit', sessionId, 'ตั้งโบนัสเติมเงิน', [
+      { id: 'tiers', label: 'ยอดเติม=โบนัสเปอร์เซ็นต์', placeholder: '100=10, 300=15, 600=20', max: 300 },
+      { id: 'uses', label: 'จำนวนครั้งต่อผู้ใช้ตลอดรุ่นนี้', placeholder: 'เว้นว่างได้', required: false, max: 10 },
+      { id: 'daily_cap', label: 'โบนัสสูงสุดต่อผู้ใช้ต่อวัน (บาท)', placeholder: 'เว้นว่างได้', required: false, max: 24 },
+    ]),
+    prepare: (sessionId) => createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message?.id ?? null, operation: 'PROMOTION_TERMS_PREPARE',
+      payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'promotion_terms_prepare'), { pool: runtime.pool }) });
 }
 }
 
@@ -1352,13 +1433,14 @@ if (route.route === 'promo_toggle_confirm' && interaction.isButton()) {
 async function handleReceiverActivate({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'receiver_activate' && interaction.isButton()) {
   if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'เบอร์รับเงินใช้ได้เฉพาะเจ้าของร้าน');
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'RECEIVER_PREPARE',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'receiver_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('receiver_activate_submit', session.id, 'เพิ่มเบอร์รับเงินใหม่', [
-    { id: 'phone', label: 'เบอร์ TrueMoney 10 หลัก', max: 10 },
-    { id: 'reason', label: 'เหตุผลการเปลี่ยนเบอร์', long: true, max: 500 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('receiver_activate_submit', sessionId, 'เพิ่มเบอร์รับเงินใหม่', [
+      { id: 'phone', label: 'เบอร์ TrueMoney 10 หลัก', max: 10 },
+      { id: 'reason', label: 'เหตุผลการเปลี่ยนเบอร์', long: true, max: 500 },
+    ]),
+    prepare: (sessionId) => createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message.id, operation: 'RECEIVER_PREPARE',
+      payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'receiver_session'), { pool: runtime.pool }) });
 }
 }
 
@@ -1400,12 +1482,13 @@ if (route.route === 'receiver_activate_confirm' && interaction.isButton()) {
 async function handleMonitorAdd({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'monitor_add' && interaction.isButton()) {
   if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'บัญชีตรวจสอบ Quest ใช้ได้เฉพาะเจ้าของร้าน');
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'MONITOR_ADD',
-    payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'monitor_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('monitor_add_submit', session.id, 'เพิ่มบัญชีตรวจสอบ Quest', [
-    { id: 'token', label: 'Discord Token', long: true, max: 300 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('monitor_add_submit', sessionId, 'เพิ่มบัญชีตรวจสอบ Quest', [
+      { id: 'token', label: 'Discord Token', long: true, max: 300 },
+    ]),
+    prepare: (sessionId) => createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message.id, operation: 'MONITOR_ADD',
+      payload: {}, configVersion: runtime.config.version }, contextFor(interaction, 'monitor_session'), { pool: runtime.pool }) });
 }
 }
 
@@ -1477,12 +1560,13 @@ if (route.route === 'monitor_check_one' && interaction.isButton()) {
 async function handleMonitorRotate({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'monitor_rotate' && interaction.isButton()) {
   ownerOnly(interaction, runtime, 'บัญชีตรวจสอบ Quest ใช้ได้เฉพาะเจ้าของร้าน');
-  const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, messageId: interaction.message?.id ?? null,
-    operation: 'MONITOR_ROTATE' }, contextFor(interaction, 'monitor_rotate_load_button'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('monitor_rotate_submit', session.id, 'เปลี่ยน Token บัญชีตรวจสอบ', [
-    { id: 'token', label: 'Discord Token ใหม่', long: true, max: 300 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route, sessionId: route.sessionId,
+    modal: (sessionId) => fieldsModal('monitor_rotate_submit', sessionId, 'เปลี่ยน Token บัญชีตรวจสอบ', [
+      { id: 'token', label: 'Discord Token ใหม่', long: true, max: 300 },
+    ]),
+    prepare: () => loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+      guildId: interaction.guildId, channelId: interaction.channelId, messageId: interaction.message?.id ?? null,
+      operation: 'MONITOR_ROTATE' }, contextFor(interaction, 'monitor_rotate_load_button'), { pool: runtime.pool }) });
 }
 }
 
@@ -1524,7 +1608,7 @@ if (['monitor_enable', 'monitor_disable'].includes(route.route) && interaction.i
 async function handleLegacyMonitorToggle({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'monitor_toggle' && interaction.isButton()) {
   ownerOnly(interaction, runtime, 'บัญชีตรวจสอบ Quest ใช้ได้เฉพาะเจ้าของร้าน');
-  return interaction.reply({ ephemeral: true, content: 'ปุ่มนี้เป็นหน้ารุ่นเก่า กรุณาเปิดรายละเอียดบัญชีใหม่ก่อนเปลี่ยนสถานะ' });
+  return interaction.editReply({ content: 'ปุ่มนี้เป็นหน้ารุ่นเก่า กรุณาเปิดรายละเอียดบัญชีใหม่ก่อนเปลี่ยนสถานะ' });
 }
 }
 
@@ -1534,18 +1618,21 @@ async function handleDlqAction({ interaction, route, runtime, gates: _gates }) {
   }
   const replay = route.route === 'dlq_replay';
   if (!replay && interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'การปิดงานค้างใช้ได้เฉพาะเจ้าของร้าน');
-  const selected = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'DLQ_DETAIL' },
-  contextFor(interaction, 'dlq_action_load'), { pool: runtime.pool });
   const operation = replay ? 'DLQ_REPLAY' : 'DLQ_DISCARD';
-  const session = await advanceInteractionSession(selected, interaction, runtime, {
-    messageId: interaction.message?.id ?? null, operation,
-    payload: { dlqId: selected.payload.dlqId }, configVersion: runtime.config.version,
-  }, 'dlq_action_session');
-  return interaction.showModal(fieldsModal(replay ? 'dlq_replay_submit' : 'dlq_discard_submit', session.id,
-    replay ? 'ลองส่งงานค้างใหม่' : 'ปิดงานค้างที่ไม่เกี่ยวกับเงิน', [
-      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-    ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal(replay ? 'dlq_replay_submit' : 'dlq_discard_submit', sessionId,
+      replay ? 'ลองส่งงานค้างใหม่' : 'ปิดงานค้างที่ไม่เกี่ยวกับเงิน', [
+        { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+      ]),
+    prepare: async (sessionId) => {
+      const selected = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
+        guildId: interaction.guildId, channelId: interaction.channelId, operation: 'DLQ_DETAIL' },
+      contextFor(interaction, 'dlq_action_load'), { pool: runtime.pool });
+      return advanceInteractionSession(selected, interaction, runtime, {
+        id: sessionId, messageId: interaction.message?.id ?? null, operation,
+        payload: { dlqId: selected.payload.dlqId }, configVersion: runtime.config.version,
+      }, 'dlq_action_session');
+    } });
 }
 
 async function handleDlqSubmit({ interaction, route, runtime, gates: _gates }) {
@@ -1600,14 +1687,15 @@ async function handleDlqPick({ interaction, route, runtime, gates: _gates }) {
 
 async function handleConcurrency({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'config_concurrency' && interaction.isButton()) {
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'CONFIG_CONCURRENCY',
-    payload: { expectedVersion: runtime.config.version }, configVersion: runtime.config.version },
-  contextFor(interaction, 'config_concurrency_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('config_concurrency_submit', session.id, 'ตั้งจำนวนงานพร้อมกัน', [
-    { id: 'concurrency', label: `จำนวน Worker (1-${runtime.env.RUNNER_CONCURRENCY_HARD_MAX})`, max: 1 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('config_concurrency_submit', sessionId, 'ตั้งจำนวนงานพร้อมกัน', [
+      { id: 'concurrency', label: `จำนวน Worker (1-${runtime.env.RUNNER_CONCURRENCY_HARD_MAX})`, max: 1 },
+      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+    ]),
+    prepare: (sessionId) => createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message.id, operation: 'CONFIG_CONCURRENCY',
+      payload: { expectedVersion: runtime.config.version }, configVersion: runtime.config.version },
+    contextFor(interaction, 'config_concurrency_session'), { pool: runtime.pool }) });
 }
 }
 
@@ -1634,15 +1722,16 @@ if (route.route === 'config_concurrency_submit' && interaction.isModalSubmit()) 
 async function handleConfig({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'config_roles' && interaction.isButton()) {
   ownerOnly(interaction, runtime, 'การตั้งค่ายศใช้ได้เฉพาะเจ้าของร้าน');
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'CONFIG_ROLES',
-    payload: { expectedVersion: runtime.config.version }, configVersion: runtime.config.version },
-  contextFor(interaction, 'config_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('config_roles_submit', session.id, 'ตั้งค่ายศของระบบ', [
-    { id: 'admin_role', label: 'ID ยศแอดมิน (เว้นว่างเพื่อปิด)', required: false, max: 20 },
-    { id: 'quest_role', label: 'ID ยศแจ้ง Quest ใหม่', required: false, max: 20 },
-    { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('config_roles_submit', sessionId, 'ตั้งค่ายศของระบบ', [
+      { id: 'admin_role', label: 'ID ยศแอดมิน (เว้นว่างเพื่อปิด)', required: false, max: 20 },
+      { id: 'quest_role', label: 'ID ยศแจ้ง Quest ใหม่', required: false, max: 20 },
+      { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
+    ]),
+    prepare: (sessionId) => createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+      channelId: interaction.channelId, messageId: interaction.message.id, operation: 'CONFIG_ROLES',
+      payload: { expectedVersion: runtime.config.version }, configVersion: runtime.config.version },
+    contextFor(interaction, 'config_session'), { pool: runtime.pool }) });
 }
 }
 
@@ -1675,15 +1764,18 @@ if (route.route === 'config_roles_submit' && interaction.isModalSubmit()) {
 async function handleBreakerPrepare({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'breaker_prepare' && interaction.isButton()) {
   if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'ระบบป้องกันการรับซองผิดปกติใช้ได้เฉพาะเจ้าของร้าน');
-  const breaker = (await runtime.pool.query("SELECT * FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
-  const session = await createAdminSession({ actorId: interaction.user.id, guildId: interaction.guildId,
-    channelId: interaction.channelId, messageId: interaction.message.id, operation: 'BREAKER_CHANGE',
-    payload: { breakerKey: breaker.breaker_key, expectedVersion: String(breaker.state_version),
-      beforeState: breaker.state }, configVersion: runtime.config.version },
-  contextFor(interaction, 'breaker_session'), { pool: runtime.pool });
-  return interaction.showModal(fieldsModal('breaker_submit', session.id, 'ทดสอบระบบรับซองอีกครั้ง', [
-    { id: 'reason', label: 'หลักฐานและเหตุผล', long: true, max: 500 },
-  ]));
+  return showPreparedModal({ interaction, runtime, route,
+    modal: (sessionId) => fieldsModal('breaker_submit', sessionId, 'ทดสอบระบบรับซองอีกครั้ง', [
+      { id: 'reason', label: 'หลักฐานและเหตุผล', long: true, max: 500 },
+    ]),
+    prepare: async (sessionId) => {
+      const breaker = (await runtime.pool.query("SELECT * FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
+      return createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
+        channelId: interaction.channelId, messageId: interaction.message.id, operation: 'BREAKER_CHANGE',
+        payload: { breakerKey: breaker.breaker_key, expectedVersion: String(breaker.state_version),
+          beforeState: breaker.state }, configVersion: runtime.config.version },
+      contextFor(interaction, 'breaker_session'), { pool: runtime.pool });
+    } });
 }
 }
 
@@ -1709,6 +1801,7 @@ if (route.route === 'breaker_submit' && interaction.isModalSubmit()) {
 
 export const ROUTE_HANDLERS = Object.freeze({
   "start": handleStart,
+  "token_open": handleTokenOpen,
   "topup": handleTopup,
   "payment_method": handlePaymentMethod,
   "voucher_submit": handleVoucherSubmit,
@@ -1795,31 +1888,31 @@ async function dispatchRoute(context) {
 function startInteractionMetrics(interaction, runtime) {
   const started = performance.now();
   const traceId = uuidv7();
+  const route = parseCustomId(interaction.customId)?.route ?? interaction.commandName ?? null;
+  interaction.__questshopTraceId = traceId;
   let acknowledged = false;
+  let acknowledgement = ACKNOWLEDGEMENT.NONE;
   const write = (operation, outcome, durationMs, errorClass = null) => runtime.pool.query(`
-    INSERT INTO operation_metrics(id,operation,outcome,duration_ms,error_class,trace_id)
-    VALUES($1,$2,$3,$4,$5,$6)
-  `, [uuidv7(), operation, outcome, Math.max(0, Math.round(durationMs)), errorClass, traceId]).catch(() => {});
-  const markAcknowledged = () => {
+    INSERT INTO operation_metrics(id,operation,outcome,duration_ms,error_class,trace_id,route,acknowledgement)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+  `, [uuidv7(), operation, outcome, Math.max(0, Math.round(durationMs)), errorClass, traceId, route, acknowledgement]).catch(() => {});
+  const markAcknowledged = (method) => {
     if (acknowledged) return;
     acknowledged = true;
+    acknowledgement = method;
     write('INTERACTION_ACK', 'SUCCESS', performance.now() - started);
   };
-  for (const method of ['reply', 'deferReply', 'showModal', 'update', 'deferUpdate']) {
-    if (typeof interaction[method] !== 'function') continue;
-    const original = interaction[method].bind(interaction);
-    interaction[method] = async (...args) => {
-      const result = await original(...args);
-      interaction.__questshopAcknowledgement = method;
-      markAcknowledged();
-      return result;
-    };
-  }
+  installResponseController(interaction, { onAcknowledged: markAcknowledged });
   return {
     complete(error = null) {
       const operation = isBackoffice(interaction, runtime) ? 'PANEL_REQUEST' : 'CUSTOMER_INTERACTION';
-      write(operation, error ? 'ERROR' : 'SUCCESS', performance.now() - started,
+      const outcome = error ? (error instanceof QuestshopError ? 'REJECTED' : 'ERROR') : 'SUCCESS';
+      write(operation, outcome, performance.now() - started,
         error?.category ?? error?.code ?? error?.name ?? null);
+      if (!acknowledged) write('INTERACTION_ACK', 'ACK_FAILED', performance.now() - started,
+        error?.category ?? error?.code ?? error?.name ?? null);
+      runtime.logger?.debug?.({ traceId, interactionId: interaction.id,
+        acknowledgement, durationMs: Math.round(performance.now() - started), outcome }, 'interaction completed');
     },
   };
 }
@@ -1854,11 +1947,21 @@ export async function routeInteraction(interaction) {
     if (!interactionMatchesContract(interaction, routeContract(route.route).interaction)) {
       throw new QuestshopError('ROUTE_INTERACTION_INVALID', 'รูปแบบการกดเมนูไม่ถูกต้อง กรุณาเปิดแผงใหม่แล้วลองอีกครั้ง');
     }
-    const gates = await authorizeRoute(interaction, route, runtime);
+    const contract = routeContract(route.route);
+    const gates = preAuthorizeRoute(interaction, route, runtime);
+    if (contract.response !== 'MODAL') await acknowledgeByContract(interaction, contract.response);
+    if (contract.response === 'MODAL') {
+      return dispatchRoute({ interaction, route, runtime, gates });
+    }
+    await authorizeRoute(interaction, route, runtime);
+    if (interaction.isModalSubmit()) await waitForModalPreparation(runtime, route.sessionId);
     return dispatchRoute({ interaction, route, runtime, gates });
   } catch (error) {
     failure = error;
-    runtime.logger.error({ error: safeError(error), interactionId: interaction.id }, 'interaction failed');
+    const log = error instanceof QuestshopError ? runtime.logger.info.bind(runtime.logger) : runtime.logger.error.bind(runtime.logger);
+    log({ error: safeError(error), traceId: interaction.__questshopTraceId, interactionId: interaction.id,
+      route: parseCustomId(interaction.customId)?.route ?? interaction.commandName ?? null,
+      acknowledgement: acknowledgementOf(interaction) }, error instanceof QuestshopError ? 'interaction rejected' : 'interaction failed');
     return ephemeralError(interaction, error).catch(() => null);
   } finally {
     metrics.complete(failure);

@@ -3,6 +3,7 @@ import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
 import { appendAdminAudit } from '../../domain/admin/audit.js';
+import { reconcileIncident } from '../../domain/incidents/service.js';
 import { fetchDiscordMessage, findDiscordMessage, isMissingDiscordMessage } from '../transport.js';
 
 function surfacePayload(surfaceKey, config) {
@@ -83,6 +84,7 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
     if (anchor.recreated) await deactivateOrphan(anchor.message, options.pool, surfaceKey, context);
     throw error;
   }
+  let cleanupFailed = false;
   if (existing?.message_id && (existing.channel_id !== channel.id || existing.message_id !== anchor.message.id)) {
     try {
       const old = await interaction.guild.channels.fetch(existing.channel_id);
@@ -90,19 +92,29 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
       await oldMessage?.edit({ content: 'แผงนี้ถูกย้ายแล้ว', embeds: [], components: [] });
     } catch (error) {
       await recordSurfaceIncidentSafely(options.pool, surfaceKey, error, context);
+      cleanupFailed = true;
     }
   }
+  if (!cleanupFailed) await resolveSurfaceIncidentSafely(options.pool, surfaceKey, context);
   return anchor.message;
 }
 
 async function recordSurfaceIncident(pool, surfaceKey, error, context) {
-  return pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-    VALUES(gen_random_uuid(),'DISCORD_SURFACE_RECONCILE_FAILED',$1,'OPEN','ERROR',$2,$3)
-    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-      evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`, [surfaceKey, {
+  return reconcileIncident({ code: 'DISCORD_SURFACE_RECONCILE_FAILED', scope: surfaceKey, active: true,
+    severity: 'ERROR', evidence: {
     code: String(error?.code ?? error?.name ?? 'UNKNOWN').slice(0, 100),
     status: Number(error?.status) || null,
-  }, context.traceId]);
+  } }, context, { pool });
+}
+
+async function resolveSurfaceIncidentSafely(pool, surfaceKey, context) {
+  try {
+    await reconcileIncident({ code: 'DISCORD_SURFACE_RECONCILE_FAILED', scope: surfaceKey,
+      active: false, severity: 'ERROR', evidence: {} }, context, { pool });
+  } catch {
+    // A successful Discord repair must not be reported as failed because the
+    // non-financial incident projection could not be updated.
+  }
 }
 
 async function recordSurfaceIncidentSafely(pool, surfaceKey, error, context) {
@@ -149,10 +161,14 @@ async function reconcileOneSurface({ guild, pool, surface, config, context }) {
   message ??= await findSurfaceMarker(channel, surface.surface_key);
   const needsRefresh = !message || surface.state === 'RECONCILING'
     || Number(surface.rendered_config_version) < Number(config?.version ?? 0);
-  if (!needsRefresh) return { surfaceKey: surface.surface_key, skipped: true };
+  if (!needsRefresh) {
+    await resolveSurfaceIncidentSafely(pool, surface.surface_key, context);
+    return { surfaceKey: surface.surface_key, skipped: true };
+  }
   const anchor = await updateOrCreateSurfaceAnchor(channel, surface.surface_key, config, message);
   const updated = await persistReconciledSurface(pool, surface, anchor.message, config, anchor, context);
   if (updated) {
+    await resolveSurfaceIncidentSafely(pool, surface.surface_key, context);
     return { surfaceKey: surface.surface_key, recreated: anchor.recreated,
       refreshed: Boolean(message), messageId: anchor.message.id };
   }

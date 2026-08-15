@@ -16,6 +16,7 @@ import { rotateEncryptedRows } from './key-rotation-worker.js';
 import { evaluateAlerts } from './alert-worker.js';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { usesApplicationBackup } from '../config/env.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
 
 async function gate(pool, name) {
   return (await pool.query('SELECT enabled FROM feature_gates WHERE gate = $1', [name])).rows[0]?.enabled === true;
@@ -35,11 +36,10 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
       VALUES($1,$2,$3,$4,$5)`, [uuidv7(), `WORKER:${name}`, error ? 'ERROR' : 'SUCCESS',
       Math.max(0, durationMs), error?.category ?? error?.code ?? error?.name ?? null]);
     if (error?.code === 'SECRET_DECRYPT_FAILED') {
-      await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-        VALUES($1,'SECRET_DECRYPT_FAILED','CRYPTO','OPEN','CRITICAL',$2,$3)
-        ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-          severity=EXCLUDED.severity,evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-      [uuidv7(), { worker: name }, uuidv7()]);
+      const context = createContext({ actorType: 'SYSTEM', actorId: 'worker-manager', guildId: env.DISCORD_GUILD_ID,
+        idempotencyKey: `worker-secret-decrypt:${name}` });
+      await reconcileIncident({ code: 'SECRET_DECRYPT_FAILED', scope: 'CRYPTO', active: true,
+        severity: 'CRITICAL', evidence: { worker: name } }, context, { pool });
     }
   };
   const start = (name, runOnce, idleMs) => tasks.push(runWorkerLoop({ name, signal, health, logger,

@@ -3,6 +3,13 @@ import { createEncryptedBackup } from '../adapters/s3/backup.js';
 import { DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import { createS3Client } from '../adapters/s3/client.js';
 import { usesApplicationBackup } from '../config/env.js';
+import { createContext } from '../shared/correlation.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
+
+function backupContext(env, action) {
+  return createContext({ actorType: 'SYSTEM', actorId: 'backup-worker', guildId: env.DISCORD_GUILD_ID,
+    idempotencyKey: `backup:${action}` });
+}
 
 export async function pruneExpiredBackups({ env, pool }) {
   const expired = (await pool.query(`SELECT id,object_key,manifest FROM backup_runs
@@ -28,11 +35,8 @@ export async function runScheduledBackup({ env, pool }) {
   if (!usesApplicationBackup(env)) return false;
   try { await pruneExpiredBackups({ env, pool }); }
   catch (error) {
-    await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-      VALUES(gen_random_uuid(),'BACKUP_RETENTION_FAILED','S3','OPEN','ERROR',$1,gen_random_uuid())
-      ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-        evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-    [{ errorCode: error.code ?? error.name }]);
+    await reconcileIncident({ code: 'BACKUP_RETENTION_FAILED', scope: 'S3', active: true,
+      severity: 'ERROR', evidence: { errorCode: error.code ?? error.name } }, backupContext(env, 'retention'), { pool });
     throw error;
   }
   const due = (await pool.query(`SELECT
@@ -53,9 +57,8 @@ export async function runScheduledBackup({ env, pool }) {
   } catch (error) {
     await pool.query(`UPDATE backup_runs SET state='FAILED',error_code=$2,completed_at=clock_timestamp()
       WHERE id=$1`, [id, error.code ?? error.name]);
-    await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-      VALUES(gen_random_uuid(),'BACKUP_FAILED','DAILY','OPEN','CRITICAL',$1,gen_random_uuid())`,
-    [{ errorCode: error.code ?? error.name }]);
+    await reconcileIncident({ code: 'BACKUP_FAILED', scope: 'DAILY', active: true,
+      severity: 'CRITICAL', evidence: { errorCode: error.code ?? error.name } }, backupContext(env, 'daily'), { pool });
     throw error;
   }
   return true;

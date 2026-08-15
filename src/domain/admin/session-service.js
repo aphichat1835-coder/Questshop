@@ -3,12 +3,12 @@ import { withTransaction } from '../../db/transaction.js';
 import { AuthorizationError, QuestshopError } from '../../shared/errors.js';
 import { recordTransition } from '../shared/transition.js';
 
-export async function createAdminSession({ actorId, guildId, channelId, messageId,
+export async function createAdminSession({ id = uuidv7(), actorId, guildId, channelId, messageId,
   operation, payload, configVersion, ttlMinutes = 5 }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => (
     (await client.query(`INSERT INTO interaction_sessions(id,actor_id,guild_id,channel_id,message_id,
       operation,config_version,payload,trace_id,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,
-      clock_timestamp()+make_interval(mins=>$10)) RETURNING *`, [uuidv7(), actorId, guildId,
+      clock_timestamp()+make_interval(mins=>$10)) RETURNING *`, [id, actorId, guildId,
       channelId, messageId, operation, configVersion, payload, context.traceId, ttlMinutes])).rows[0]
   ));
 }
@@ -36,7 +36,8 @@ export async function advanceAdminSession({
       fromState: current.state, toState: terminated.state, stateVersion: terminated.state_version, context });
     const next = (await client.query(`INSERT INTO interaction_sessions(id,actor_id,guild_id,channel_id,message_id,
         operation,config_version,payload,trace_id,expires_at)
-      VALUES(gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp()+make_interval(mins=>$9)) RETURNING *`, [
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,clock_timestamp()+make_interval(mins=>$10)) RETURNING *`, [
+      child.id ?? uuidv7(),
       actorId, guildId, child.channelId, child.messageId ?? null, child.operation,
       child.configVersion, child.payload ?? {}, context.traceId, child.ttlMinutes ?? 5,
     ])).rows[0];

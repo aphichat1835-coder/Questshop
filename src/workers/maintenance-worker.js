@@ -264,11 +264,10 @@ async function maintainMonitorsAndDailyTopupLocks(database, context) {
 }
 
 async function queueMaintenanceNotifications(database, context) {
-  const incidents = await database.query(`SELECT *,floor(extract(epoch FROM updated_at))::bigint AS version
-      FROM incidents WHERE state<>'RESOLVED'`);
+  const incidents = await database.query(`SELECT * FROM incidents WHERE state<>'RESOLVED'`);
   for (const incident of incidents.rows) await enqueueProjection(database, {
       projectionType: 'SYSTEM_INCIDENT', aggregateType: 'INCIDENT', aggregateId: incident.id,
-      aggregateVersion: incident.version, surfaceKey: 'LOG_SYSTEM', context,
+      aggregateVersion: incident.state_version, surfaceKey: 'LOG_SYSTEM', context,
     });
   const dueReviews = await database.query(`UPDATE manual_reviews SET remind_at=clock_timestamp()+interval '24 hours'
       WHERE state<>'RESOLVED' AND remind_at<=clock_timestamp()

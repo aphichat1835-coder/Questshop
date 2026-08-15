@@ -18,6 +18,8 @@ import { validateKeyringCoverage } from './keyring-coverage.js';
 import { validateKeyringSentinels } from './keyring-sentinels.js';
 import { validateRuntimeRole } from '../db/role-contract.js';
 import { processOutbox } from '../workers/outbox-worker.js';
+import { verifyConfiguredSourceSha } from '../config/source-version.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
 
 export async function openRuntimeDatabase(env, health, dependencies = {}) {
   const pool = (dependencies.getRuntimePool ?? getRuntimePool)(env);
@@ -161,11 +163,11 @@ async function markRuntimeReady({ env, health, logger, pool }) {
 
 async function recordStartupCryptoIncident(pool, error) {
   if (!pool || error?.code !== 'SECRET_DECRYPT_FAILED') return;
-  await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-    VALUES($1,'SECRET_DECRYPT_FAILED','CRYPTO','OPEN','CRITICAL',$2,$3)
-    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-      severity=EXCLUDED.severity,evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-  [uuidv7(), { phase: 'startup' }, uuidv7()]).catch(() => null);
+  await reconcileIncident({ code: 'SECRET_DECRYPT_FAILED', scope: 'CRYPTO', active: true,
+    severity: 'CRITICAL', evidence: { phase: 'startup' } }, {
+    traceId: uuidv7(), causationId: null, actorType: 'SYSTEM', actorId: 'startup', guildId: 'SYSTEM',
+    idempotencyKey: 'startup-secret-decrypt',
+  }, { pool }).catch(() => null);
 }
 
 async function cleanupFailedStartup({ abortController, client, error, health, heartbeat, logger, pool, server }) {
@@ -206,6 +208,7 @@ export async function startup({ health = createHealthState(), server: existingSe
   let runtime;
   try {
     const env = loadRuntimeEnvironment();
+    const source = verifyConfiguredSourceSha(env);
     health.checks.config = 'OK';
     assertStarting();
     pool = await openRuntimeDatabase(env, health);
@@ -216,6 +219,9 @@ export async function startup({ health = createHealthState(), server: existingSe
     health.checks.bootstrap = 'RECOVERING';
     runtime = { env, logger, health, server, pool, client: null, config, workers: null, abortController,
       heartbeat: null, runtimeLease, runtimeHolder: holder, acceptingInteractions: false, shutdownPromise: null };
+    health.checks.sourceSha = source.verified ? 'OK' : 'UNVERIFIED';
+    logger.info({ configuredGitSha: env.GIT_SHA, sourceSha: source.sourceSha, sourceShaVerified: source.verified },
+      'Questshop source revision');
     // A lease acquired before Discord login must remain owned during recovery.
     // Components observe this same object and remain closed until Ready.
     runtime.heartbeat = startRuntimeHeartbeat({ abortController, env, holder, pool, runtimeLease,

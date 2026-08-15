@@ -1,10 +1,11 @@
 import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { setImmediate } from 'node:timers/promises';
 import { createTestPool } from '../fixtures/postgres.js';
 import { customId, parseCustomId } from '../../src/discord/components/custom-id.js';
 import {
-  ROUTE_HANDLERS, authorizeRoute, formatInteractionError, interactionMatchesContract,
+  ROUTE_HANDLERS, authorizeRoute, formatInteractionError, interactionMatchesContract, routeInteraction,
 } from '../../src/discord/interactions/router.js';
 import { ADMIN, CUSTOMER, OWNER, ROUTE_CONTRACTS, routeContract } from '../../src/discord/interactions/contracts.js';
 import {
@@ -83,6 +84,34 @@ test('interaction errors expose only safe business copy and a bounded support co
   const invalid = formatInteractionError(new TypeError('internal parser detail'), '123456789012345678');
   assert.match(invalid, /ข้อมูลที่กรอกไม่ถูกต้อง/);
   assert.doesNotMatch(invalid, /internal parser detail/);
+});
+
+test('a route acknowledgement is sent before its first slow database operation', async () => {
+  let releaseQuery;
+  const calls = [];
+  const queryStarted = new Promise((resolve) => { releaseQuery = resolve; });
+  const runtime = {
+    acceptingInteractions: true,
+    env: { PRELAUNCH: false, OWNER_ID: 'owner', DISCORD_GUILD_ID: 'guild' },
+    config: { values: {}, gates: { STORE_OPEN: true, CUSTOMER_INTERACTIONS_ENABLED: true,
+      TOPUP_ACCEPTING: true, ORDER_ACCEPTING: true } },
+    health: { workers: {}, startedAt: new Date().toISOString() },
+    logger: { debug: () => {}, info: () => {}, error: () => {} },
+    pool: { query: async () => { await queryStarted; return { rows: [] }; } },
+  };
+  const interaction = {
+    id: '123456789012345678', customId: customId('monitor_list'), user: { id: 'owner' }, guildId: 'guild', channelId: 'channel',
+    client: { questshop: runtime, isReady: () => true }, member: { roles: { cache: { has: () => true } } },
+    inGuild: () => true, isChatInputCommand: () => false, isButton: () => true,
+    isStringSelectMenu: () => false, isUserSelectMenu: () => false, isModalSubmit: () => false,
+    deferUpdate: async () => { calls.push('deferUpdate'); }, editReply: async () => { calls.push('editReply'); },
+  };
+  const running = routeInteraction(interaction);
+  await setImmediate();
+  assert.deepEqual(calls, ['deferUpdate']);
+  releaseQuery();
+  await running;
+  assert.deepEqual(calls, ['deferUpdate', 'editReply']);
 });
 
 test('pre-launch keeps customer routes limited to Owner or Admin even when UAT gates are open', async () => {

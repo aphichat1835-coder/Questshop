@@ -4,6 +4,7 @@ import { createQuestApiClient, profileFromEnv } from '../quest-engine/api/client
 import { getPersistentDiscordRateLimitCoordinator } from '../quest-engine/rate-limits/coordinator.js';
 import { createContext } from '../shared/correlation.js';
 import { ingestDiscovery } from '../domain/catalog/service.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
 
 async function loadScanMonitors(pool) {
   return (await pool.query(`SELECT m.*,c.key_version,c.nonce,c.ciphertext,c.auth_tag
@@ -22,11 +23,8 @@ async function markMonitorFailure(pool, monitor, error, context) {
     cooldown_until=CASE WHEN $2='COOLDOWN' THEN clock_timestamp()+interval '15 minutes' ELSE cooldown_until END,
     updated_at=clock_timestamp() WHERE id=$1 AND state_version=$4 AND state<>'DISABLED' RETURNING state`,
   [monitor.id, state, failures, monitor.state_version])).rows[0];
-  if (updated?.state === 'QUARANTINED') await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-    VALUES(gen_random_uuid(),'MONITOR_QUARANTINED',$1,'OPEN','ERROR',$2,$3)
-    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
-    DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-  [monitor.id, { errorCode: error.code ?? error.name }, context.traceId]);
+  if (updated?.state === 'QUARANTINED') await reconcileIncident({ code: 'MONITOR_QUARANTINED', scope: monitor.id,
+    active: true, severity: 'ERROR', evidence: { errorCode: error.code ?? error.name } }, context, { pool });
 }
 
 async function fetchMonitorQuests(monitor, { env, pool, signal }) {

@@ -192,6 +192,10 @@ npm start
 `npm run deploy` เท่ากับ `setup:verify → migrate → register` และเป็นคำสั่งเดียวที่ควรรับผิดชอบ migration
 กับการลงทะเบียน command. `npm start` ไม่ migrate และใช้ Runtime credential เท่านั้น
 
+ระหว่าง `setup:verify` ระบบจะเทียบ `GIT_SHA` กับ `git rev-parse HEAD` หาก host มี Git metadata อยู่แล้ว
+และจะหยุดทันทีเมื่อไม่ตรงกัน; หาก host ไม่ส่ง Git metadata มา ระบบจะแสดง `sourceShaVerified:false` เพื่อไม่
+กล่าวอ้างว่า SHA จาก Environment เป็น source ที่พิสูจน์แล้ว
+
 ## รันบน inwcloud + Aiven
 
 1. ตั้ง Runtime เป็น **Node.js 22.x LTS**

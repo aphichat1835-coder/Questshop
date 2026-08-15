@@ -168,6 +168,10 @@ start
 → Questshop ready
 ```
 
+หาก inwcloud checkout มี Git metadata อยู่ `setup:verify` จะรายงาน `sourceShaVerified:true` พร้อม `sourceSha`
+ซึ่งต้องตรงกับ `GIT_SHA`; ถ้า host ไม่ส่ง Git metadata ระบบจะรายงาน `sourceShaVerified:false` และห้ามใช้
+Environment SHA เพียงอย่างเดียวเป็นหลักฐานว่า source ที่รันตรงกับ revision ที่เลือก
+
 ความหมาย:
 
 - `applied: 0` = schema อยู่ version ล่าสุดแล้ว เป็นผลปกติ
@@ -195,6 +199,7 @@ start
 |---|---|---|
 | `DATABASE_DIRECT_URL ... undefined` | deploy ต้องใช้ Migrator URL แต่ยังไม่ตั้ง | เพิ่ม URL ของ `questshop_migrator` พร้อม `sslmode=verify-full` |
 | `GIT_SHA must be the 40-character...` | SHA ไม่ครบหรือไม่ใช่ hexadecimal | คัดลอก commit SHA เต็มของ source ที่ inwcloud ดึงจริง |
+| `GIT_SHA does not match checked-out source` | ค่า Environment ยังเป็น SHA เก่า | ตั้ง `GIT_SHA` ให้ตรงกับ branch/commit ที่ inwcloud checkout แล้ว deploy ใหม่ |
 | `POSTGRES_RUNTIME_ROLE_CONTRACT_FAILED` | Runtime ได้สิทธิ์ฐานข้อมูลเกิน policy | ยืนยันว่า Direct URL ใช้ migrator แยก, รัน deploy ใหม่; ถ้ายังไม่ผ่านให้ตรวจ Aiven bootstrap grants/membership |
 | `Questshop bot must have Discord Administrator permission` | Discord bot ไม่มี Administrator | เพิ่มสิทธิ์ใน Discord แล้ว restart |
 | Error TLS/CA | URL/CA ไม่ตรง Aiven certificate chain | URL ต้อง `sslmode=verify-full`; ตรวจ Base64 ของ CA และเอา `/tmp`/`NODE_EXTRA_CA_CERTS` workaround ออก |
@@ -236,7 +241,7 @@ Discord 403 จะถูกบันทึกเป็น incident แต่บ�
 ## 9. หลัง deploy แล้วทำอะไรต่อ
 
 1. ตรวจ `/livez` และ `/readyz`
-2. ตรวจ SHA ใน `Questshop ready` ให้ตรงกับ source ที่เลือก
+2. ตรวจ log `Questshop source revision`; หาก `sourceShaVerified:true`, `configuredGitSha` และ `sourceSha` ต้องตรงกัน
 3. Owner ติดตั้ง 8 surfaces ด้วย slash commands
 4. ยืนยันว่า `PRELAUNCH=true`; ระบบปกติจะเปิดอัตโนมัติ แต่ลูกค้าทั่วไปยังถูกจำกัดโดย Pre-launch policy
 5. ทำ [Pre-launch UAT](../uat/prelaunch.md) ตามลำดับบน SHA เดียวกัน
