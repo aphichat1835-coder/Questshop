@@ -623,31 +623,59 @@ async function handleTestFailureRetry({ interaction, route, runtime, gates: _gat
     : 'รับคำสั่งแล้ว ระบบจะทดสอบใหม่สูงสุด 3 ครั้งต่อ Monitor และหยุดทันทีเมื่อผ่าน');
 }
 
-export async function authorizeRoute(interaction, route, runtime) {
-  await assertSurfaceBinding(interaction, route, runtime);
-  const contract = routeContract(route.route);
-  if (!contract) return null;
-  const backofficeRoute = contract.access !== CUSTOMER;
+function assertPrelaunchRouteAccess(interaction, contract, runtime) {
+  const customerRoute = contract.access === CUSTOMER;
   // Pre-launch intentionally uses the production guild, database and real
   // financial adapters.  It must therefore be an Owner/Admin-only test round:
   // opening a gate for UAT must not accidentally make the store public.
-  if (runtime.env.PRELAUNCH && !backofficeRoute && !isBackoffice(interaction, runtime)) {
+  if (runtime.env.PRELAUNCH && customerRoute && !isBackoffice(interaction, runtime)) {
     throw new QuestshopError('PRELAUNCH_RESTRICTED', 'ช่วงทดสอบ Pre-launch ใช้ได้เฉพาะ Owner/Admin');
   }
+}
+
+async function consumeCustomerButtonRateLimit(interaction, route, runtime) {
   if (interaction.isButton() && ['start', 'topup'].includes(route.route)) {
     await consumeRateLimit({ discordUserId: interaction.user.id, operation: 'BUTTON' },
       contextFor(interaction, 'button_rate'), { pool: runtime.pool });
   }
-  const gates = runtime.config.gates ?? Object.fromEntries((await runtime.pool.query('SELECT gate, enabled FROM feature_gates')).rows.map((row) => [row.gate, row.enabled]));
+}
+
+async function loadAuthorizationGates(runtime) {
+  if (runtime.config.gates) return runtime.config.gates;
+  const result = await runtime.pool.query('SELECT gate, enabled FROM feature_gates');
+  return Object.fromEntries(result.rows.map((row) => [row.gate, row.enabled]));
+}
+
+function assertRouteRole(interaction, contract, runtime) {
   if (contract.access === OWNER && interaction.user.id !== runtime.env.OWNER_ID) {
     throw new QuestshopError('OWNER_ONLY', 'เมนูนี้ใช้ได้เฉพาะ Owner');
   }
   if (contract.access === ADMIN && !isBackoffice(interaction, runtime)) {
     throw new QuestshopError('ADMIN_ONLY', 'เมนูนี้ใช้ได้เฉพาะ Owner/Admin');
   }
-  if (!backofficeRoute && (!gates.STORE_OPEN || !gates.CUSTOMER_INTERACTIONS_ENABLED)) throw new QuestshopError('STORE_CLOSED', 'ร้านปิดรับรายการชั่วคราว');
-  if (contract.gates.includes('TOPUP_ACCEPTING') && !gates.TOPUP_ACCEPTING) throw new QuestshopError('TOPUP_CLOSED', 'ระบบเติมเงินปิดชั่วคราว');
-  if (contract.gates.includes('ORDER_ACCEPTING') && !gates.ORDER_ACCEPTING) throw new QuestshopError('ORDER_CLOSED', 'ระบบรับ Quest ปิดชั่วคราว');
+}
+
+function assertCustomerRouteGates(contract, gates) {
+  if (!gates.STORE_OPEN || !gates.CUSTOMER_INTERACTIONS_ENABLED) {
+    throw new QuestshopError('STORE_CLOSED', 'ร้านปิดรับรายการชั่วคราว');
+  }
+  if (contract.gates.includes('TOPUP_ACCEPTING') && !gates.TOPUP_ACCEPTING) {
+    throw new QuestshopError('TOPUP_CLOSED', 'ระบบเติมเงินปิดชั่วคราว');
+  }
+  if (contract.gates.includes('ORDER_ACCEPTING') && !gates.ORDER_ACCEPTING) {
+    throw new QuestshopError('ORDER_CLOSED', 'ระบบรับ Quest ปิดชั่วคราว');
+  }
+}
+
+export async function authorizeRoute(interaction, route, runtime) {
+  await assertSurfaceBinding(interaction, route, runtime);
+  const contract = routeContract(route.route);
+  if (!contract) return null;
+  assertPrelaunchRouteAccess(interaction, contract, runtime);
+  await consumeCustomerButtonRateLimit(interaction, route, runtime);
+  const gates = await loadAuthorizationGates(runtime);
+  assertRouteRole(interaction, contract, runtime);
+  if (contract.access === CUSTOMER) assertCustomerRouteGates(contract, gates);
   return gates;
 }
 

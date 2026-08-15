@@ -33,7 +33,7 @@ export async function findDiscordMessage(channel, predicate, { limit = 100, maxi
   while (inspected < maximum) {
     const page = await channel.messages.fetch({ limit: Math.min(limit, maximum - inspected), ...(before ? { before } : {}) });
     const messages = messageValues(page);
-    const match = messages.find(predicate);
+    const match = messages.find((message) => predicate(message));
     if (match) return match;
     inspected += messages.length;
     if (messages.length < limit) return null;

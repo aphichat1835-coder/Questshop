@@ -63,7 +63,6 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
   }
   message ??= await findSurfaceMarker(channel, surfaceKey);
   const anchor = await updateOrCreateSurfaceAnchor(channel, surfaceKey, config, message);
-  message = anchor.message;
   try {
     await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
       await client.query(`
@@ -76,16 +75,16 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
         rendered_config_version = EXCLUDED.rendered_config_version,
         state_version = surfaces.state_version + 1, last_validated_at = clock_timestamp(),
         updated_at = clock_timestamp()
-      `, [surfaceKey, interaction.guildId, channel.id, message.id, Number(config?.version ?? 0)]);
+      `, [surfaceKey, interaction.guildId, channel.id, anchor.message.id, Number(config?.version ?? 0)]);
       await appendAdminAudit(client, { action: 'SURFACE_SETUP', targetType: 'SURFACE', targetId: surfaceKey,
         actorId: interaction.user.id, before: existing ?? null,
-        after: { channelId: channel.id, messageId: message.id }, reason: 'setup command', context });
+        after: { channelId: channel.id, messageId: anchor.message.id }, reason: 'setup command', context });
     });
   } catch (error) {
-    if (anchor.recreated) await deactivateOrphan(message, options.pool, surfaceKey, context);
+    if (anchor.recreated) await deactivateOrphan(anchor.message, options.pool, surfaceKey, context);
     throw error;
   }
-  if (existing?.message_id && (existing.channel_id !== channel.id || existing.message_id !== message.id)) {
+  if (existing?.message_id && (existing.channel_id !== channel.id || existing.message_id !== anchor.message.id)) {
     try {
       const old = await interaction.guild.channels.fetch(existing.channel_id);
       const oldMessage = old?.isTextBased() ? await fetchSurfaceMessageFresh(old, existing.message_id) : null;
@@ -94,7 +93,7 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
       await recordSurfaceIncidentSafely(options.pool, surfaceKey, error, context);
     }
   }
-  return message;
+  return anchor.message;
 }
 
 async function recordSurfaceIncident(pool, surfaceKey, error, context) {
