@@ -83,6 +83,8 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
   state counts and oldest pending age for diagnosis.
 - A recovered Discord surface now resolves its prior `DISCORD_SURFACE_RECONCILE_FAILED` incident and updates the
   existing LOG_SYSTEM projection. Worker liveness is based on an active heartbeat rather than only completed work.
+- Incident projections are queued only after `LOG_SYSTEM` is installed and active, so a not-yet-installed log surface
+  cannot accumulate unrelated Outbox work or delay customer-facing notification delivery.
 
 - Discord interaction routing is now governed by one explicit contract per persistent route (audience, component
   type and customer gate). Backoffice actions remain usable while customer intake is closed, forged component types

@@ -163,6 +163,9 @@ test('Aiven-managed alert evaluation skips local backup tables and clears no bac
       queries.push(String(sql));
       return pool.query(sql, values);
     },
+    connect() {
+      return pool.connect();
+    },
   };
   const health = { ready: true, status: 'HEALTHY', workers: {} };
   await evaluateAlerts({ pool: aivenPool, health, env: { BACKUP_MODE: 'AIVEN_MANAGED' } });

@@ -4,6 +4,9 @@ import { enqueueProjection } from '../outbox/service.js';
 import { recordTransition } from '../shared/transition.js';
 
 async function enqueueIncidentProjection(client, incident, context) {
+  const logSystemActive = (await client.query(`SELECT 1 FROM surfaces
+    WHERE surface_key='LOG_SYSTEM' AND state='ACTIVE'`)).rowCount > 0;
+  if (!logSystemActive) return null;
   return enqueueProjection(client, {
     projectionType: 'SYSTEM_INCIDENT', aggregateType: 'INCIDENT', aggregateId: incident.id,
     aggregateVersion: incident.state_version, surfaceKey: 'LOG_SYSTEM', context,
