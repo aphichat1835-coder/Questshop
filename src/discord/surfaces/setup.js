@@ -5,11 +5,32 @@ import { renderSurfaceAnchor } from '../renderers/surfaces.js';
 import { appendAdminAudit } from '../../domain/admin/audit.js';
 import { reconcileIncident } from '../../domain/incidents/service.js';
 import { fetchDiscordMessage, findDiscordMessage, isMissingDiscordMessage } from '../transport.js';
+import { normalizeDiscordPayload } from '../payload.js';
+
+// Setup commands can be issued concurrently from two Discord interactions.
+// The runtime is intentionally all-in-one, so a keyed promise lock prevents
+// two anchors for the same durable surface from being created in one process.
+const surfaceSetupLocks = new Map();
+
+async function withSurfaceSetupLock(surfaceKey, work) {
+  const previous = surfaceSetupLocks.get(surfaceKey) ?? Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const queued = previous.then(() => current);
+  surfaceSetupLocks.set(surfaceKey, queued);
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (surfaceSetupLocks.get(surfaceKey) === queued) surfaceSetupLocks.delete(surfaceKey);
+  }
+}
 
 function surfacePayload(surfaceKey, config) {
   const body = renderSurfaceAnchor(surfaceKey, config?.values ?? config);
   body.embeds?.[0]?.setFooter?.({ text: `Questshop Surface • ${surfaceKey}` });
-  return body;
+  return normalizeDiscordPayload(body);
 }
 
 async function findSurfaceMarker(channel, surfaceKey) {
@@ -51,7 +72,7 @@ export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, e
   return { message: created, recreated: true };
 }
 
-export async function setupSurface({ interaction, surfaceKey, config }, context, options = {}) {
+async function setupSurfaceLocked({ interaction, surfaceKey, config }, context, options = {}) {
   const channel = interaction.options.getChannel('channel') ?? interaction.channel;
   if (!channel?.isTextBased() || channel.isDMBased()) {
     throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ต้องเลือกห้องข้อความในเซิร์ฟเวอร์');
@@ -65,17 +86,20 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
   const anchor = await updateOrCreateSurfaceAnchor(channel, surfaceKey, config, message);
   try {
     await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-      await client.query(`
-      INSERT INTO surfaces(surface_key, guild_id, channel_id, message_id,
-        state, last_validated_at, rendered_config_version)
-      VALUES ($1,$2,$3,$4,'ACTIVE',clock_timestamp(),$5)
-      ON CONFLICT (surface_key) DO UPDATE SET guild_id = EXCLUDED.guild_id,
-        channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id,
-        state = 'ACTIVE',
-        rendered_config_version = EXCLUDED.rendered_config_version,
-        state_version = surfaces.state_version + 1, last_validated_at = clock_timestamp(),
-        updated_at = clock_timestamp()
-      `, [surfaceKey, interaction.guildId, channel.id, anchor.message.id, Number(config?.version ?? 0)]);
+      const values = [surfaceKey, interaction.guildId, channel.id, anchor.message.id, Number(config?.version ?? 0)];
+      let persisted;
+      if (existing) {
+        persisted = (await client.query(`UPDATE surfaces SET guild_id=$2,channel_id=$3,message_id=$4,
+          state='ACTIVE',rendered_config_version=$5,state_version=state_version+1,
+          last_validated_at=clock_timestamp(),updated_at=clock_timestamp()
+          WHERE surface_key=$1 AND state_version=$6 RETURNING *`, [...values, existing.state_version])).rows[0];
+      } else {
+        persisted = (await client.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,
+          state,last_validated_at,rendered_config_version)
+          VALUES($1,$2,$3,$4,'ACTIVE',clock_timestamp(),$5)
+          ON CONFLICT(surface_key) DO NOTHING RETURNING *`, values)).rows[0];
+      }
+      if (!persisted) throw new QuestshopError('STALE_SURFACE', 'มีการติดตั้งแผงนี้จากคำสั่งอื่นพร้อมกัน');
       await appendAdminAudit(client, { action: 'SURFACE_SETUP', targetType: 'SURFACE', targetId: surfaceKey,
         actorId: interaction.user.id, before: existing ?? null,
         after: { channelId: channel.id, messageId: anchor.message.id }, reason: 'setup command', context });
@@ -97,6 +121,10 @@ export async function setupSurface({ interaction, surfaceKey, config }, context,
   }
   if (!cleanupFailed) await resolveSurfaceIncidentSafely(options.pool, surfaceKey, context);
   return anchor.message;
+}
+
+export async function setupSurface(input, context, options = {}) {
+  return withSurfaceSetupLock(input.surfaceKey, () => setupSurfaceLocked(input, context, options));
 }
 
 async function recordSurfaceIncident(pool, surfaceKey, error, context) {

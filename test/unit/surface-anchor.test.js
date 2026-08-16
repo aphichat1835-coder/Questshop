@@ -4,6 +4,7 @@ import { SURFACE_COMMANDS } from '../../src/discord/commands/definitions.js';
 import {
   fetchSurfaceMessageFresh, surfaceNonce, updateOrCreateSurfaceAnchor,
 } from '../../src/discord/surfaces/setup.js';
+import { normalizeDiscordPayload } from '../../src/discord/payload.js';
 
 function createChannel({ listedMessages = [], sentMessage = { id: 'new-anchor' } } = {}) {
   const fetches = [];
@@ -96,4 +97,29 @@ test('rate limiting and transient fetch failures never become a missing-message 
     await assert.rejects(() => fetchSurfaceMessageFresh(channel, 'old-anchor'));
     assert.equal(channel.sent.length, 0);
   }
+});
+
+test('Discord payload boundary strips unsafe mentions and bounds textual output', () => {
+  const body = normalizeDiscordPayload({ content: '@everyone '.repeat(500), allowedMentions: { parse: ['everyone'] } });
+  assert.ok(body.content.length <= 2_000);
+  assert.match(body.content, /@\u200beveryone/);
+  assert.deepEqual(body.allowedMentions.parse, []);
+});
+
+test('Discord payload boundary also bounds embeds and drops an unsafe link component', () => {
+  const body = normalizeDiscordPayload({
+    embeds: [{ title: '@here '.repeat(100), description: 'x'.repeat(5_000),
+      fields: Array.from({ length: 30 }, () => ({ name: 'n'.repeat(300), value: 'v'.repeat(1_200) })) }],
+    components: [{ type: 1, components: [
+      { type: 2, style: 5, label: 'bad', url: 'javascript:alert(1)' },
+      { type: 2, style: 1, label: 'safe', custom_id: 'x'.repeat(120) },
+    ] }],
+  });
+  const [embed] = body.embeds;
+  assert.ok(embed.title.length <= 256);
+  assert.ok(embed.description.length <= 4_096);
+  assert.ok(embed.fields.length <= 25);
+  assert.ok(embed.fields.every((field) => field.name.length <= 256 && field.value.length <= 1_024));
+  assert.ok(body.components[0].components.every((component) => component.url !== 'javascript:alert(1)'));
+  assert.equal(body.components[0].components[0].custom_id.length, 100);
 });

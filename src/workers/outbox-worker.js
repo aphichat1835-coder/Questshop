@@ -6,6 +6,7 @@ import { recordTransition } from '../domain/shared/transition.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { discordErrorKind, fetchDiscordMessage, findDiscordMessageByNonce } from '../discord/transport.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
+import { normalizeDiscordPayload } from '../discord/payload.js';
 
 const BACKOFF = [1, 5, 15, 60, 300, 900];
 
@@ -183,15 +184,16 @@ async function applyQuestAnnouncementPing(pool, projection, body) {
 }
 
 export async function publishProjection(channel, projection, body) {
+  const normalizedBody = normalizeDiscordPayload(body);
   const message = projection.message_id ? await fetchDiscordMessage(channel, projection.message_id) : null;
-  if (message) return message.edit(body);
+  if (message) return message.edit(normalizedBody);
   // `send` can fail after Discord accepted the create.  Reconcile by the
   // stable nonce before creating, and once more after an unknown result, so a
   // retry does not fill a durable projection with duplicate messages.
   const existing = await findDiscordMessageByNonce(channel, projection.nonce, { maximum: 100 });
   if (existing) return existing;
   try {
-    return await channel.send({ ...body, nonce: projection.nonce, enforceNonce: true });
+    return await channel.send(normalizeDiscordPayload({ ...normalizedBody, nonce: projection.nonce, enforceNonce: true }));
   } catch (error) {
     const reconciled = await findDiscordMessageByNonce(channel, projection.nonce, { maximum: 100 });
     if (reconciled) return reconciled;

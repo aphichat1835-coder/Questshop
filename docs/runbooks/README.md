@@ -14,6 +14,7 @@ Every incident follows: Detect → Contain → Preserve evidence → Recover →
 | Monitor token invalid | Quarantine account immediately | Owner rotates credential, then uses **เช็คระบบ Token** to verify login and Quest-list access |
 | Discord surface forbidden (403) | Preserve the outbox event and incident; do not change surface state automatically | Owner fixes the Discord channel permission manually, then replays the affected outbox event |
 | Discord outage / 429 | Retain outbox; obey Retry-After | Resume coalesced delivery after health recovers |
+| Discord interaction timeout / expired panel | Preserve Support code and exact Git SHA; do not retry a money action from the old control | Owner reruns the relevant setup command only for a confirmed old/deleted anchor, then starts the affected flow again from its current panel |
 | Aiven database recovery | Keep store closed; preserve incident/ledger evidence | Owner restores or recovers through Aiven Console, then validates database/ledger before reopening |
 | Secret compromise | Contain the affected integration; retain evidence | Activate new key version, resumable re-encryption, restore test |
 | Deploy rollback | Maintenance and drain | Roll app only if schema compatible; otherwise forward-fix |
@@ -56,3 +57,6 @@ verification queries and reopening approval. Never paste tokens, cookies, databa
   decision, the exact Git SHA and every ledger reconciliation before reopening. `backup:reconcile` applies only to
   the optional `LOCAL_S3` compatibility mode.
 - Full voucher-link exposure requires Owner action to restrict the channel, preserve audit and review viewers; the bot does not enforce or repair channel privacy automatically.
+- When Discord shows **Questshop ไม่ตอบสนอง**, keep the displayed Support code and check the matching structured
+  interaction log first. A safe validation/business rejection must be an Ephemeral Thai response; an internal error
+  must preserve its trace and never be solved by replaying a payment/refund confirmation blindly.

@@ -13,14 +13,16 @@ export const ADMIN_CATEGORIES = Object.freeze([
   ['dlq', 'ปัญหาที่ต้องจัดการ'],
 ]);
 
-export function adminCategoryOptions(selected = null) {
-  return ADMIN_CATEGORIES.map(([value, label]) => ({ value, label, default: value === selected }));
+export function adminCategoryOptions(selected = null, { isOwner = false } = {}) {
+  return ADMIN_CATEGORIES
+    .filter(([value]) => isOwner || !['monitors', 'receivers'].includes(value))
+    .map(([value, label]) => ({ value, label, default: value === selected }));
 }
 
-export function adminNavigationComponents(selected, actionRows = []) {
+export function adminNavigationComponents(selected, actionRows = [], { isOwner = false } = {}) {
   const menu = new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
     .setCustomId(customId('admin_nav')).setPlaceholder('เปลี่ยนหมวดการตั้งค่า')
-    .addOptions(adminCategoryOptions(selected)));
+    .addOptions(adminCategoryOptions(selected, { isOwner })));
   const controls = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(customId(`admin_refresh_${selected}`)).setLabel('รีเฟรช')
       .setStyle(ButtonStyle.Secondary).setEmoji('🔄'),

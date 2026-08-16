@@ -26,3 +26,19 @@ test('response controller preserves a modal as a terminal acknowledgement', asyn
   await interaction.showModal({ customId: 'qs:v1:test:00000000-0000-0000-0000-000000000000' });
   assert.equal(acknowledgementOf(interaction), ACKNOWLEDGEMENT.MODAL);
 });
+
+test('response controller normalizes rendered replies and reports the actual message once', async () => {
+  const messages = [];
+  const interaction = {
+    deferReply: async () => {},
+    editReply: async (payload) => ({ id: 'ephemeral-reply', payload }),
+  };
+  installResponseController(interaction, { onMessage: async (event) => messages.push(event) });
+  await interaction.deferReply({ ephemeral: true });
+  await interaction.editReply({ content: '@everyone '.repeat(500), allowedMentions: { parse: ['everyone'] } });
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].result.id, 'ephemeral-reply');
+  assert.ok(messages[0].payload.content.length <= 2_000);
+  assert.deepEqual(messages[0].payload.allowedMentions.parse, []);
+  assert.match(messages[0].payload.content, /@\u200beveryone/);
+});

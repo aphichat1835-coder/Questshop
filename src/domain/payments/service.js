@@ -23,12 +23,12 @@ async function findCommittedVoucher(pool, hashes) {
   // PostgreSQL may report a serialization failure while the concurrent owner
   // is still committing.  This is a read-only bounded reconciliation; it
   // never attempts to redeem or recreate a voucher.
-  for (let attempt = 0; attempt < 5; attempt += 1) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     const existing = await withTransaction({ pool, isolation: 'READ COMMITTED', maxAttempts: 1 }, (client) => (
       findVoucher(client, hashes)
     ));
     if (existing) return existing;
-    if (attempt < 4) await delay(25 * (attempt + 1));
+    if (attempt < 7) await delay(50 * (attempt + 1));
   }
   return null;
 }
@@ -43,7 +43,7 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
   const normalized = normalizeVoucherUrl(voucherUrl);
   const hashes = allVoucherHmacs(normalized.code, env.VOUCHER_HMAC_KEYS_JSON);
   try {
-    return await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    return await withTransaction({ ...options, isolation: 'SERIALIZABLE', maxAttempts: 5, deadlineMs: 10_000 }, async (client) => {
     const locked = (await client.query(`SELECT 1 FROM topup_daily_locks
       WHERE discord_user_id=$1 AND expires_at>clock_timestamp()`, [discordUserId])).rowCount > 0;
     if (locked) throw new QuestshopError('TOPUP_DAILY_LIMIT', 'เติมเงินครบเพดานของวันนี้แล้ว กรุณาลองใหม่หลังเที่ยงคืน');

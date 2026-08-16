@@ -663,7 +663,7 @@ export async function expireSessions(_input, _context, options = {}) {
     const result = await client.query(`
       WITH expired AS (
         SELECT id FROM interaction_sessions
-        WHERE state = 'ACTIVE' AND expires_at <= clock_timestamp()
+        WHERE state IN ('ACTIVE','PENDING_BIND') AND expires_at <= clock_timestamp()
         ORDER BY expires_at,id LIMIT 500 FOR UPDATE SKIP LOCKED
       )
       UPDATE interaction_sessions AS session SET state = 'EXPIRED', state_version = session.state_version + 1,

@@ -8,7 +8,7 @@ import {
 } from '../../src/domain/pricing/categories.js';
 import { setQuestCategoryPrice } from '../../src/domain/admin/config-service.js';
 import { createContext } from '../../src/shared/correlation.js';
-import { ADMIN_CATEGORIES } from '../../src/discord/renderers/admin.js';
+import { ADMIN_CATEGORIES, adminCategoryOptions } from '../../src/discord/renderers/admin.js';
 
 test('a new store starts normal internal gates open without an admin setup step', () => {
   assert.deepEqual(Object.keys(DEFAULT_FEATURE_GATES), FEATURE_GATES);
@@ -27,6 +27,14 @@ test('admin navigation exposes only the nine simplified operational categories',
   assert.deepEqual(ADMIN_CATEGORIES.map(([key]) => key), [
     'overview', 'pricing', 'promotions', 'orders', 'payments', 'wallet', 'monitors', 'receivers', 'dlq',
   ]);
+});
+
+test('ordinary Admin navigation omits Owner-only receiver and monitor controls', () => {
+  assert.deepEqual(adminCategoryOptions(null, { isOwner: false }).map((option) => option.value), [
+    'overview', 'pricing', 'promotions', 'orders', 'payments', 'wallet', 'dlq',
+  ]);
+  assert.ok(adminCategoryOptions(null, { isOwner: true }).some((option) => option.value === 'monitors'));
+  assert.ok(adminCategoryOptions(null, { isOwner: true }).some((option) => option.value === 'receivers'));
 });
 
 test('category price changes require both current rule versions before a transaction starts', async () => {

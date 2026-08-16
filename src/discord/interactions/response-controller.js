@@ -1,5 +1,6 @@
 import { MessageFlags } from 'discord.js';
 import { QuestshopError } from '../../shared/errors.js';
+import { normalizeDiscordPayload } from '../payload.js';
 
 export const ACKNOWLEDGEMENT = Object.freeze({
   NONE: 'NONE',
@@ -22,7 +23,31 @@ export function acknowledgementOf(interaction) {
   return interaction.__questshopAcknowledgement ?? ACKNOWLEDGEMENT.NONE;
 }
 
-export function installResponseController(interaction, { onAcknowledged = () => {} } = {}) {
+function normalizeInitialArguments(args) {
+  return args.map((value, index) => {
+    if (index !== 0 || !value || typeof value !== 'object') return value;
+    const needsPayloadBoundary = ['content', 'embeds', 'components', 'nonce', 'allowedMentions']
+      .some((key) => Object.hasOwn(value, key));
+    const normalizedOptions = needsPayloadBoundary ? normalizeDiscordPayload(value) : { ...value };
+    if (normalizedOptions.ephemeral !== true) return normalizedOptions;
+    normalizedOptions.flags = normalizedOptions.flags ?? MessageFlags.Ephemeral;
+    delete normalizedOptions.ephemeral;
+    return normalizedOptions;
+  });
+}
+
+function installOutputBoundary(interaction, method, onMessage) {
+  if (typeof interaction[method] !== 'function') return;
+  const original = interaction[method].bind(interaction);
+  interaction[method] = async (...args) => {
+    const normalized = normalizeInitialArguments(args);
+    const result = await original(...normalized);
+    await onMessage({ method, payload: normalized[0], result });
+    return result;
+  };
+}
+
+export function installResponseController(interaction, { onAcknowledged = () => {}, onMessage = async () => {} } = {}) {
   for (const method of INITIAL_METHODS) {
     if (typeof interaction[method] !== 'function') continue;
     const original = interaction[method].bind(interaction);
@@ -32,18 +57,17 @@ export function installResponseController(interaction, { onAcknowledged = () => 
         if (current === method) return null;
         throw new QuestshopError('INTERACTION_ALREADY_ACKNOWLEDGED', 'Interaction ถูกตอบรับแล้ว');
       }
-      const normalized = args.map((value, index) => {
-        if (index !== 0 || !value || typeof value !== 'object' || value.ephemeral !== true) return value;
-        const normalizedOptions = { ...value, flags: value.flags ?? MessageFlags.Ephemeral };
-        delete normalizedOptions.ephemeral;
-        return normalizedOptions;
-      });
+      const normalized = normalizeInitialArguments(args);
       const result = await original(...normalized);
       interaction.__questshopAcknowledgement = method;
       onAcknowledged(method);
       return result;
     };
   }
+  // Acknowledgement methods above intentionally do not notify `onMessage`:
+  // defer methods do not create a component-bearing message yet.  Every
+  // actual reply/edit/follow-up goes through this single transport boundary.
+  for (const method of ['editReply', 'followUp']) installOutputBoundary(interaction, method, onMessage);
 }
 
 export async function acknowledgeByContract(interaction, response) {

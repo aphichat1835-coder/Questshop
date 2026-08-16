@@ -10,6 +10,7 @@ import {
 import { ADMIN, CUSTOMER, OWNER, ROUTE_CONTRACTS, routeContract } from '../../src/discord/interactions/contracts.js';
 import {
   advanceAdminSession,
+  bindRenderedSessionMessages,
   bindSessionMessage,
   createAdminSession,
   loadAdminSession,
@@ -114,6 +115,51 @@ test('a route acknowledgement is sent before its first slow database operation',
   assert.deepEqual(calls, ['deferUpdate', 'editReply']);
 });
 
+test('router awaits handler failures and returns a safe ephemeral error instead of timing out', async () => {
+  const replies = [];
+  const runtime = {
+    acceptingInteractions: true,
+    env: { PRELAUNCH: false, OWNER_ID: 'owner', DISCORD_GUILD_ID: 'guild' },
+    config: { values: {}, gates: { STORE_OPEN: true, CUSTOMER_INTERACTIONS_ENABLED: true,
+      TOPUP_ACCEPTING: true, ORDER_ACCEPTING: true } },
+    health: { workers: {}, startedAt: new Date().toISOString() },
+    logger: { debug: () => {}, info: () => {}, error: () => {} },
+    pool: { query: async (sql) => {
+      if (String(sql).includes('FROM surfaces')) return { rows: [{ guild_id: 'guild', channel_id: 'channel', message_id: 'panel' }] };
+      return { rows: [] };
+    } },
+  };
+  const interaction = {
+    id: '123456789012345678', customId: customId('admin'), user: { id: 'owner' }, guildId: 'guild', channelId: 'channel',
+    message: { id: 'panel' }, values: ['not-a-real-category'], client: { questshop: runtime, isReady: () => true },
+    member: { roles: { cache: { has: () => true } } },
+    inGuild: () => true, isChatInputCommand: () => false, isButton: () => false,
+    isStringSelectMenu: () => true, isUserSelectMenu: () => false, isModalSubmit: () => false,
+    deferReply: async () => {}, editReply: async (payload) => { replies.push(payload); return { id: 'reply' }; },
+  };
+  await assert.doesNotReject(() => routeInteraction(interaction));
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].content, /ไม่พบหมวด/);
+});
+
+test('unknown components always receive an expiry response', async () => {
+  const replies = [];
+  const runtime = {
+    acceptingInteractions: true, env: { DISCORD_GUILD_ID: 'guild', OWNER_ID: 'owner' }, config: { values: {}, gates: {} },
+    health: { workers: {}, startedAt: new Date().toISOString() }, logger: { debug: () => {}, info: () => {}, error: () => {} },
+    pool: { query: async () => ({ rows: [] }) },
+  };
+  const interaction = {
+    id: '123456789012345679', customId: 'legacy-panel-button', user: { id: 'owner' }, guildId: 'guild', channelId: 'channel',
+    client: { questshop: runtime }, inGuild: () => true, isChatInputCommand: () => false,
+    isButton: () => true, isStringSelectMenu: () => false, isUserSelectMenu: () => false, isModalSubmit: () => false,
+    reply: async (payload) => { replies.push(payload); return { id: 'reply' }; },
+  };
+  await routeInteraction(interaction);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].content, /รุ่นเก่าหรือหมดอายุ/);
+});
+
 test('pre-launch keeps customer routes limited to Owner or Admin even when UAT gates are open', async () => {
   const runtime = {
     env: { PRELAUNCH: true, OWNER_ID: 'owner' },
@@ -157,6 +203,10 @@ test('server interaction session enforces actor guild channel operation and Post
   assert.equal(session.trace_id, context.traceId);
   assert.equal((await loadAdminSession({ sessionId: session.id, actorId: 'actor-a', guildId: 'guild-a',
     channelId: 'channel-a', messageId: 'message-a', operation: 'SECURITY_TEST' }, context, { pool })).id, session.id);
+  // Modal submit events do not reliably contain the source Message ID.  The
+  // remaining durable bindings still apply when that ID is absent.
+  assert.equal((await loadAdminSession({ sessionId: session.id, actorId: 'actor-a', guildId: 'guild-a',
+    channelId: 'channel-a', operation: 'SECURITY_TEST' }, context, { pool })).id, session.id);
   await assert.rejects(() => loadAdminSession({ sessionId: session.id, actorId: 'actor-b',
     guildId: 'guild-a', channelId: 'channel-a', operation: 'SECURITY_TEST' }, context, { pool }),
   (error) => error.code === 'NOT_AUTHORIZED');
@@ -180,9 +230,14 @@ test('session message binding and terminal transition are domain-owned compare-a
   const session = await createAdminSession({ actorId: 'actor-a', guildId: 'guild-a',
     channelId: 'channel-a', messageId: null, operation: 'SESSION_CAS', payload: {}, configVersion: 1 },
   context, { pool });
+  assert.equal(session.state, 'PENDING_BIND');
   const bound = await bindSessionMessage({ sessionId: session.id, actorId: 'actor-a', guildId: 'guild-a',
     messageId: 'reply-a', expectedVersion: session.state_version }, context, { pool });
   assert.equal(bound.message_id, 'reply-a');
+  assert.equal(bound.state, 'ACTIVE');
+  assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM state_transitions
+    WHERE aggregate_type='INTERACTION_SESSION' AND aggregate_id=$1 AND from_state='PENDING_BIND'
+      AND to_state='ACTIVE'`, [session.id])).rows[0].count), 1);
   await assert.rejects(() => bindSessionMessage({ sessionId: session.id, actorId: 'actor-a', guildId: 'guild-a',
     messageId: 'reply-b', expectedVersion: session.state_version }, context, { pool }),
   (error) => error.code === 'STALE_SESSION');
@@ -193,6 +248,22 @@ test('session message binding and terminal transition are domain-owned compare-a
     WHERE aggregate_type='INTERACTION_SESSION' AND aggregate_id=$1 AND to_state='TERMINAL'`, [session.id])).rows[0].count), 1);
   await assert.rejects(() => terminateAdminSession({ sessionId: session.id, actorId: 'actor-a', guildId: 'guild-a',
     expectedVersion: terminal.state_version }, context, { pool }), (error) => error.code === 'STALE_SESSION');
+});
+
+test('rendered replies bind every pending child session to the actual reply message once', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const context = createContext({ actorType: 'ADMIN', actorId: 'actor-a', guildId: 'guild-a',
+    idempotencyKey: 'session-render-bind' });
+  const first = await createAdminSession({ actorId: 'actor-a', guildId: 'guild-a', channelId: 'channel-a',
+    messageId: null, operation: 'FIRST', payload: {}, configVersion: 1 }, context, { pool });
+  const second = await createAdminSession({ actorId: 'actor-a', guildId: 'guild-a', channelId: 'channel-a',
+    messageId: null, operation: 'SECOND', payload: {}, configVersion: 1 }, context, { pool });
+  const bound = await bindRenderedSessionMessages({ sessionIds: [first.id, second.id], actorId: 'actor-a',
+    guildId: 'guild-a', messageId: 'ephemeral-message-id' }, context, { pool });
+  assert.equal(bound.length, 2);
+  assert.ok(bound.every((session) => session.state === 'ACTIVE' && session.message_id === 'ephemeral-message-id'));
+  assert.equal((await bindRenderedSessionMessages({ sessionIds: [first.id, second.id], actorId: 'actor-a',
+    guildId: 'guild-a', messageId: 'another-message' }, context, { pool })).length, 0);
 });
 
 test('admin session advances parent to terminal before creating one child session', async (t) => {

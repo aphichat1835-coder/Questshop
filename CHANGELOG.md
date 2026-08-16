@@ -27,6 +27,11 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
 
 ### Added
 
+- Migration 0028 adds a durable `PENDING_BIND` interaction-session phase.  A multi-step panel now binds its child
+  session to the actual Ephemeral Discord reply that renders its controls before it becomes usable.
+- Router regression coverage for awaited handler failure, legacy-panel acknowledgement, response payload boundaries
+  and callback message binding.
+
 - Discord reliability closure: persistent routes now declare their acknowledgement strategy, normal routes defer before
   PostgreSQL work, and Modal launchers open before durable session preparation. Session creation/advance accepts an
   explicit opaque child ID so a fast Modal submit remains actor/guild/channel-bound without using process memory as
@@ -77,6 +82,18 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
 - Automated unit, PostgreSQL integration, concurrency, crash, security, contract, recovery และ load tests
 
 ### Changed
+
+- Discord interaction routing now awaits every handler inside its error boundary.  Safe business failures return a
+  Thai Ephemeral recovery message with Support code instead of becoming an unacknowledged Discord timeout; metrics
+  record the eventual outcome and error code.
+- Reply/edit/follow-up traffic now passes through one bounded Discord payload boundary with deny-by-default mentions.
+  Newly rendered component sessions bind to the exact reply message through the domain service, while terminal
+  confirmations retain their existing idempotency and session checks.
+- Concurrent submission of the same voucher now has a longer bounded serializable retry/reconciliation window, so a
+  losing request returns the durable owner instead of exposing a transient PostgreSQL serialization error.
+- Legacy/unknown components and obsolete slash commands now receive an explicit expired-panel response.  Admin
+  navigation hides Owner-only Monitor/Receiver categories for ordinary Admins.  In-process per-surface setup locking
+  and state-version compare-and-swap prevent concurrent setup from leaving two active anchors.
 
 - Expected business rejections such as insufficient wallet credit are logged and measured as `REJECTED`, not as a
   system failure. `ERROR_RATE_HIGH` now counts only failed customer/admin operations, while Outbox incidents include

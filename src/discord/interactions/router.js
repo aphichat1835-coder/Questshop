@@ -19,6 +19,7 @@ import { withTransaction } from '../../db/transaction.js';
 import {
   advanceAdminSession,
   bindSessionMessage,
+  bindRenderedSessionMessages,
   createAdminSession,
   loadAdminSession,
   terminateAdminSession,
@@ -188,7 +189,23 @@ const CUSTOMER_ERROR_CODES = new Set([
   'DLQ_SELECTION_INVALID', 'DLQ_NOT_FOUND', 'RESERVATION_NOT_FOUND', 'ALREADY_REFUNDED',
   'REFUND_NOT_CAPTURED', 'PROMOTION_NOT_FOUND', 'TOKEN_INVALID', 'INVALID_VOUCHER_URL',
   'INVALID_VOUCHER_CODE', 'ROUTE_INTERACTION_INVALID',
+  'RATE_LIMITED', 'QUOTE_EXPIRED', 'QUEUE_FULL', 'ACCOUNT_ACTIVE_ORDER', 'SESSION_NOT_FOUND',
+  'QUEST_INSUFFICIENT_TIME', 'QUEST_EXTERNALLY_COMPLETED', 'TOKEN_ACCOUNT_CHANGED',
+  'TOPUP_DAILY_LIMIT', 'RECEIVER_UNAVAILABLE', 'RUNTIME_NOT_ACTIVE', 'STALE_STATE',
+  'INSUFFICIENT_BALANCE', 'ADMIN_CATEGORY_INVALID', 'SURFACE_CHANNEL_INVALID',
 ]);
+
+const INCIDENT_ERROR_CODES = new Set([
+  'SECRET_DECRYPT_FAILED', 'LEDGER_INVARIANT', 'RUNTIME_MIGRATOR_ROLE_CONFLICT',
+  'FENCING_LOST', 'SCHEMA_INCOMPATIBLE',
+]);
+
+function interactionErrorOutcome(error) {
+  if (!error) return 'SUCCESS';
+  if (error instanceof QuestshopError && CUSTOMER_ERROR_CODES.has(error.code)) return 'REJECTED';
+  if (error instanceof QuestshopError && !INCIDENT_ERROR_CODES.has(error.code)) return 'REJECTED';
+  return 'ERROR';
+}
 export function formatInteractionError(error, interactionId) {
   const support = supportCode(error?.traceId ?? interactionId);
   let detail = 'เกิดข้อผิดพลาดภายใน ระบบบันทึกรหัสสำหรับตรวจสอบแล้ว';
@@ -203,9 +220,8 @@ async function ephemeralError(interaction, error) {
   const message = formatInteractionError(error, interaction.__questshopTraceId ?? interaction.id);
   const acknowledgement = acknowledgementOf(interaction);
   if (acknowledgement === ACKNOWLEDGEMENT.MODAL) return null;
-  if ([ACKNOWLEDGEMENT.DEFER_UPDATE, ACKNOWLEDGEMENT.UPDATE].includes(acknowledgement)
-    && typeof interaction.followUp === 'function') {
-    return interaction.followUp(ephemeralResponse({ content: message, allowedMentions: { parse: [] } }));
+  if ([ACKNOWLEDGEMENT.DEFER_UPDATE, ACKNOWLEDGEMENT.UPDATE].includes(acknowledgement)) {
+    return interaction.editReply({ content: message, embeds: [], components: [] });
   }
   if ([ACKNOWLEDGEMENT.DEFER_REPLY, ACKNOWLEDGEMENT.REPLY].includes(acknowledgement)) {
     return interaction.editReply({ content: message, embeds: [], components: [] });
@@ -219,38 +235,51 @@ function pendingModalPreparations(runtime) {
 }
 
 async function waitForModalPreparation(runtime, sessionId) {
-  const pending = pendingModalPreparations(runtime).get(sessionId);
-  if (pending) await pending;
+  const preparations = pendingModalPreparations(runtime);
+  const pending = preparations.get(sessionId);
+  if (!pending) return;
+  if (pending.expiresAt <= Date.now()) {
+    preparations.delete(sessionId);
+    throw new QuestshopError('SESSION_EXPIRED', 'หน้ากรอกข้อมูลหมดอายุแล้ว กรุณาเริ่มใหม่');
+  }
+  if (pending.status === 'CONSUMING' || pending.status === 'CONSUMED') {
+    throw new QuestshopError('STALE_SESSION', 'แบบฟอร์มนี้ถูกส่งไปแล้ว กรุณาเริ่มใหม่');
+  }
+  pending.status = 'CONSUMING';
+  await pending.promise;
+  preparations.delete(sessionId);
+  if (pending.status === 'FAILED') throw pending.error;
+  if (pending.status !== 'CONSUMING') throw new QuestshopError('SESSION_EXPIRED', 'หน้ากรอกข้อมูลหมดอายุแล้ว กรุณาเริ่มใหม่');
+  pending.status = 'CONSUMED';
 }
 
 async function showPreparedModal({ interaction, runtime, route, modal, sessionId = uuidv7(), prepare }) {
   const preparations = pendingModalPreparations(runtime);
-  let resolvePreparation;
-  let rejectPreparation;
-  const pending = new Promise((resolve, reject) => {
-    resolvePreparation = resolve;
-    rejectPreparation = reject;
-  });
-  pending.catch(() => {});
+  const pending = { status: 'PENDING', error: null, expiresAt: Date.now() + 5 * 60_000, promise: null };
   preparations.set(sessionId, pending);
-  try {
-    await interaction.showModal(modal(sessionId));
-  } catch (error) {
-    preparations.delete(sessionId);
-    rejectPreparation(error);
-    throw error;
-  }
-  try {
+  // Invoke the acknowledgement before scheduling the small durable
+  // preparation, but publish the Promise synchronously so an unusually fast
+  // modal submit can never observe a missing preparation record.
+  const modalAcknowledgement = interaction.showModal(modal(sessionId));
+  pending.promise = Promise.resolve().then(async () => {
     await authorizeRoute(interaction, route, runtime);
-    const value = await prepare(sessionId);
-    resolvePreparation(value);
+    return prepare(sessionId);
+  }).then((value) => {
+    if (pending.status === 'PENDING') pending.status = 'SUCCEEDED';
     return value;
+  }, (error) => {
+    pending.status = 'FAILED';
+    pending.error = error;
+    runtime.logger?.info?.({ error: safeError(error), sessionId, route: route.route }, 'modal preparation failed');
+    return null;
+  });
+  try {
+    await modalAcknowledgement;
   } catch (error) {
-    rejectPreparation(error);
-    throw error;
-  } finally {
     preparations.delete(sessionId);
+    throw error;
   }
+  return sessionId;
 }
 function tokenModal(sessionId) {
   const input = new TextInputBuilder().setCustomId('token').setStyle(TextInputStyle.Paragraph)
@@ -317,8 +346,11 @@ function panelEmbed(color, title, description) {
 }
 
 function adminReply(interaction, selected, payload) {
+  const runtime = interaction.client.questshop;
   return interaction.editReply({ ...payload,
-    components: adminNavigationComponents(selected, payload.components ?? []),
+    components: adminNavigationComponents(selected, payload.components ?? [], {
+      isOwner: interaction.user.id === runtime.env.OWNER_ID,
+    }),
     allowedMentions: { parse: [] } });
 }
 
@@ -614,7 +646,7 @@ const ADMIN_PANEL_RENDERERS = Object.freeze({
 async function handleSurfaceCommand(interaction, runtime) {
   if (!interaction.isChatInputCommand()) return false;
   const surface = SURFACE_COMMANDS[interaction.commandName];
-  if (!surface) return true;
+  if (!surface) return false;
   if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'คำสั่งนี้ใช้ได้เฉพาะ Owner');
   await interaction.deferReply({ ephemeral: true });
   const message = await setupSurface({ interaction, surfaceKey: surface, config: runtime.config }, contextFor(interaction, 'setup'), { pool: runtime.pool });
@@ -1040,7 +1072,6 @@ if (route.route === 'wallet_adjust_submit' && interaction.isModalSubmit()) {
 
 async function handleWalletAdjustConfirm({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'wallet_adjust_confirm' && interaction.isButton()) {
-  await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_WALLET_CONFIRM' },
   contextFor(interaction, 'wallet_confirm_load'), { pool: runtime.pool });
@@ -1124,7 +1155,6 @@ if (route.route === 'refund_prepare_submit' && interaction.isModalSubmit()) {
 
 async function handleRefundConfirm({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'refund_confirm' && interaction.isButton()) {
-  await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'ADMIN_REFUND_CONFIRM' },
   contextFor(interaction, 'refund_confirm_load'), { pool: runtime.pool });
@@ -1335,7 +1365,6 @@ if (route.route === 'price_category_submit' && interaction.isModalSubmit()) {
 
 async function handlePriceCategoryConfirm({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'price_category_confirm' && interaction.isButton()) {
-  await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PRICE_CATEGORY_CONFIRM' },
   contextFor(interaction, 'price_category_confirm_load'), { pool: runtime.pool });
@@ -1386,7 +1415,6 @@ if (route.route === 'promo_set_submit' && interaction.isModalSubmit()) {
 
 async function handlePromotionSetConfirm({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'promo_set_confirm' && interaction.isButton()) {
-  await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PROMOTION_TERMS_CONFIRM' },
   contextFor(interaction, 'promotion_terms_confirm_load'), { pool: runtime.pool });
@@ -1420,7 +1448,6 @@ if (route.route === 'promo_toggle' && interaction.isButton()) {
 
 async function handlePromotionToggleConfirm({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'promo_toggle_confirm' && interaction.isButton()) {
-  await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'PROMOTION_TOGGLE_CONFIRM' },
   contextFor(interaction, 'promotion_toggle_load'), { pool: runtime.pool });
@@ -1468,7 +1495,6 @@ if (route.route === 'receiver_activate_submit' && interaction.isModalSubmit()) {
 async function handleReceiverActivateConfirm({ interaction, route, runtime, gates: _gates }) {
 if (route.route === 'receiver_activate_confirm' && interaction.isButton()) {
   if (interaction.user.id !== runtime.env.OWNER_ID) throw new QuestshopError('OWNER_ONLY', 'เบอร์รับเงินใช้ได้เฉพาะเจ้าของร้าน');
-  await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
     guildId: interaction.guildId, channelId: interaction.channelId, operation: 'RECEIVER_CONFIRM' },
   contextFor(interaction, 'receiver_confirm_load'), { pool: runtime.pool });
@@ -1885,6 +1911,32 @@ async function dispatchRoute(context) {
   return handler(context);
 }
 
+function sessionIdsFromComponents(components) {
+  const ids = new Set();
+  const visit = (value) => {
+    if (!value || typeof value !== 'object') return;
+    const data = typeof value.toJSON === 'function' ? value.toJSON() : value;
+    const parsed = typeof data.custom_id === 'string' ? parseCustomId(data.custom_id) : null;
+    if (parsed?.sessionId) ids.add(parsed.sessionId);
+    for (const child of data.components ?? []) visit(child);
+  };
+  for (const component of components ?? []) visit(component);
+  return [...ids];
+}
+
+async function bindRenderedSessions(interaction, runtime, { payload, result }) {
+  let messageId = result?.id;
+  const sessionIds = sessionIdsFromComponents(payload?.components);
+  if (!sessionIds.length) return;
+  if (!messageId && typeof interaction.fetchReply === 'function') {
+    const reply = await interaction.fetchReply();
+    messageId = reply?.id;
+  }
+  if (!messageId) return;
+  await bindRenderedSessionMessages({ sessionIds, actorId: interaction.user.id,
+    guildId: interaction.guildId, messageId }, contextFor(interaction, 'interaction_session_bind'), { pool: runtime.pool });
+}
+
 function startInteractionMetrics(interaction, runtime) {
   const started = performance.now();
   const traceId = uuidv7();
@@ -1902,17 +1954,18 @@ function startInteractionMetrics(interaction, runtime) {
     acknowledgement = method;
     write('INTERACTION_ACK', 'SUCCESS', performance.now() - started);
   };
-  installResponseController(interaction, { onAcknowledged: markAcknowledged });
+  installResponseController(interaction, {
+    onAcknowledged: markAcknowledged,
+    onMessage: async (event) => bindRenderedSessions(interaction, runtime, event),
+  });
   return {
     complete(error = null) {
       const operation = isBackoffice(interaction, runtime) ? 'PANEL_REQUEST' : 'CUSTOMER_INTERACTION';
-      let outcome = 'SUCCESS';
-      if (error instanceof QuestshopError) outcome = 'REJECTED';
-      else if (error) outcome = 'ERROR';
+      const outcome = interactionErrorOutcome(error);
       write(operation, outcome, performance.now() - started,
-        error?.category ?? error?.code ?? error?.name ?? null);
+        error?.code ?? error?.category ?? error?.name ?? null);
       if (!acknowledged) write('INTERACTION_ACK', 'ACK_FAILED', performance.now() - started,
-        error?.category ?? error?.code ?? error?.name ?? null);
+        error?.code ?? error?.category ?? error?.name ?? null);
       runtime.logger?.debug?.({ traceId, interactionId: interaction.id,
         acknowledgement, durationMs: Math.round(performance.now() - started), outcome }, 'interaction completed');
     },
@@ -1938,8 +1991,17 @@ export async function routeInteraction(interaction) {
     }
     if (!interaction.inGuild() || interaction.guildId !== runtime.env.DISCORD_GUILD_ID) return;
     if (await handleSurfaceCommand(interaction, runtime)) return;
+    if (interaction.isChatInputCommand()) {
+      return interaction.reply(ephemeralResponse({
+        content: 'คำสั่งนี้ไม่มีแล้วหรือหมดอายุ กรุณาใช้คำสั่งติดตั้งแผง Questshop ใหม่',
+      }));
+    }
     const route = parseCustomId(interaction.customId);
-    if (!route) return;
+    if (!route) {
+      return interaction.reply(ephemeralResponse({
+        content: 'แผงนี้เป็นรุ่นเก่าหรือหมดอายุแล้ว กรุณาเปิดแผงใหม่แล้วลองอีกครั้ง',
+      }));
+    }
     if (!routeContract(route.route)) {
       return interaction.reply({
         content: 'เมนูนี้เป็นแผงรุ่นเก่าและหมดอายุแล้ว กรุณาเปิด `/admin-panel` ใหม่',
@@ -1953,11 +2015,11 @@ export async function routeInteraction(interaction) {
     const gates = preAuthorizeRoute(interaction, route, runtime);
     if (contract.response !== 'MODAL') await acknowledgeByContract(interaction, contract.response);
     if (contract.response === 'MODAL') {
-      return dispatchRoute({ interaction, route, runtime, gates });
+      return await dispatchRoute({ interaction, route, runtime, gates });
     }
     await authorizeRoute(interaction, route, runtime);
     if (interaction.isModalSubmit()) await waitForModalPreparation(runtime, route.sessionId);
-    return dispatchRoute({ interaction, route, runtime, gates });
+    return await dispatchRoute({ interaction, route, runtime, gates });
   } catch (error) {
     failure = error;
     const log = error instanceof QuestshopError ? runtime.logger.info.bind(runtime.logger) : runtime.logger.error.bind(runtime.logger);
