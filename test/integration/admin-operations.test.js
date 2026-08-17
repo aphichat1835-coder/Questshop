@@ -6,7 +6,9 @@ import {
   addMonitor, checkAllMonitorHealth, checkMonitorHealth, rotateMonitorCredential, setMonitorState,
 } from '../../src/domain/admin/monitor-service.js';
 import { setCircuitBreakerState } from '../../src/domain/admin/operations-service.js';
-import { replaceManualPromotion, setManualPromotionEnabled, setQuestCategoryPrice } from '../../src/domain/admin/config-service.js';
+import {
+  replaceManualPromotion, setManualPromotionEnabled, setQuestCategoryPrice, updateRuntimeConfig,
+} from '../../src/domain/admin/config-service.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -16,6 +18,18 @@ const keyring = { current: 1, keys: { 1: Buffer.alloc(32, 7).toString('base64') 
 const env = { DATA_ENCRYPTION_KEYS_JSON: keyring };
 const context = createContext({ actorType: 'OWNER', actorId: 'owner', guildId: 'guild',
   idempotencyKey: 'admin-operations' });
+
+test('first runtime config update accepts the visible baseline and retires legacy Admin Role ID', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const changed = await updateRuntimeConfig({
+    patch: { adminRoleId: '123456789012345678', questAnnouncementRoleId: '223456789012345678' },
+    expectedVersion: 1,
+    reason: 'configure Quest announcement role',
+  }, context, { pool });
+  assert.equal(Number(changed.version), 1);
+  assert.equal(changed.payload.questAnnouncementRoleId, '223456789012345678');
+  assert.equal(Object.hasOwn(changed.payload, 'adminRoleId'), false);
+});
 
 test('monitor credential rotation validates the same account and never exposes plaintext', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');

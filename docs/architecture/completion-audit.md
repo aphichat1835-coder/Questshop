@@ -116,7 +116,7 @@ source tests.
 |---|---|---|
 | 1. Scope and runtime | `package.json`, `src/config/env.js`, `src/bootstrap/*`, `Dockerfile` | Source-confirmed. Actual inwcloud memory/deploy evidence remains. |
 | 2. `quest-auto`, `quest-new`, history and setup commands | `src/discord/{commands,interactions,renderers,surfaces}`, `test/security/interactions.test.js`, `test/integration/outbox-dlq.test.js` | Source-confirmed. Real Guild/mobile interaction and persistent-component UAT remain. |
-| 3. Admin, daily top-up protection and four log surfaces | `src/domain/admin`, `topup_daily_locks`, `src/discord/renderers/projections.js` | Source-confirmed. Manual user block/unblock controls are retired; the automatic daily top-up lock remains. Owner/Admin role and Guild UI UAT remain. |
+| 3. Admin, daily top-up protection and four log surfaces | `src/domain/admin`, `topup_daily_locks`, `src/discord/renderers/projections.js` | Source-confirmed. Manual user block/unblock controls are retired; the automatic daily top-up lock remains. Owner/Discord Administrator authorization and Guild UI UAT remain. |
 | 4. Fixed state machines | domain `states.js`, `migrations/0001_initial.sql`, `test/unit/states.test.js` | Source-confirmed. Production trace sampling remains. |
 | 5. Error classes, retry and backoff budgets | payment, runner, outbox services/workers and their crash/fault tests | Source-confirmed for simulated errors. Provider and Discord error behaviour remains live evidence. |
 | 6. Fair queue, lease, lock and fencing | `src/domain/runner/service.js`, `src/db/leases.js`, concurrency/crash tests | Source-confirmed. Runtime contention at production load remains. |

@@ -51,7 +51,7 @@ export const ROUTE_CONTRACTS = Object.freeze({
   monitor_rotate_submit: owner('MODAL_SUBMIT'), monitor_enable: owner('BUTTON'),
   monitor_disable: owner('BUTTON'), monitor_toggle: owner('BUTTON'),
   dlq_discard: owner('BUTTON', 'MODAL'), dlq_discard_submit: owner('MODAL_SUBMIT'),
-  config_roles: owner('BUTTON', 'MODAL'), config_roles_submit: owner('MODAL_SUBMIT'),
+  config_quest_role: owner('BUTTON', 'MODAL'), config_quest_role_submit: owner('MODAL_SUBMIT'),
   breaker_prepare: owner('BUTTON', 'MODAL'), breaker_submit: owner('MODAL_SUBMIT'),
 });
 

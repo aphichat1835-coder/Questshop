@@ -2,6 +2,7 @@ import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { setImmediate } from 'node:timers/promises';
+import { ModalBuilder, PermissionFlagsBits, PermissionsBitField } from 'discord.js';
 import { createTestPool } from '../fixtures/postgres.js';
 import { customId, parseCustomId } from '../../src/discord/components/custom-id.js';
 import {
@@ -23,6 +24,10 @@ import { expireSessions } from '../../src/domain/checkout/service.js';
 let pool;
 before(async () => { pool = await createTestPool(); });
 after(async () => { await pool?.end(); });
+
+function memberPermissions(...permissions) {
+  return new PermissionsBitField(permissions).freeze();
+}
 
 test('component custom IDs are versioned opaque and reject forged input', () => {
   const value = customId('quest_confirm');
@@ -60,18 +65,34 @@ test('a forged custom ID cannot change a route component type', () => {
 test('backoffice route stays available when customer store gates are closed', async () => {
   const runtime = {
     env: { PRELAUNCH: false, OWNER_ID: 'owner' },
-    config: { values: { adminRoleId: 'admin-role' }, gates: {
+    config: { values: {}, gates: {
       STORE_OPEN: false, CUSTOMER_INTERACTIONS_ENABLED: false, TOPUP_ACCEPTING: false, ORDER_ACCEPTING: false,
     } },
     pool: { query: async () => ({ rows: [] }) },
   };
   const admin = {
-    user: { id: 'admin' }, member: { roles: { cache: { has: (id) => id === 'admin-role' } } },
+    user: { id: 'admin' }, memberPermissions: memberPermissions(PermissionFlagsBits.Administrator),
     isButton: () => false,
   };
   await assert.doesNotReject(() => authorizeRoute(admin, { route: 'payment_review_pick' }, runtime));
   await assert.rejects(() => authorizeRoute(admin, { route: 'topup_review_credit' }, runtime),
     (error) => error.code === 'OWNER_ONLY');
+});
+
+test('a legacy configured role cannot grant backoffice access without Discord Administrator', async () => {
+  const runtime = {
+    env: { PRELAUNCH: false, OWNER_ID: 'owner' },
+    config: { values: { adminRoleId: 'legacy-admin-role' }, gates: {} },
+    pool: { query: async () => ({ rows: [] }) },
+  };
+  const legacyRoleMember = {
+    user: { id: 'legacy-admin' },
+    member: { roles: { cache: { has: () => true } } },
+    memberPermissions: memberPermissions(),
+    isButton: () => false,
+  };
+  await assert.rejects(() => authorizeRoute(legacyRoleMember, { route: 'payment_review_pick' }, runtime),
+    (error) => error.code === 'ADMIN_ONLY');
 });
 
 test('interaction errors expose only safe business copy and a bounded support code', () => {
@@ -142,6 +163,84 @@ test('router awaits handler failures and returns a safe ephemeral error instead 
   assert.match(replies[0].content, /ไม่พบหมวด/);
 });
 
+test('pricing route sends an intact ModalBuilder and prepares its durable session', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  let receivedModal;
+  const replies = [];
+  const runtime = {
+    acceptingInteractions: true,
+    env: { PRELAUNCH: false, OWNER_ID: 'owner', DISCORD_GUILD_ID: 'guild' },
+    config: { version: 1, values: {}, gates: { STORE_OPEN: true, CUSTOMER_INTERACTIONS_ENABLED: true,
+      TOPUP_ACCEPTING: true, ORDER_ACCEPTING: true } },
+    health: { workers: {}, startedAt: new Date().toISOString() },
+    logger: { debug: () => {}, info: () => {}, error: () => {} },
+    pool,
+  };
+  const interaction = {
+    id: '123456789012345680', customId: customId('price_category_pick'), values: ['GAME'],
+    user: { id: 'owner' }, guildId: 'guild', channelId: 'channel', message: { id: 'pricing-panel' },
+    client: { questshop: runtime, isReady: () => true }, member: { roles: { cache: { has: () => true } } },
+    inGuild: () => true, isChatInputCommand: () => false, isButton: () => false,
+    isStringSelectMenu: () => true, isUserSelectMenu: () => false, isModalSubmit: () => false,
+    showModal: async (modal) => {
+      receivedModal = modal;
+      return modal.toJSON();
+    },
+    reply: async (payload) => { replies.push(payload); },
+  };
+
+  await assert.doesNotReject(() => routeInteraction(interaction));
+  assert.ok(receivedModal instanceof ModalBuilder);
+  const modalData = receivedModal.toJSON();
+  const route = parseCustomId(modalData.custom_id);
+  assert.equal(route.route, 'price_category_submit');
+  assert.equal(modalData.components[0].type, 18);
+  assert.deepEqual(replies, []);
+
+  let session;
+  for (let attempt = 0; attempt < 20 && !session; attempt += 1) {
+    await setImmediate();
+    session = (await pool.query('SELECT * FROM interaction_sessions WHERE id=$1', [route.sessionId])).rows[0];
+  }
+  assert.equal(session?.operation, 'PRICE_CATEGORY_PREPARE');
+  assert.equal(session?.actor_id, 'owner');
+});
+
+test('Owner role configuration modal contains only the Quest announcement role', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  let receivedModal;
+  const runtime = {
+    acceptingInteractions: true,
+    env: { PRELAUNCH: false, OWNER_ID: 'owner', DISCORD_GUILD_ID: 'guild' },
+    config: { version: 1, values: { adminRoleId: 'legacy-role' }, gates: {} },
+    health: { workers: {}, startedAt: new Date().toISOString() },
+    logger: { debug: () => {}, info: () => {}, error: () => {} },
+    pool,
+  };
+  const interaction = {
+    id: '123456789012345681', customId: customId('config_quest_role'),
+    user: { id: 'owner' }, guildId: 'guild', channelId: 'channel', message: { id: 'overview-panel' },
+    client: { questshop: runtime }, memberPermissions: memberPermissions(),
+    inGuild: () => true, isChatInputCommand: () => false, isButton: () => true,
+    isStringSelectMenu: () => false, isUserSelectMenu: () => false, isModalSubmit: () => false,
+    showModal: async (modal) => { receivedModal = modal; return modal.toJSON(); },
+    reply: async () => {},
+  };
+
+  await assert.doesNotReject(() => routeInteraction(interaction));
+  const modalData = receivedModal.toJSON();
+  const modalRoute = parseCustomId(modalData.custom_id);
+  assert.equal(modalRoute.route, 'config_quest_role_submit');
+  assert.match(JSON.stringify(modalData), /quest_role/);
+  assert.doesNotMatch(JSON.stringify(modalData), /admin_role/);
+  let session;
+  for (let attempt = 0; attempt < 20 && !session; attempt += 1) {
+    await setImmediate();
+    session = (await pool.query('SELECT * FROM interaction_sessions WHERE id=$1', [modalRoute.sessionId])).rows[0];
+  }
+  assert.equal(session?.operation, 'CONFIG_QUEST_ROLE');
+});
+
 test('unknown components always receive an expiry response', async () => {
   const replies = [];
   const runtime = {
@@ -163,21 +262,21 @@ test('unknown components always receive an expiry response', async () => {
 test('pre-launch keeps customer routes limited to Owner or Admin even when UAT gates are open', async () => {
   const runtime = {
     env: { PRELAUNCH: true, OWNER_ID: 'owner' },
-    config: { values: { adminRoleId: 'admin-role' } },
+    config: { values: {} },
     pool: { query: async () => ({ rows: [
       { gate: 'STORE_OPEN', enabled: true }, { gate: 'CUSTOMER_INTERACTIONS_ENABLED', enabled: true },
       { gate: 'TOPUP_ACCEPTING', enabled: true },
     ] }) },
   };
   const customer = {
-    user: { id: 'customer' }, member: { roles: { cache: { has: () => false } } },
+    user: { id: 'customer' }, memberPermissions: memberPermissions(),
     isButton: () => false,
   };
   await assert.rejects(() => authorizeRoute(customer, { route: 'payment_method' }, runtime),
     (error) => error.code === 'PRELAUNCH_RESTRICTED');
 
   const admin = {
-    user: { id: 'admin' }, member: { roles: { cache: { has: (id) => id === 'admin-role' } } },
+    user: { id: 'admin' }, memberPermissions: memberPermissions(PermissionFlagsBits.Administrator),
     isButton: () => false,
   };
   const gates = await authorizeRoute(admin, { route: 'payment_method' }, runtime);

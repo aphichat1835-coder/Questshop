@@ -1,6 +1,6 @@
 import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, LabelBuilder, ModalBuilder,
-  StringSelectMenuBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder,
+  PermissionFlagsBits, StringSelectMenuBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder,
 } from 'discord.js';
 import { v7 as uuidv7 } from 'uuid';
 import { createContext, supportCode } from '../../shared/correlation.js';
@@ -135,7 +135,6 @@ function overviewRuntimeMetrics(interaction, runtime) {
 function overviewDescription({ incidents, metrics, queue, reviews, surfaces, row, runtime }) {
   const { workers, healthyWorkers, uptimeMinutes, ping, discordReady } = metrics;
   const values = runtime.config.values ?? {};
-  const adminRole = values.adminRoleId ? `<@&${values.adminRoleId}>` : 'ยังไม่ตั้ง';
   const questRole = values.questAnnouncementRoleId ? `<@&${values.questAnnouncementRoleId}>` : 'ปิด';
   return [
     '**ภาพรวมการเงิน**',
@@ -145,7 +144,7 @@ function overviewDescription({ incidents, metrics, queue, reviews, surfaces, row
     '', '**สุขภาพระบบ**',
     `ฐานข้อมูล: **${runtime.health?.checks?.database ?? (runtime.health?.ready ? 'พร้อม' : 'กำลังตรวจ')}** • Discord: **${discordReady ? 'พร้อม' : 'กำลังเชื่อมต่อ'}**`,
     `Worker พร้อมทำงาน: **${healthyWorkers}/${workers.length}** • Ping: **${ping}** • เปิดมาแล้ว: **${uptimeMinutes} นาที**`,
-    `ห้อง/แผงที่ติดตั้ง: **${surfaces.rows[0].count}** • ยศแอดมิน: **${adminRole}** • ยศแจ้ง Quest: **${questRole}**`,
+    `ห้อง/แผงที่ติดตั้ง: **${surfaces.rows[0].count}** • ผู้ดูแลหลังบ้าน: **สิทธิ์ Administrator** • ยศแจ้ง Quest: **${questRole}**`,
   ].join('\n');
 }
 function runnerConcurrency(runtime) {
@@ -154,8 +153,7 @@ function runnerConcurrency(runtime) {
 }
 function actorTypeFor(interaction, runtime) {
   if (interaction.user.id === runtime.env.OWNER_ID) return 'OWNER';
-  const adminRoleId = runtime.config.values?.adminRoleId;
-  if (adminRoleId && interaction.member?.roles?.cache?.has(adminRoleId)) return 'ADMIN';
+  if (hasAdministratorPermission(interaction)) return 'ADMIN';
   return 'CUSTOMER';
 }
 function contextFor(interaction, operation) {
@@ -176,10 +174,13 @@ async function advanceInteractionSession(session, interaction, runtime, child, o
     guildId: interaction.guildId, child: { ...child, channelId: child.channelId ?? interaction.channelId } },
   contextFor(interaction, operation), { pool: runtime.pool });
 }
+export function hasAdministratorPermission(interaction) {
+  return interaction.memberPermissions?.has?.(PermissionFlagsBits.Administrator) === true;
+}
+
 function isBackoffice(interaction, runtime) {
   if (interaction.user.id === runtime.env.OWNER_ID) return true;
-  const roleId = runtime.config.values?.adminRoleId;
-  return Boolean(roleId && interaction.member?.roles?.cache?.has(roleId));
+  return hasAdministratorPermission(interaction);
 }
 const CUSTOMER_ERROR_CODES = new Set([
   'OWNER_ONLY', 'ADMIN_ONLY', 'NOT_AUTHORIZED', 'SESSION_EXPIRED', 'STALE_SESSION',
@@ -632,7 +633,7 @@ async function renderOverviewPanel(interaction, runtime) {
   const metrics = overviewRuntimeMetrics(interaction, runtime);
   const description = overviewDescription({ incidents, metrics, queue, reviews, surfaces, row, runtime });
   const controls = [new ActionRowBuilder().addComponents(new ButtonBuilder()
-    .setCustomId(customId('config_roles')).setLabel('ตั้งยศแอดมิน / แจ้ง Quest').setStyle(ButtonStyle.Secondary)
+    .setCustomId(customId('config_quest_role')).setLabel('ตั้งยศแจ้ง Quest').setStyle(ButtonStyle.Secondary)
     .setDisabled(interaction.user.id !== runtime.env.OWNER_ID))];
   return adminReply(interaction, 'overview', { embeds: [panelEmbed(0x5865f2, 'ภาพรวมร้าน', description)], components: controls });
 }
@@ -1746,36 +1747,34 @@ if (route.route === 'config_concurrency_submit' && interaction.isModalSubmit()) 
 }
 
 async function handleConfig({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'config_roles' && interaction.isButton()) {
-  ownerOnly(interaction, runtime, 'การตั้งค่ายศใช้ได้เฉพาะเจ้าของร้าน');
+if (route.route === 'config_quest_role' && interaction.isButton()) {
+  ownerOnly(interaction, runtime, 'การตั้งค่ายศแจ้ง Quest ใช้ได้เฉพาะเจ้าของร้าน');
   return showPreparedModal({ interaction, runtime, route,
-    modal: (sessionId) => fieldsModal('config_roles_submit', sessionId, 'ตั้งค่ายศของระบบ', [
-      { id: 'admin_role', label: 'ID ยศแอดมิน (เว้นว่างเพื่อปิด)', required: false, max: 20 },
+    modal: (sessionId) => fieldsModal('config_quest_role_submit', sessionId, 'ตั้งยศแจ้ง Quest ใหม่', [
       { id: 'quest_role', label: 'ID ยศแจ้ง Quest ใหม่', required: false, max: 20 },
       { id: 'reason', label: 'เหตุผล', long: true, max: 500 },
     ]),
     prepare: (sessionId) => createAdminSession({ id: sessionId, actorId: interaction.user.id, guildId: interaction.guildId,
-      channelId: interaction.channelId, messageId: interaction.message.id, operation: 'CONFIG_ROLES',
+      channelId: interaction.channelId, messageId: interaction.message.id, operation: 'CONFIG_QUEST_ROLE',
       payload: { expectedVersion: runtime.config.version }, configVersion: runtime.config.version },
     contextFor(interaction, 'config_session'), { pool: runtime.pool }) });
 }
 }
 
 function roleConfigPatch(interaction) {
-  const adminRoleId = interaction.fields.getTextInputValue('admin_role').trim() || null;
   const questAnnouncementRoleId = interaction.fields.getTextInputValue('quest_role').trim() || null;
-  if ([adminRoleId, questAnnouncementRoleId].some((id) => id && !/^\d{17,20}$/.test(id))) {
+  if (questAnnouncementRoleId && !/^\d{17,20}$/.test(questAnnouncementRoleId)) {
     throw new TypeError('ID ยศไม่ถูกต้อง');
   }
-  return { adminRoleId, questAnnouncementRoleId };
+  return { questAnnouncementRoleId };
 }
 
 async function handleConfigSubmit({ interaction, route, runtime, gates: _gates }) {
-if (route.route === 'config_roles_submit' && interaction.isModalSubmit()) {
-  ownerOnly(interaction, runtime, 'การตั้งค่ายศใช้ได้เฉพาะเจ้าของร้าน');
+if (route.route === 'config_quest_role_submit' && interaction.isModalSubmit()) {
+  ownerOnly(interaction, runtime, 'การตั้งค่ายศแจ้ง Quest ใช้ได้เฉพาะเจ้าของร้าน');
   await interaction.deferReply({ ephemeral: true });
   const session = await loadAdminSession({ sessionId: route.sessionId, actorId: interaction.user.id,
-    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'CONFIG_ROLES' },
+    guildId: interaction.guildId, channelId: interaction.channelId, operation: 'CONFIG_QUEST_ROLE' },
   contextFor(interaction, 'config_load'), { pool: runtime.pool });
   const changed = await updateRuntimeConfig({ patch: roleConfigPatch(interaction), expectedVersion: session.payload.expectedVersion,
     reason: interaction.fields.getTextInputValue('reason').trim() },
@@ -1889,8 +1888,8 @@ export const ROUTE_HANDLERS = Object.freeze({
   "dlq_discard_submit": handleDlqSubmit,
   "config_concurrency": handleConcurrency,
   "config_concurrency_submit": handleConcurrencySubmit,
-  "config_roles": handleConfig,
-  "config_roles_submit": handleConfigSubmit,
+  "config_quest_role": handleConfig,
+  "config_quest_role_submit": handleConfigSubmit,
   "breaker_prepare": handleBreakerPrepare,
   "breaker_submit": handleBreakerSubmit,
   "test_fail_send": handleTestFailureSend,

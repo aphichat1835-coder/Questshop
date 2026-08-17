@@ -23,7 +23,11 @@ export function acknowledgementOf(interaction) {
   return interaction.__questshopAcknowledgement ?? ACKNOWLEDGEMENT.NONE;
 }
 
-function normalizeInitialArguments(args) {
+function normalizeInitialArguments(method, args) {
+  // ModalBuilder is not a message payload. Spreading/normalizing it strips
+  // the builder prototype and moves custom_id/title under `data`, so
+  // discord.js can no longer serialize the modal. Preserve it exactly.
+  if (method === ACKNOWLEDGEMENT.MODAL) return args;
   return args.map((value, index) => {
     if (index !== 0 || !value || typeof value !== 'object') return value;
     const needsPayloadBoundary = ['content', 'embeds', 'components', 'nonce', 'allowedMentions']
@@ -40,7 +44,7 @@ function installOutputBoundary(interaction, method, onMessage) {
   if (typeof interaction[method] !== 'function') return;
   const original = interaction[method].bind(interaction);
   interaction[method] = async (...args) => {
-    const normalized = normalizeInitialArguments(args);
+    const normalized = normalizeInitialArguments(method, args);
     const result = await original(...normalized);
     await onMessage({ method, payload: normalized[0], result });
     return result;
@@ -57,7 +61,7 @@ export function installResponseController(interaction, { onAcknowledged = () => 
         if (current === method) return null;
         throw new QuestshopError('INTERACTION_ALREADY_ACKNOWLEDGED', 'Interaction ถูกตอบรับแล้ว');
       }
-      const normalized = normalizeInitialArguments(args);
+      const normalized = normalizeInitialArguments(method, args);
       const result = await original(...normalized);
       interaction.__questshopAcknowledgement = method;
       onAcknowledged(method);

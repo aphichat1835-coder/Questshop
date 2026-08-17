@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MessageFlags } from 'discord.js';
+import {
+  LabelBuilder, MessageFlags, ModalBuilder, TextInputBuilder, TextInputStyle,
+} from 'discord.js';
 import {
   ACKNOWLEDGEMENT, acknowledgementOf, installResponseController,
 } from '../../src/discord/interactions/response-controller.js';
@@ -20,10 +22,22 @@ test('response controller converts deprecated ephemeral options and owns one ack
     (error) => error.code === 'INTERACTION_ALREADY_ACKNOWLEDGED');
 });
 
-test('response controller preserves a modal as a terminal acknowledgement', async () => {
-  const interaction = { showModal: async () => {} };
+test('response controller preserves a real ModalBuilder as a terminal acknowledgement', async () => {
+  let received;
+  const input = new TextInputBuilder().setCustomId('amount').setStyle(TextInputStyle.Short).setRequired(true);
+  const modal = new ModalBuilder()
+    .setCustomId('qs:v1:test:00000000-0000-0000-0000-000000000000')
+    .setTitle('ตั้งราคา')
+    .addLabelComponents(new LabelBuilder().setLabel('ราคาใหม่').setTextInputComponent(input));
+  const interaction = { showModal: async (value) => {
+    received = value;
+    return value.toJSON();
+  } };
   installResponseController(interaction);
-  await interaction.showModal({ customId: 'qs:v1:test:00000000-0000-0000-0000-000000000000' });
+  await interaction.showModal(modal);
+  assert.equal(received, modal);
+  assert.equal(received.toJSON().custom_id, 'qs:v1:test:00000000-0000-0000-0000-000000000000');
+  assert.equal(received.toJSON().components[0].type, 18);
   assert.equal(acknowledgementOf(interaction), ACKNOWLEDGEMENT.MODAL);
 });
 

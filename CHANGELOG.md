@@ -27,6 +27,8 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
 
 ### Added
 
+- Discord response controller now preserves `ModalBuilder` instances instead of treating them as message payloads.
+  This restores all 19 Modal-launching routes, including Quest pricing, promotions, receiver setup and Wallet tools.
 - Migration 0028 adds a durable `PENDING_BIND` interaction-session phase.  A multi-step panel now binds its child
   session to the actual Ephemeral Discord reply that renders its controls before it becomes usable.
 - Router regression coverage for awaited handler failure, legacy-panel acknowledgement, response payload boundaries
@@ -83,6 +85,9 @@ Discord, TrueMoney, Managed PostgreSQL, inwcloud restart และ Owner UAT ค
 
 ### Changed
 
+- Backoffice authorization no longer depends on a configured Admin Role ID. Owner access still uses `OWNER_ID`; all
+  other backoffice access is reauthorized from the member's current Discord `Administrator` permission on every
+  interaction. The Overview panel now configures only the optional Quest-announcement role.
 - Discord interaction routing now awaits every handler inside its error boundary.  Safe business failures return a
   Thai Ephemeral recovery message with Support code instead of becoming an unacknowledged Discord timeout; metrics
   record the eventual outcome and error code.

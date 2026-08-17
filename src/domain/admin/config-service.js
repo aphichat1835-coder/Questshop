@@ -8,6 +8,7 @@ import {
   assertQuestPriceCategory,
   taskTypesForQuestPriceCategory,
 } from '../pricing/categories.js';
+import { sanitizeRuntimeConfigValues } from '../../config/runtime-config.js';
 
 export async function updateFeatureGate({ gate, enabled, reason, expectedVersion, release = null }, context, options = {}) {
   assertFeatureGate(gate);
@@ -153,10 +154,13 @@ export async function updateRuntimeConfig({ patch, expectedVersion, reason }, co
   if (!patch || typeof patch !== 'object' || Array.isArray(patch) || !reason?.trim()) throw new TypeError('invalid config update');
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const before = (await client.query('SELECT * FROM config_versions ORDER BY version DESC LIMIT 1 FOR UPDATE')).rows[0] ?? null;
-    const version = Number(before?.version ?? 0);
-    if (version !== Number(expectedVersion)) throw new Error('STALE_CONFIG');
-    const payload = { ...before?.payload, ...patch };
-    const nextVersion = version + 1;
+    // Runtime exposes version 1 before the first persisted customization so
+    // sessions have a stable non-zero config version. Accept that baseline,
+    // then persist the first snapshot as version 1.
+    const visibleVersion = Number(before?.version ?? 1);
+    if (visibleVersion !== Number(expectedVersion)) throw new Error('STALE_CONFIG');
+    const payload = sanitizeRuntimeConfigValues({ ...before?.payload, ...patch });
+    const nextVersion = Number(before?.version ?? 0) + 1;
     const hash = createHash('sha256').update(JSON.stringify(payload)).digest('hex');
     const row = (await client.query(`INSERT INTO config_versions(id,version,payload,payload_hash,
       actor_type,actor_id,trace_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,

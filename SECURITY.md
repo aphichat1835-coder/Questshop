@@ -133,6 +133,8 @@ Report immediately if you find:
 - a token, secret, database URL, full voucher link outside the accepted Payment Log path, or decrypted receiver value
   in output/history;
 - forged/stale interaction/session authorization, customer/Admin privilege bypass or unsafe command routing;
+- backoffice authorization is re-evaluated from Discord's current `Administrator` permission on every interaction;
+  a configured role ID is not an authorization source;
 - negative Wallet balance, duplicate credit, double Capture/Release, Ledger mismatch or editable audit evidence;
 - voucher replay, HMAC bypass, Receiver/Promotion snapshot mismatch or post-send blind retry;
 - active-account uniqueness, queue fairness, lease/fencing or restart-recovery bypass;
