@@ -200,6 +200,7 @@ export async function publishProjection(channel, projection, body) {
   if (existing) return existing;
   try {
     const createPayload = createProjectionSendPayload(normalizedBody, projection.nonce);
+    // nosemgrep: javascript.express.security.audit.xss.direct-response-write.direct-response-write -- Discord TextBasedChannel is not an HTTP response; createPayload has already passed normalizeDiscordPayload.
     return await channel.send(createPayload);
   } catch (error) {
     const reconciled = await findDiscordMessageByNonce(channel, projection.nonce, { maximum: 100 });
