@@ -149,17 +149,24 @@ function normalizeAllowedMentions(value) {
 }
 
 function suppressUnallowedMentions(value, allowedMentions) {
-  const permitted = [];
-  const protectedText = String(value).replace(/<@&(\d+)>|<@!?(\d+)>/g, (match, roleId, userId) => {
+  const text = String(value);
+  const mentions = /<@&(\d+)>|<@!?(\d+)>/g;
+  let cursor = 0;
+  let result = '';
+
+  for (const match of text.matchAll(mentions)) {
+    const [mention, roleId, userId] = match;
+    const offset = match.index ?? cursor;
+    result += text.slice(cursor, offset).replaceAll('@', '@\u200b');
+
     const allowed = roleId
       ? (allowedMentions.roles ?? []).includes(roleId)
       : (allowedMentions.users ?? []).includes(userId);
-    if (!allowed) return match.replace('@', '@\u200b');
-    permitted.push(match);
-    return `\u0000${permitted.length - 1}\u0000`;
-  });
-  return protectedText.replaceAll('@', '@\u200b')
-    .replace(/\u0000(\d+)\u0000/g, (_match, index) => permitted[Number(index)] ?? '');
+    result += allowed ? mention : mention.replace('@', '@\u200b');
+    cursor = offset + mention.length;
+  }
+
+  return `${result}${text.slice(cursor).replaceAll('@', '@\u200b')}`;
 }
 
 /**

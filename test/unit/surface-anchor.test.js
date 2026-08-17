@@ -106,6 +106,16 @@ test('Discord payload boundary strips unsafe mentions and bounds textual output'
   assert.deepEqual(body.allowedMentions.parse, []);
 });
 
+test('Discord payload boundary preserves only explicitly allowlisted role mentions without control-character placeholders', () => {
+  const roleId = '123456789012345678';
+  const body = normalizeDiscordPayload({
+    content: `<@&${roleId}> @everyone <@&987654321098765432>`,
+    allowedMentions: { roles: [roleId] },
+  });
+  assert.equal(body.content, `<@&${roleId}> @\u200beveryone <@\u200b&987654321098765432>`);
+  assert.doesNotMatch(body.content, /[\u0000-\u001f]/);
+});
+
 test('Discord payload boundary also bounds embeds and drops an unsafe link component', () => {
   const body = normalizeDiscordPayload({
     embeds: [{ title: '@here '.repeat(100), description: 'x'.repeat(5_000),

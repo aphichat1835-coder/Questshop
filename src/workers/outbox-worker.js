@@ -183,6 +183,12 @@ async function applyQuestAnnouncementPing(pool, projection, body) {
   return true;
 }
 
+function createProjectionSendPayload(normalizedBody, nonce) {
+  // `normalizedBody` has already crossed the payload boundary before either
+  // edit or create.  Only add transport-controlled nonce metadata here.
+  return { ...normalizedBody, nonce, enforceNonce: true };
+}
+
 export async function publishProjection(channel, projection, body) {
   const normalizedBody = normalizeDiscordPayload(body);
   const message = projection.message_id ? await fetchDiscordMessage(channel, projection.message_id) : null;
@@ -193,7 +199,8 @@ export async function publishProjection(channel, projection, body) {
   const existing = await findDiscordMessageByNonce(channel, projection.nonce, { maximum: 100 });
   if (existing) return existing;
   try {
-    return await channel.send(normalizeDiscordPayload({ ...normalizedBody, nonce: projection.nonce, enforceNonce: true }));
+    const createPayload = createProjectionSendPayload(normalizedBody, projection.nonce);
+    return await channel.send(createPayload);
   } catch (error) {
     const reconciled = await findDiscordMessageByNonce(channel, projection.nonce, { maximum: 100 });
     if (reconciled) return reconciled;
