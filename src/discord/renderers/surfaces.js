@@ -16,8 +16,8 @@ function safeHttpsUrl(value) {
 
 export function renderQuestAuto(config = {}) {
   const embed = new EmbedBuilder().setColor(COLORS.primary)
-    .setTitle(truncateDiscordText(config.title ?? 'Discord Quest — ทำเควสอัตโนมัติ', DISCORD_LIMITS.embedTitle))
-    .setDescription(truncateDiscordText(config.description ?? 'เติมเครดิต เลือก Quest ที่ต้องการ แล้วติดตามความคืบหน้าได้อัตโนมัติ\nระบบคิดค่าบริการเฉพาะ Quest ที่ทำสำเร็จเท่านั้น', DISCORD_LIMITS.embedDescription));
+    .setTitle(truncateDiscordText(config.title ?? 'Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
+    .setDescription(truncateDiscordText(config.description ?? 'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ\n**ค่าบริการ 5 บาท / เควสสำเร็จ**\nใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ\nเลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ', DISCORD_LIMITS.embedDescription));
   const mediaUrl = safeHttpsUrl(config.mediaUrl);
   if (mediaUrl) embed.setImage(mediaUrl);
   return {
