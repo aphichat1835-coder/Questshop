@@ -1,8 +1,7 @@
 # Questshop production evidence record
 
-Copy this file for each pre-launch round.  It is a record of evidence, not a
-replacement for the database audit trail.  Never put tokens, voucher URLs,
-database URLs, cookies or encryption/HMAC keys in it.
+Copy this file for each pre-launch round. It records evidence; it does not replace database audit trails.
+Never record raw tokens, voucher URLs, database URLs, cookies, passwords or encryption/HMAC keys.
 
 ## Release identity
 
@@ -17,74 +16,90 @@ database URLs, cookies or encryption/HMAC keys in it.
 | Owner conducting UAT | |
 | Guild ID | |
 
-The Git SHA must be the same for every entry below.  Stop the round if an app,
-migration or configuration deployment changes it.
+Stop the round if app/migration/config deployment changes the Git SHA.
 
 ## Preconditions
 
-- [ ] `PRELAUNCH=true` restricts customer routes to Owner/Admin for this UAT round; normal capabilities are not
-      manually opened one by one.
-- [ ] Managed PostgreSQL TLS uses `verify-full`; direct/runtime Aiven URLs and roles
-      roles are distinct and runtime has no DDL privilege.
-- [ ] Private log rooms deny `@everyone`; the bot has the expected permissions.
-- [ ] Receiver version, monitor account and keyring health are valid; record
-      version numbers only.
-- [ ] `npm run verify`, `npm audit --audit-level=high`, Docker build and the
-      fake-adapter load test passed for this SHA.
+- [ ] `PRELAUNCH=true`.
+- [ ] Direct/Runtime Aiven URLs use distinct roles and `sslmode=verify-full`.
+- [ ] Runtime has no schema DDL and protected append-only tables deny update/delete.
+- [ ] Bot has Discord `Administrator`.
+- [ ] Owner manually verified backoffice channel viewers/roles; no automated privacy guard is claimed.
+- [ ] Receiver, Monitor and keyring health are valid; record version/ID only.
+- [ ] check/lint/PostgreSQL-backed coverage/load/audit/Docker gates passed for this SHA.
+
+## Quest Auto evidence
+
+Expected source contract:
+
+```text
+Title    Discord Quest • Auto
+Video    src/discord/assets/videoplayback.mp4
+Size     6,812,564 bytes
+SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+```
+
+| Case | Discord Message ID / evidence | Expected outcome | Observed outcome | Owner approval |
+|---|---|---|---|---|
+| `/quest-auto` install/update | | one durable active anchor | | |
+| Desktop video playback | | `videoplayback.mp4` plays correctly | | |
+| Mobile video playback | | same uploaded video plays correctly | | |
+| Equal GAME/VIDEO price | | one amount, e.g. `5 บาท` | | |
+| Different GAME/VIDEO price | | min-max range, e.g. `5-7 บาท` | | |
+| Price refresh timing | | same message updates within ~60s Maintenance window | | |
+| Restart | | no duplicate anchor/video attachment | | |
+| Legacy/missing video | | same anchor replaces stale attachment with `videoplayback.mp4` | | |
+| Deleted anchor | | exactly one replacement becomes authoritative | | |
+| Discord 403 | | incident/pointer preserved; no permission auto-repair | | |
+
+Record only message/channel IDs and timestamps, never a Discord user token.
 
 ## Financial proof
 
 | Case | Top-up / Order / Trace ID | Expected outcome | Observed outcome | Owner approval |
 |---|---|---|---|---|
 | Real low-value TrueMoney success | | `REDEEMED → CREDITED` exactly once | | |
-| Same voucher submitted twice | | one durable top-up owner | | |
+| Same voucher submitted twice | | one durable Top-up owner | | |
 | Provider timeout after possible send | | `AMBIGUOUS`, no blind retry | | |
 | Owner resolves ambiguous payment | | Credit or Reject with audit | | |
 | Five Quest items: 3 success / 2 failure | | 3 Capture + 2 Release | | |
-| Worker crash / restart around settlement | | no duplicate ledger change | | |
+| Worker crash / restart around settlement | | no duplicate Ledger mutation | | |
 
-Record only masked voucher identifiers and database IDs.  The complete voucher
-link belongs exclusively in the validated `log-payments` surface.
+Use masked voucher identity only. Complete voucher link belongs only in the validated `LOG_PAYMENTS` surface.
 
 ## Discord and Quest proof
 
 | Case | Evidence IDs | Expected outcome | Observed outcome | Approved by |
 |---|---|---|---|---|
-| `/quest-auto` update/move and restart | | exactly one live anchor | | |
-| Mobile checkout over 25 Quest options | | pagination/selection/quote works | | |
-| Forged, wrong-user and expired component | | denied without side effect | | |
-| Real supported video Quest | | verify then manual URL claim only | | |
-| Real supported desktop Quest | | verify then manual URL claim only | | |
-| `quest-new` discovery | | announcement hides customer source | | |
-| Discord 403/404/429/5xx | | scoped surface/DLQ/retry behavior | | |
-| Surface setup permissions | | setup rejects missing/private-room access | | |
+| Mobile checkout >25 options | | pagination/selection/quote works | | |
+| Forged/wrong-user/expired component | | denied without side effect | | |
+| Real Video Quest | | verify then manual claim URL only | | |
+| Real Desktop Quest | | verify then manual claim URL only | | |
+| Monitor-discovered Quest | | private until current-contract pass/override | | |
+| customer `quest-new` | | public output hides customer source | | |
+| Discord 404/429/5xx | | scoped retry/reconcile behavior | | |
 
-For every Quest run, record the Order Item ID, Job ID and shortened support
-code.  Do not record a Discord user token.
+For Quest runs, record Order Item ID, Job ID and shortened support code only.
 
-## Backup, restore and operations proof
+## Aiven / operations proof
 
 | Case | Backup / Incident / Trace ID | Expected outcome | Observed outcome | Owner approval |
 |---|---|---|---|---|
-| Aiven provider-managed backup | | Aiven Console status + plan limitation recorded | | |
-| Restore drill to temporary managed DB | | schema/ledger/reservation/payment/queue/outbox/crypto checks pass | | |
-| Runtime restart recovery | | leases, queue, runner, payment, outbox and reviews recover | | |
-| Alert delivery | | financial and infrastructure alert reaches Owner | | |
-| Rollback rehearsal | | app rollback or forward-fix decision recorded | | |
+| Aiven provider-managed backup | | Console status + plan limitation recorded | | |
+| Runtime restart recovery | | leases/queue/payment/outbox/reviews recover | | |
+| Health endpoints | | `/livez`, `/readyz`, authorized `/statusz` correct | | |
+| Alert delivery | | Owner receives financial/infrastructure alert | | |
+| Rollback rehearsal | | compatible app rollback or forward-fix decision | | |
 
-## Closeout and normal-operation confirmation
+## Closeout
 
 - [ ] Run `CONFIRM_PRELAUNCH_CLOSEOUT=I_UNDERSTAND_COMPENSATING_TRANSACTIONS npm run prelaunch:closeout`.
-- [ ] Record the resulting `PRELAUNCH_CLOSEOUT` release-evidence ID and confirm
-      that no financial/admin audit was deleted.
-- [ ] Owner confirms `PRELAUNCH=false` only after the closeout is complete. Normal capabilities are already
-      configured as enabled; do not manually open each one from a panel.
-- [ ] Record any incident brake that remained closed, its health/invariant result and Owner reopening approval.
+- [ ] Record resulting `PRELAUNCH_CLOSEOUT` release-evidence ID.
+- [ ] Confirm no financial/Admin audit evidence was deleted.
+- [ ] Owner sets `PRELAUNCH=false` only after required rows are approved.
 
 ## Final decision
 
-- [ ] All rows are passed or have an approved compensating/forward-fix record.
-- [ ] Owner accepts the residual risks explicitly listed in the Final
-      Decision-Complete plan.
-- [ ] Status is `done` only after the evidence is stored for this exact SHA;
-      otherwise the status remains `implemented-but-unverified`.
+- [ ] Every applicable row passed or has an approved compensating/forward-fix record.
+- [ ] Owner accepts residual risks.
+- [ ] Status is `done` only for this exact Git SHA; otherwise **implemented-but-unverified**.

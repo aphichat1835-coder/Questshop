@@ -1,164 +1,141 @@
 # Deploy Questshop on inwcloud + Aiven PostgreSQL
 
-คู่มือนี้ใช้สำหรับ source ปัจจุบันของ Questshop บนกิ่ง/commit ที่คุณเลือก deploy เท่านั้น ไม่ทดสอบ
-TrueMoney จริง และไม่ทำให้ระบบเป็น production-ready โดยอัตโนมัติ ระบบปกติเริ่มทำงานอัตโนมัติ;
-เฉพาะ incident brake ที่เกิดจากความผิดปกติเท่านั้นที่คงปิดไว้จนผ่านการกู้เฉพาะจุด
+This guide applies to the exact branch/commit selected for deployment. Passing deployment does not make the system
+production-ready; live TrueMoney, Quest, Discord and Owner UAT still require evidence on the same Git SHA.
 
-## สิ่งที่ต้องมี
+## Requirements
 
-- inwcloud project ที่ดึง repository และ branch/commit ที่ต้องการได้
-- Runtime **Node.js 22.x LTS**
-- Aiven PostgreSQL 16+ และ CA certificate ถ้า Aiven service ใช้ private CA
-- Discord bot อยู่ใน Guild เป้าหมายและมีสิทธิ์ `Administrator`
-- PostgreSQL roles ที่แยกกันแล้ว:
-  - `questshop_migrator`: ใช้ migration, มี `USAGE, CREATE` บน schema `public`
-  - `questshop_runtime`: ใช้บอทตอนทำงาน, มี `USAGE` บน `public` และไม่มี `CREATE`
+- inwcloud project connected to the repository/branch
+- Node.js 22.x LTS
+- Aiven PostgreSQL 16+
+- Discord bot in the target Guild with `Administrator`
+- separate PostgreSQL roles:
+  - `questshop_migrator`: `USAGE, CREATE` on `public`
+  - `questshop_runtime`: `USAGE` on `public`, no `CREATE`
 
-Aiven/Admin เป็นผู้รับผิดชอบการสร้าง role, `CONNECT`, role membership และ schema grants. Questshop จะจัดการ
-เฉพาะ object privileges ที่ Migrator เป็นเจ้าของหลัง migration เท่านั้น ดูรายละเอียดที่
-[PostgreSQL role contract](../architecture/postgresql-roles.md)
+Aiven/Admin owns role creation, `CONNECT`, membership and schema grants. Questshop synchronizes only object privileges
+owned by the effective Migrator after migration.
 
-> [!CAUTION]
-> `questshop_migrator` กับ `questshop_runtime` ต้องเป็นคนละ role. อย่าใช้ URL เดียวกันทั้ง
-> `DATABASE_DIRECT_URL` และ `DATABASE_POOL_URL`; deployment จะ fail-closed ตาม design
+## 1. Select source and `GIT_SHA`
 
-## 1. เลือก source และ Git SHA
+Select the intended branch/commit in inwcloud and set `GIT_SHA` to the exact 40-character commit SHA.
+If Git metadata exists in the checkout, `setup:verify` compares `git rev-parse HEAD` against `GIT_SHA` and fails on
+mismatch.
 
-1. เลือก branch/commit ที่ต้องการใน inwcloud
-2. หา SHA เต็ม 40 ตัวของ commit นั้นจาก GitHub หรือ local Git:
+## 2. Runtime command
 
-```bash
-git rev-parse HEAD
+Configure inwcloud:
+
+```text
+Language: Node.js
+Version: 22.x LTS
+Run mode: Custom Command
 ```
 
-3. ตั้งค่า `GIT_SHA` ให้ตรงกับ SHA เดียวกันทุกตัวอักษร
-
-ใน production ระบบปฏิเสธ SHA ที่ไม่ครบ 40 ตัว เพื่อให้ log, migration audit และ UAT ผูกกับ revision จริงได้
-
-## 2. ตั้ง Project Runtime
-
-ในหน้า Project Settings ของ inwcloud:
-
-- Programming language: **Node.js**
-- Version: **Node.js 22.x (LTS)**
-- Run mode: **Custom Command**
-- Custom Command:
+Use:
 
 ```bash
 npm ci --omit=dev && npm run deploy && npm start
 ```
 
-คำสั่งนี้ตั้งใจให้รันทุกครั้งที่ inwcloud start/restart:
+`npm run deploy` performs:
 
 ```text
-npm ci --omit=dev
-→ npm run deploy
-  → npm run setup:verify
-  → npm run migrate
-  → npm run register
-→ npm start
+setup:verify → migrate → register
 ```
 
-แม้ไม่มี migration ใหม่ (`applied: 0`) ก็ยังต้องรัน `npm run migrate` เพราะมัน synchronize และตรวจ
-PostgreSQL object privileges ทุก deploy. อย่าแทนคำสั่งนี้ด้วย `npm start` หรือ `npm run register && npm start`
+Run migration every deploy even when `applied: 0`, because object privilege synchronization and validation still run.
 
-## 3. ตั้ง Environment Variables
+## 3. Environment Variables
 
-ใส่ค่าทั้งหมดในหน้า Environment Variables/Secrets ของ inwcloud ไม่ใส่ใน repository, command หรือ log
-
-| Variable | ค่า/หน้าที่ |
+| Variable | Value / purpose |
 |---|---|
 | `NODE_ENV` | `production` |
-| `DISCORD_BOT_TOKEN` | Bot token จาก Discord Developer Portal |
-| `DISCORD_CLIENT_ID` | Application ID ของ Discord |
-| `DISCORD_GUILD_ID` | Server ID ของ Guild เป้าหมาย |
-| `OWNER_ID` | Discord User ID ของ Owner |
-| `DATABASE_POOL_URL` | URL ของ `questshop_runtime`, มี `sslmode=verify-full` |
-| `DATABASE_DIRECT_URL` | URL ของ `questshop_migrator`, มี `sslmode=verify-full` |
-| `DATABASE_SSL_CA_BASE64` | CA PEM ของ Aiven ที่ Base64 แล้ว; ใส่เมื่อ Aiven CA ไม่ได้อยู่ใน Node trust store |
-| `STATUS_TOKEN` | Token สำหรับเรียก `/statusz`, ยาวอย่างน้อย 32 ตัวอักษร |
-| `DATA_ENCRYPTION_KEYS_JSON` | JSON keyring เข้ารหัส credential |
-| `VOUCHER_HMAC_KEYS_JSON` | JSON keyring HMAC สำหรับ voucher identity |
+| `DISCORD_BOT_TOKEN` | Bot secret |
+| `DISCORD_CLIENT_ID` | Application ID |
+| `DISCORD_GUILD_ID` | target Guild ID |
+| `OWNER_ID` | Owner Discord user ID |
+| `DATABASE_POOL_URL` | `questshop_runtime`, `sslmode=verify-full` |
+| `DATABASE_DIRECT_URL` | `questshop_migrator`, `sslmode=verify-full` |
+| `DATABASE_SSL_CA_BASE64` | Aiven CA PEM encoded as Base64 when required |
+| `STATUS_TOKEN` | `/statusz` Bearer token, at least 32 chars |
+| `DATA_ENCRYPTION_KEYS_JSON` | persistent Data keyring |
+| `VOUCHER_HMAC_KEYS_JSON` | persistent Voucher HMAC keyring |
 | `BACKUP_MODE` | `AIVEN_MANAGED` |
-| `GIT_SHA` | SHA เต็ม 40 ตัวของ source ที่กำลัง deploy |
-
-ค่าที่แนะนำในช่วง pre-launch:
-
-| Variable | ค่า |
-|---|---|
-| `PRELAUNCH` | `true` |
+| `GIT_SHA` | exact 40-char source SHA |
+| `PRELAUNCH` | `true` during UAT |
 | `TIMEZONE` | `Asia/Bangkok` |
-| `RUNNER_CONCURRENCY` | `2` |
-| `RUNNER_CONCURRENCY_HARD_MAX` | `5` |
-| `PORT` | `3000` หรือ port ที่จะ map Domain ของ inwcloud |
+| `RUNNER_CONCURRENCY` | default `2` |
+| `RUNNER_CONCURRENCY_HARD_MAX` | max `5` |
+| `PORT` | default `3000` |
 
-### TLS ของ Aiven
+Never put secret values in repository files, Custom Command, logs, screenshots or tickets.
 
-URL ทั้งสองต้องคง `sslmode=verify-full` เช่น:
+## 4. Aiven TLS
 
-```text
-postgresql://questshop_runtime:<PASSWORD>@<AIVEN_HOST>:<PORT>/<DATABASE>?sslmode=verify-full
-```
+Both database URLs keep `sslmode=verify-full`.
+When the Aiven chain needs its private CA, store the complete PEM as Base64 in `DATABASE_SSL_CA_BASE64`.
+Questshop decodes CA in-process and supplies it to `pg` with `rejectUnauthorized: true`.
 
-เมื่อจำเป็นต้องใช้ CA ให้แปลง **ไฟล์ PEM ทั้งไฟล์** เป็น Base64 แล้วใส่ผลลัพธ์ลง
-`DATABASE_SSL_CA_BASE64`. อย่าใส่ private key และอย่า paste certificate ลง log
-
-Questshop จะ decode CA ใน process และส่งเข้า `pg` โดยตรงพร้อม `rejectUnauthorized: true`. สำหรับ source รุ่นนี้
-**ห้ามเพิ่ม workaround เก่า** ต่อไปนี้ใน Custom Command:
+Do **not** use the old workaround:
 
 ```bash
-# ไม่ต้องใช้ และไม่ควรใส่
-node -e "...writeFileSync('/tmp/aiven-ca.pem', ...)"
+# do not add
 export NODE_EXTRA_CA_CERTS=/tmp/aiven-ca.pem
 ```
 
-ระบบจะลบเฉพาะ SSL query parameters จาก URL สำเนาที่ส่งให้ `pg`; URL ต้นฉบับยังผ่าน validation
-`sslmode=verify-full` อยู่เสมอ
+Do not write a temporary CA file in the inwcloud startup command for the current source.
 
-### Keyrings และ Status Token
+## 5. Quest Auto bundled video deployment
 
-หากมี terminal แบบ interactive บนเครื่องที่ปลอดภัย สามารถให้ Questshop สร้างค่าเริ่มต้นครั้งแรกได้:
+The repository must contain the exact source asset:
 
-```bash
-npm ci
-npm run setup
+```text
+src/discord/assets/videoplayback.mp4
+Size     6,812,564 bytes
+SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
 ```
 
-จากนั้นย้าย `STATUS_TOKEN`, `DATA_ENCRYPTION_KEYS_JSON` และ `VOUCHER_HMAC_KEYS_JSON` ไปเก็บใน inwcloud
-Environment Variables. เก็บค่าเดิมให้คงที่ทุก redeploy; ห้ามสุ่มค่าใหม่เพียงเพื่อแก้ startup error เพราะข้อมูล
-Token/Voucher ที่เข้ารหัสอยู่เดิมอาจถอดไม่ได้
+No build-time conversion, compression or Base64 reconstruction is used. Runtime reads this MP4 directly from `src`,
+verifies size + `ftyp` + SHA-256 and uploads it only when the persistent `QUEST_AUTO` message does not already contain
+the expected `videoplayback.mp4` attachment.
 
-## 4. Domain และ health endpoint
+If startup/runtime reports `Bundled Quest Auto video failed integrity verification`, do not bypass the check.
+Confirm the deployed checkout contains the exact Git-tracked binary and that inwcloud did not fetch an older revision.
 
-Questshop เปิด HTTP server ที่ `PORT` เพื่อใช้ health endpoint:
+The 6.8 MB asset is included by the normal `COPY src ./src` Docker/build/deploy source path; no extra media service is
+required.
 
-| Path | Authorization | ผลที่ควรได้ |
+## 6. Quest Auto dynamic price behavior
+
+The storefront price is read from active supported `TYPE` price rules:
+
+- equal prices → one value such as `5 บาท`
+- different GAME/VIDEO prices → range such as `5-7 บาท`
+- incomplete supported pricing → `ค่าบริการยังไม่พร้อม`
+
+The persistent message is edited automatically through surface reconciliation. The Maintenance worker currently runs
+approximately every 60 seconds, so visible price/media healing is eventual within the maintenance cycle rather than an
+instant same-click guarantee.
+
+## 7. Health endpoints
+
+| Path | Authorization | Expected |
 |---|---|---|
-| `/livez` | ไม่ต้อง | `200` เมื่อ process ยังตอบได้ |
-| `/readyz` | ไม่ต้อง | `200` เมื่อ runtime พร้อมรับงาน; `503` ระหว่าง startup/incident |
-| `/statusz` | `Bearer STATUS_TOKEN` | สถานะ workers, gates, incidents แบบจำกัด |
+| `/livez` | none | `200` while process is alive |
+| `/readyz` | none | `200` when runtime is ready, otherwise `503` |
+| `/statusz` | `Bearer STATUS_TOKEN` | bounded worker/gate/incident detail |
 
-ถ้าต้องการ inwcloud Domain ให้ map internal port ให้ตรงกับ `PORT` เช่น `3000`. Domain นี้มีไว้ดู health ไม่ใช่
-web dashboard และไม่ควรเผย `/statusz` token
+Map the inwcloud Domain to `PORT` if external health access is needed.
 
-ตัวอย่างทดสอบจากเครื่องที่เข้าถึง Domain ได้:
-
-```bash
-curl https://YOUR_DOMAIN/livez
-curl https://YOUR_DOMAIN/readyz
-curl -H 'Authorization: Bearer YOUR_STATUS_TOKEN' https://YOUR_DOMAIN/statusz
-```
-
-## 5. อ่านผล deploy ที่ถูกต้อง
-
-หลัง Save/Restart ให้ดู log ตามลำดับนี้:
+## 8. Expected deploy log order
 
 ```text
 setup:verify
-→ {"ok":true,"nodeEnv":"production",...}
+→ {"ok":true,...}
 
 migrate
-→ migration: { current: <version>, applied: <number>, privilegeSynchronization: { status: 'PASS', ... } }
+→ privilegeSynchronization: { status: 'PASS', ... }
 → preMigrationBackup: 'AIVEN_MANAGED'
 
 register
@@ -168,19 +145,11 @@ start
 → Questshop ready
 ```
 
-หาก inwcloud checkout มี Git metadata อยู่ `setup:verify` จะรายงาน `sourceShaVerified:true` พร้อม `sourceSha`
-ซึ่งต้องตรงกับ `GIT_SHA`; ถ้า host ไม่ส่ง Git metadata ระบบจะรายงาน `sourceShaVerified:false` และห้ามใช้
-Environment SHA เพียงอย่างเดียวเป็นหลักฐานว่า source ที่รันตรงกับ revision ที่เลือก
+`Questshop ready` confirms process/runtime readiness only; it does not prove TrueMoney or Quest execution.
 
-ความหมาย:
+## 9. Surface installation
 
-- `applied: 0` = schema อยู่ version ล่าสุดแล้ว เป็นผลปกติ
-- `privilegeSynchronization.status: 'PASS'` = role/object privilege ที่ Questshop ตรวจผ่าน
-- `Registered 8 guild commands` = ลงทะเบียนคำสั่ง Guild สำเร็จ แต่ไม่ใช่หลักฐานว่า panel ถูกติดตั้งแล้ว
-- `Questshop ready` = DB/schema/Discord/runtime lease พร้อมสำหรับ process นี้ แต่ไม่ใช่การยืนยัน TrueMoney
-  หรือ Quest execution จริง
-
-หลังขึ้น ready แล้ว Owner จึงใช้คำสั่งติดตั้ง panel/log ใน Discord:
+After runtime is ready, Owner installs/moves the eight surfaces:
 
 ```text
 /quest-auto
@@ -193,58 +162,48 @@ Environment SHA เพียงอย่างเดียวเป็นหล�
 /log-system
 ```
 
-## 6. แก้ปัญหาที่พบบ่อย
+Re-running setup updates/moves the durable surface instead of intentionally creating a second active panel.
+`QUEST_AUTO` setup also heals missing/legacy video attachment and current price text.
 
-| อาการใน log | ความหมาย | สิ่งที่ตรวจ |
-|---|---|---|
-| `DATABASE_DIRECT_URL ... undefined` | deploy ต้องใช้ Migrator URL แต่ยังไม่ตั้ง | เพิ่ม URL ของ `questshop_migrator` พร้อม `sslmode=verify-full` |
-| `GIT_SHA must be the 40-character...` | SHA ไม่ครบหรือไม่ใช่ hexadecimal | คัดลอก commit SHA เต็มของ source ที่ inwcloud ดึงจริง |
-| `GIT_SHA does not match checked-out source` | ค่า Environment ยังเป็น SHA เก่า | ตั้ง `GIT_SHA` ให้ตรงกับ branch/commit ที่ inwcloud checkout แล้ว deploy ใหม่ |
-| `POSTGRES_RUNTIME_ROLE_CONTRACT_FAILED` | Runtime ได้สิทธิ์ฐานข้อมูลเกิน policy | ยืนยันว่า Direct URL ใช้ migrator แยก, รัน deploy ใหม่; ถ้ายังไม่ผ่านให้ตรวจ Aiven bootstrap grants/membership |
-| `Questshop bot must have Discord Administrator permission` | Discord bot ไม่มี Administrator | เพิ่มสิทธิ์ใน Discord แล้ว restart |
-| Error TLS/CA | URL/CA ไม่ตรง Aiven certificate chain | URL ต้อง `sslmode=verify-full`; ตรวจ Base64 ของ CA และเอา `/tmp`/`NODE_EXTRA_CA_CERTS` workaround ออก |
-| `Registered 8 guild commands` แล้ว process หยุด | register สำเร็จ แต่ startup ล้มในขั้นต่อไป | อ่าน error หลังบรรทัด `start`; มักเป็น env, role contract หรือ Discord permission |
-| Log แสดง SHA เก่า | inwcloud ยังดึง source/branch เก่า หรือ `GIT_SHA` ไม่ตรง | เลือก branch/commit ใหม่ แล้วตั้ง `GIT_SHA` ให้ตรง SHA เต็ม |
+## 10. Common failures
 
-ห้ามแก้ด้วยการให้ Runtime role มี `CREATE`, `UPDATE` หรือ `DELETE` เกิน policy และห้ามใช้ manual `GRANT`
-อย่างถาวรเพื่อให้บอทเปิดผ่าน. ถ้า privilege sync fail ให้แก้ Aiven bootstrap ตาม role contract
+| Error / symptom | Action |
+|---|---|
+| `DATABASE_DIRECT_URL ... undefined` | add the separate Migrator URL |
+| `GIT_SHA ...` invalid/mismatch | set the exact deployed 40-char SHA |
+| `POSTGRES_RUNTIME_ROLE_CONTRACT_FAILED` | fix Aiven role/bootstrap grants; do not broaden Runtime permissions |
+| Bot Administrator error | grant Discord `Administrator`, then restart |
+| TLS/CA error | verify both URLs use `verify-full` and CA Base64 is complete |
+| Quest Auto media integrity failure | verify exact `videoplayback.mp4` size/hash in deployed checkout |
+| Quest Auto still shows old price | allow one Maintenance cycle; confirm active `TYPE` rules are complete and surface is ACTIVE |
+| Quest Auto still shows old video | confirm attachment filename is not already `videoplayback.mp4`; rerun `/quest-auto` or restart/reconcile |
+| Discord 403 | Owner fixes channel permission manually; bot does not auto-repair overwrites |
 
-## 7. Backup, restart และ rollback
+## 11. Backup / rollback
 
-### Aiven-managed backup
+`BACKUP_MODE=AIVEN_MANAGED` means Aiven owns backup/recovery. Questshop does not run `pg_dump`, `pg_restore` or S3
+backup in this mode and does not claim a local restore drill.
 
-`BACKUP_MODE=AIVEN_MANAGED` คือ Aiven ดูแล backup/recovery. inwcloud ไม่ต้องมี `pg_dump`, `pg_restore`,
-S3 credential หรือ `DATABASE_RESTORE_URL` สำหรับโหมดนี้. Questshop บันทึกเพียงนโยบาย deploy; ไม่ได้ยืนยันว่า
-Aiven backup หรือ restore ผ่านจริงแทน Owner
+Rollback:
 
-### Restart
+- if schema remains compatible, select the prior app commit, update `GIT_SHA`, deploy again;
+- there are no automatic down migrations;
+- if schema cannot support the older app, forward-fix instead of editing applied migrations;
+- production DB recovery is an Aiven disaster-recovery action followed by Ledger/state reconciliation.
 
-เมื่อ inwcloud restart ให้ใช้ Custom Command เดิมเสมอ. Migration อาจรายงาน `applied: 0` แต่ privilege sync
-และ command registration ยังทำซ้ำได้แบบตั้งใจ
+## 12. Owner responsibility for backoffice channels
 
-### Rollback
+Owner policy intentionally removes human-visibility/privacy preflight and runtime permission-drift auto-repair.
+`LOG_PAYMENTS` may contain a full voucher link. Owner must configure channel viewers/roles correctly.
+Discord 403 is recorded as an incident but bot does not change permission overwrites.
 
-- ถ้า schema ยัง compatible ให้เปลี่ยน source กลับไป commit ที่ต้องการ และตั้ง `GIT_SHA` ให้ตรง แล้ว deploy ใหม่
-- Questshop ไม่มี automatic down migration. หาก schema เดินหน้าแล้วแต่ app เก่ารองรับไม่ได้ ให้ทำ forward fix
-  แทนการแก้/ลบ migration เก่า
-- Database restore เป็นการกู้ภัยระดับ Aiven: ปิดร้าน, preserve หลักฐาน, กู้ผ่าน Aiven และ reconcile Ledger ก่อนเปิด
-  Gate ใหม่
+## 13. Post-deploy checklist
 
-## 8. Owner responsibility for backoffice channels
-
-Owner เลือกให้บอทไม่ตรวจ privacy/human visibility ของห้องหลังบ้าน และไม่ auto-repair Discord permission drift.
-โดยเฉพาะ `LOG_PAYMENTS` อาจมี full voucher link. เจ้าของต้องตั้งห้องหลังบ้าน, สมาชิก, role และ Discord access
-history เอง และต้องไม่เปิดห้องนั้นให้คนที่ไม่เกี่ยวข้อง
-
-Discord 403 จะถูกบันทึกเป็น incident แต่บอทจะไม่แก้ permission หรือปิด surface ให้อัตโนมัติ
-
-## 9. หลัง deploy แล้วทำอะไรต่อ
-
-1. ตรวจ `/livez` และ `/readyz`
-2. ตรวจ log `Questshop source revision`; หาก `sourceShaVerified:true`, `configuredGitSha` และ `sourceSha` ต้องตรงกัน
-3. Owner ติดตั้ง 8 surfaces ด้วย slash commands
-4. ยืนยันว่า `PRELAUNCH=true`; ระบบปกติจะเปิดอัตโนมัติ แต่ลูกค้าทั่วไปยังถูกจำกัดโดย Pre-launch policy
-5. ทำ [Pre-launch UAT](../uat/prelaunch.md) ตามลำดับบน SHA เดียวกัน
-6. ทำ UAT ต่อตามรายการ; หากเกิด incident ให้ใช้การกู้เฉพาะส่วนนั้นจากหมวด “ปัญหาที่ต้องจัดการ”
-
-การที่คู่มือนี้ deploy ผ่าน ไม่ได้ให้อำนาจเปิดร้าน, ทำ TrueMoney mutation จริง หรือยืนยันว่าระบบพร้อมใช้งานจริง
+1. `/livez` and `/readyz` are healthy.
+2. Source SHA evidence matches the intended commit when Git metadata is available.
+3. Eight surfaces are installed.
+4. `PRELAUNCH=true` during UAT.
+5. `QUEST_AUTO` shows **Discord Quest • Auto**, expected price text and `videoplayback.mp4` playback.
+6. Change one Admin Quest price and verify the **same message** refreshes within the Maintenance window.
+7. Restart once and confirm no duplicate Quest Auto panel or duplicate video attachment.
+8. Continue the full checklist in `docs/uat/prelaunch.md` on the same SHA.

@@ -1,62 +1,88 @@
 # Emergency runbooks
 
-Every incident follows: Detect → Contain → Preserve evidence → Recover → Verify → Reopen → Review.
+Every incident follows:
+
+```text
+Detect → Contain → Preserve evidence → Recover → Verify → Reopen → Review
+```
 
 | Incident | Immediate containment | Recovery authority |
 |---|---|---|
-| Ambiguous TrueMoney | The scoped payment circuit breaker protects auto-credit; preserve attempt/receiver/voucher evidence | Owner checks TrueMoney app, then Credit or Reject |
-| Duplicate credit / ledger mismatch | Preserve evidence and let the financial incident brake stop affected intake; do not edit ledger | Owner uses compensating transaction after invariant audit |
-| Database outage | Mark Not Ready; stop dequeue and financial actions | Restore connectivity, recover leases, verify ledger/checkpoints |
-| Queue stuck / lease storm | Stop dispatch through the scoped incident path; snapshot jobs/leases | Expire stale leases with fencing, verify health, then Owner reopens only that incident control |
-| Financial DLQ | Keep item reserved; never discard | Owner replay with new attempt and parent reference |
-| Non-financial DLQ | Preserve delivery evidence | Owner replay or discard with reason/audit |
-| Quest schema/executor failure | Pause affected Quest only | Pin compatible engine, retest, reopen sale |
-| Monitor token invalid | Quarantine account immediately | Owner rotates credential, then uses **เช็คระบบ Token** to verify login and Quest-list access |
-| Discord surface forbidden (403) | Preserve the outbox event and incident; do not change surface state automatically | Owner fixes the Discord channel permission manually, then replays the affected outbox event |
-| Discord outage / 429 | Retain outbox; obey Retry-After | Resume coalesced delivery after health recovers |
-| Discord interaction timeout / expired panel | Preserve Support code and exact Git SHA; do not retry a money action from the old control | Owner reruns the relevant setup command only for a confirmed old/deleted anchor, then starts the affected flow again from its current panel |
-| Aiven database recovery | Keep store closed; preserve incident/ledger evidence | Owner restores or recovers through Aiven Console, then validates database/ledger before reopening |
-| Secret compromise | Contain the affected integration; retain evidence | Activate new key version, resumable re-encryption, restore test |
-| Deploy rollback | Maintenance and drain | Roll app only if schema compatible; otherwise forward-fix |
-| Full voucher link exposure | Owner manually restricts the log channel and preserves audit | Rotate access, preserve audit and review viewers; no automatic privacy guard exists by Owner policy |
-| Worker crash during mutation | Stop old fencing owner | Recover checkpoint, verify provider state before retry |
-| Pre-launch closeout | Keep store closed | Compensate real financial tests; retain audit |
-| Receiver rotation | Snapshot old receiver for pending jobs | New jobs use active version; old versions remain retained |
-| User leaves guild | Do not confiscate wallet; active work continues | Admin may separately stop/release with audited action |
+| Ambiguous TrueMoney | preserve attempt/receiver/voucher evidence; no blind retry | Owner checks provider evidence, then Credit or Reject |
+| Duplicate credit / ledger mismatch | stop affected intake through scoped incident control; never edit ledger | Owner uses compensating transaction after invariant audit |
+| Database outage | mark Not Ready; stop dequeue/financial actions | restore connectivity, recover leases, verify ledger/checkpoints |
+| Queue stuck / lease storm | stop affected dispatch; preserve jobs/leases | recover stale leases with fencing, verify, reopen scoped control |
+| Financial DLQ | keep evidence/reservation; never discard | Owner replays with parent reference |
+| Non-financial DLQ | preserve delivery evidence | Owner replay/discard with reason/audit |
+| Quest schema/executor failure | pause affected Quest | pin compatible engine/contract, retest, reopen sale |
+| Monitor token invalid | quarantine account | Owner rotates credential and runs **เช็คระบบ Token** |
+| Discord surface 403 | preserve authoritative pointer/outbox/incident | Owner fixes Discord permission manually |
+| Discord outage / 429 | retain outbox; obey Retry-After | resume coalesced delivery after health recovery |
+| Discord interaction timeout | preserve Support code and Git SHA | restart the current flow; never replay uncertain money action blindly |
+| Quest Auto stale price | keep current anchor; do not create a second panel | verify active `TYPE` prices; allow Maintenance reconciliation or rerun `/quest-auto` |
+| Quest Auto missing/old video | keep current anchor | verify source `videoplayback.mp4`, then rerun `/quest-auto` or allow reconciliation |
+| Quest Auto media integrity failure | do not bypass hash/size check | restore exact Owner-uploaded file in deployed source and redeploy |
+| Aiven recovery | keep store closed; preserve ledger/incident evidence | Owner recovers through Aiven Console and reconciles before reopening |
+| Secret compromise | contain affected integration | rotate provider/key version and verify scoped recovery |
+| Deploy rollback | maintenance/drain as required | roll app only when schema compatible, otherwise forward-fix |
+| Full voucher link exposure | Owner restricts channel and preserves audit | review viewers/access; no automated privacy guard exists |
+| Worker crash during mutation | stop stale fencing owner | verify durable checkpoint/provider state before retry |
+| Pre-launch closeout | keep store closed | compensate real financial tests; retain audit |
+| Receiver rotation | retain old snapshot for pending work | new work uses active receiver version |
 
-For every row, record incident ID, trace IDs, Git SHA, timeline, actor, evidence hashes, containment gates,
-verification queries and reopening approval. Never paste tokens, cookies, database URLs or key material.
+## Quest Auto recovery details
+
+### Expected source asset
+
+```text
+src/discord/assets/videoplayback.mp4
+Size     6,812,564 bytes
+SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+```
+
+If `Bundled Quest Auto video failed integrity verification` appears:
+
+1. confirm the deployed Git SHA is the intended revision;
+2. confirm the file exists at the exact path above;
+3. verify the file was not converted/re-encoded/truncated by a manual upload step;
+4. redeploy the correct source;
+5. do **not** remove the integrity check just to make startup/surface refresh pass.
+
+### Stale price
+
+The storefront reads active supported `TYPE` price rules. If the visible price is stale:
+
+1. confirm all four supported task types have one active TYPE rule;
+2. confirm `QUEST_AUTO` surface is ACTIVE and its Discord message still exists;
+3. allow the Maintenance worker one cycle (approximately 60 seconds);
+4. if needed, Owner reruns `/quest-auto` to force setup/update of the same anchor;
+5. verify the same Discord message ID remains active and no duplicate panel was created.
+
+### Stale/legacy video attachment
+
+If the message still contains an old attachment filename such as `quest-auto-demo.mp4`, reconciliation/setup should
+clear attachments and upload `videoplayback.mp4` on the same durable message. If the message already has an attachment
+named `videoplayback.mp4`, runtime intentionally preserves it to avoid duplicate upload.
+
+Therefore, if the Owner intentionally changes the video bytes in a future release, version/change the filename or add
+an explicit attachment migration; otherwise Discord-side filename matching can preserve the older remote bytes.
 
 ## Mandatory execution template
 
-1. **Detect:** confirm the alert against PostgreSQL state and capture the short support/correlation code.
-2. **Contain:** use the scoped incident control or surface action only. Financial invariants stop affected intake automatically; there is no general Admin gate menu.
-3. **Preserve evidence:** export relevant immutable ledger IDs, attempts, fencing tokens, provider phases and hashes.
-4. **Recover:** use the action in the table; never edit a ledger entry or retry an uncertain mutation blindly.
-5. **Verify:** run the module invariant query, check Outbox/Review terminal state, and validate Discord projection.
-6. **Reopen:** Owner records approval, reason and exact Git SHA before reopening only the affected incident control after its health/invariant check.
-7. **Post-incident review:** document cause, blast radius, SLO impact, control failure and a regression test.
+1. **Detect:** confirm the alert/state and capture short Support/correlation code.
+2. **Contain:** use the scoped incident/surface action only.
+3. **Preserve evidence:** record immutable IDs, attempts, fences and hashes; never raw secrets.
+4. **Recover:** follow the relevant row above; never edit historical money evidence or blindly retry an uncertain mutation.
+5. **Verify:** check domain invariants, Outbox/Review state and Discord projection/surface.
+6. **Reopen:** Owner records approval, reason and exact Git SHA for the affected control.
+7. **Review:** document cause, blast radius, SLO impact and a regression test.
 
 ## Special decision rules
 
-- Ambiguous TrueMoney remains reserved for Owner decision until the TrueMoney application provides evidence.
-- A worker crash with an `IN_FLIGHT`, `ACCEPTED` or `UNCERTAIN` mutation is first reacquired for one fresh
-  Quest-state verification. A proven completed result from the runner's own mutation is captured and moved to
-  `READY_TO_CLAIM`; a completed Quest whose Item never started and has no runner proof is released as external
-  completion. A proven absent `UNCERTAIN` mutation may receive one controlled retry. If the Item had already started
-  but durable completion provenance is missing or contradictory, it enters Manual Review with money still Reserved
-  instead of guessing Capture or Refund.
-- A Monitor test whose Quest execution contract changed must not be force-published from an old alert.  Let the
-  scanner create a current-contract batch, or investigate the new private alert; **ส่งเลย** is valid only for the
-  same fingerprint.  A crash-recovered Monitor test verifies fresh state first and never treats enrollment alone as
-  proof of test completion.
-- Financial/Audit DLQ can be replayed but never discarded. Replay creates a new Outbox event and parent trace.
-- Bot Administrator is validated at startup. Backoffice human visibility is Owner-managed and deliberately has no automated privacy preflight; runtime delivery failures are recorded as incidents and the bot never changes channel overwrites automatically.
-- Database recovery is disaster-only for production. Stop the store, preserve the failed database and reconcile every credit.
-- Aiven-managed mode does not create S3 artifacts or a Questshop restore drill. Record the Aiven Console recovery
-  decision, the exact Git SHA and every ledger reconciliation before reopening. `backup:reconcile` applies only to
-  the optional `LOCAL_S3` compatibility mode.
-- Full voucher-link exposure requires Owner action to restrict the channel, preserve audit and review viewers; the bot does not enforce or repair channel privacy automatically.
-- When Discord shows **Questshop ไม่ตอบสนอง**, keep the displayed Support code and check the matching structured
-  interaction log first. A safe validation/business rejection must be an Ephemeral Thai response; an internal error
-  must preserve its trace and never be solved by replaying a payment/refund confirmation blindly.
+- A possibly-sent TrueMoney or Quest mutation is verified before retry.
+- A proven Runner completion with durable provenance captures the reservation; contradictory/missing provenance remains Reserved for Review.
+- Monitor evidence is valid only for the exact execution-contract fingerprint.
+- Financial/Audit DLQ can be replayed but never discarded.
+- Bot Administrator is validated at startup; backoffice human visibility is Owner-managed and has no automated privacy preflight.
+- Aiven-managed mode does not create Questshop S3 backup artifacts or a local restore-drill claim.
+- A Quest Auto presentation repair may edit/recover Discord surface content/media but must not mutate Wallet/Ledger/Payment/Order state.
