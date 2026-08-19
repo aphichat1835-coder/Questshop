@@ -16,6 +16,21 @@ test('Quest Auto storefront renders one price when configured prices are equal',
   assert.match(body.embeds[0].data.description, /Discord Orbs/);
 });
 
+test('Quest Auto storefront keeps the Owner-approved title and copy instead of legacy branding overrides', () => {
+  const body = renderQuestAuto({
+    title: 'หัวข้อเก่า',
+    description: 'ข้อความเก่า',
+    priceRange: { minCents: 500n, maxCents: 700n },
+  });
+  assert.equal(body.embeds[0].data.title, 'Discord Quest • Auto');
+  assert.equal(body.embeds[0].data.description, [
+    'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ',
+    '**ค่าบริการ 5-7 บาท / เควสสำเร็จ**',
+    'ใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ',
+    'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
+  ].join('\n'));
+});
+
 test('Quest Auto storefront renders min-max price range with a hyphen', () => {
   assert.equal(questPriceRangeText({ minCents: 500n, maxCents: 700n }), '5-7 บาท');
   assert.equal(questPriceRangeText({ minCents: 550n, maxCents: 725n }), '5.50-7.25 บาท');
