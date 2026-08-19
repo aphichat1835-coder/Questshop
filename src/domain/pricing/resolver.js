@@ -1,5 +1,12 @@
 import { questPriceCategoryForTaskType } from './categories.js';
 
+const SUPPORTED_QUEST_TASK_TYPES = Object.freeze([
+  'PLAY_ON_DESKTOP',
+  'PLAY_ON_DESKTOP_V2',
+  'WATCH_VIDEO',
+  'WATCH_VIDEO_ON_MOBILE',
+]);
+
 export async function resolvePrice(client, { taskType }) {
   if (!questPriceCategoryForTaskType(taskType)) return null;
   const result = await client.query(`
@@ -11,6 +18,16 @@ export async function resolvePrice(client, { taskType }) {
     LIMIT 1
   `, [taskType]);
   return result.rows[0] ?? null;
+}
+
+export async function configuredQuestPriceRange(client) {
+  const result = await client.query(`SELECT min(amount_cents)::bigint AS min_amount_cents,
+      max(amount_cents)::bigint AS max_amount_cents
+    FROM price_rules
+    WHERE enabled=true AND rule_type='TYPE' AND task_type = ANY($1::text[])`, [SUPPORTED_QUEST_TASK_TYPES]);
+  const row = result.rows[0];
+  if (row?.min_amount_cents == null || row?.max_amount_cents == null) return null;
+  return { minCents: BigInt(row.min_amount_cents), maxCents: BigInt(row.max_amount_cents) };
 }
 
 export async function minimumSellablePrice(client) {
