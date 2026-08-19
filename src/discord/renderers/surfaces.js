@@ -32,14 +32,15 @@ export function questPriceRangeText(priceRange) {
 
 export function renderQuestAuto(config = {}) {
   const price = questPriceRangeText(config.priceRange);
+  const description = [
+    'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ',
+    `**ค่าบริการ ${price} / เควสสำเร็จ**`,
+    'ใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ',
+    'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
+  ].join('\n');
   const embed = new EmbedBuilder().setColor(COLORS.primary)
-    .setTitle(truncateDiscordText(config.title ?? 'Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
-    .setDescription(truncateDiscordText(config.description ?? [
-      'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ',
-      `**ค่าบริการ ${price} / เควสสำเร็จ**`,
-      'ใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ',
-      'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
-    ].join('\n'), DISCORD_LIMITS.embedDescription));
+    .setTitle(truncateDiscordText('Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
+    .setDescription(truncateDiscordText(description, DISCORD_LIMITS.embedDescription));
   const mediaUrl = safeHttpsUrl(config.mediaUrl);
   if (mediaUrl) embed.setImage(mediaUrl);
   return {
