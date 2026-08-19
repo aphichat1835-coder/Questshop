@@ -1,7 +1,7 @@
 import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { v7 as uuidv7 } from 'uuid';
-import { resolvePrice } from '../../src/domain/pricing/resolver.js';
+import { configuredQuestPriceRange, resolvePrice } from '../../src/domain/pricing/resolver.js';
 import { setQuestCategoryPrice } from '../../src/domain/admin/config-service.js';
 import { createContext } from '../../src/shared/correlation.js';
 import { resolvePromotionBonus } from '../../src/domain/promotions/resolver.js';
@@ -45,9 +45,10 @@ test('new store resolves all four supported task types from two 5-baht categorie
     assert.equal(price.rule_type, 'TYPE');
     assert.equal(BigInt(price.amount_cents), 500n);
   }
+  assert.deepEqual(await configuredQuestPriceRange(pool), { minCents: 500n, maxCents: 500n });
 });
 
-test('changing GAME price is atomic, versioned, and never changes VIDEO', async (t) => {
+test('changing GAME price is atomic, versioned, never changes VIDEO, and updates the storefront range source', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const before = (await pool.query(`SELECT task_type,state_version FROM price_rules
     WHERE enabled=true AND rule_type='TYPE' AND task_type IN ('PLAY_ON_DESKTOP','PLAY_ON_DESKTOP_V2')`)).rows;
@@ -61,6 +62,7 @@ test('changing GAME price is atomic, versioned, and never changes VIDEO', async 
   for (const taskType of ['WATCH_VIDEO', 'WATCH_VIDEO_ON_MOBILE']) {
     assert.equal(BigInt((await resolvePrice(pool, { taskType })).amount_cents), 500n);
   }
+  assert.deepEqual(await configuredQuestPriceRange(pool), { minCents: 500n, maxCents: 750n });
   const active = await pool.query(`SELECT task_type,count(*)::integer AS count FROM price_rules
     WHERE enabled=true AND rule_type='TYPE' GROUP BY task_type`);
   assert.ok(active.rows.every((row) => row.count === 1));
