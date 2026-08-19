@@ -38,13 +38,19 @@ test('Quest Auto storefront renders min-max price range with a hyphen', () => {
   assert.match(body.embeds[0].data.description, /ค่าบริการ 5-7 บาท \/ เควสสำเร็จ/);
 });
 
-test('configured Quest price range reads the active supported TYPE prices', async () => {
-  const pool = { query: async (sql) => {
+test('configured Quest price range requires all supported TYPE prices', async () => {
+  const completePool = { query: async (sql) => {
     assert.match(sql, /min\(amount_cents\)/);
     assert.match(sql, /max\(amount_cents\)/);
-    return { rows: [{ min_amount_cents: '500', max_amount_cents: '700' }] };
+    assert.match(sql, /count\(DISTINCT task_type\)/);
+    return { rows: [{ min_cents: '500', max_cents: '700', task_type_count: 4 }] };
   } };
-  assert.deepEqual(await configuredQuestPriceRange(pool), { minCents: 500n, maxCents: 700n });
+  assert.deepEqual(await configuredQuestPriceRange(completePool), { minCents: 500n, maxCents: 700n });
+
+  const incompletePool = { query: async () => ({
+    rows: [{ min_cents: '500', max_cents: '700', task_type_count: 3 }],
+  }) };
+  assert.equal(await configuredQuestPriceRange(incompletePool), null);
 });
 
 test('Quest Auto bundled demo video decodes as MP4 and missing video marks the surface stale', async () => {
