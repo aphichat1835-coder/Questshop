@@ -65,6 +65,7 @@ async function withSurfaceFiles(body, surfaceKey, message) {
   if (surfaceKey !== 'QUEST_AUTO' || hasQuestAutoVideo(message)) return body;
   return {
     ...body,
+    attachments: [],
     files: [
       ...(body.files ?? []),
       { attachment: await loadQuestAutoVideo(), name: QUEST_AUTO_VIDEO_FILENAME },
