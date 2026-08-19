@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict';
-import { access } from 'node:fs/promises';
 import test from 'node:test';
 import { configuredQuestPriceRange } from '../../src/domain/pricing/resolver.js';
 import { questPriceRangeText, renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
 import {
   QUEST_AUTO_VIDEO_FILENAME,
-  QUEST_AUTO_VIDEO_PATH,
+  loadQuestAutoVideo,
   questAutoSurfacePresentationMatches,
 } from '../../src/discord/surfaces/setup.js';
 
@@ -33,8 +32,12 @@ test('configured Quest price range reads the active supported TYPE prices', asyn
   assert.deepEqual(await configuredQuestPriceRange(pool), { minCents: 500n, maxCents: 700n });
 });
 
-test('Quest Auto bundled demo video exists and missing video marks the surface stale', async () => {
-  await access(QUEST_AUTO_VIDEO_PATH);
+test('Quest Auto bundled demo video decodes as MP4 and missing video marks the surface stale', async () => {
+  const video = await loadQuestAutoVideo();
+  assert.ok(Buffer.isBuffer(video));
+  assert.ok(video.length > 1_024);
+  assert.equal(video.subarray(4, 8).toString('ascii'), 'ftyp');
+
   const payload = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }] };
   const withoutVideo = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }], attachments: new Map() };
   assert.equal(questAutoSurfacePresentationMatches(withoutVideo, payload), false);
