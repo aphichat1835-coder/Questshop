@@ -14,10 +14,32 @@ function safeHttpsUrl(value) {
   } catch { return null; }
 }
 
+function compactBaht(cents) {
+  const value = BigInt(cents);
+  const whole = value / 100n;
+  const fraction = String(value % 100n).padStart(2, '0');
+  return fraction === '00' ? whole.toString() : `${whole}.${fraction}`;
+}
+
+export function questPriceRangeText(priceRange) {
+  if (priceRange?.minCents == null || priceRange?.maxCents == null) return 'ตามราคาที่กำหนด';
+  const minimum = BigInt(priceRange.minCents);
+  const maximum = BigInt(priceRange.maxCents);
+  const minimumText = compactBaht(minimum);
+  if (minimum === maximum) return `${minimumText} บาท`;
+  return `${minimumText}-${compactBaht(maximum)} บาท`;
+}
+
 export function renderQuestAuto(config = {}) {
+  const price = questPriceRangeText(config.priceRange);
   const embed = new EmbedBuilder().setColor(COLORS.primary)
-    .setTitle(truncateDiscordText(config.title ?? 'Discord Quest — ทำเควสอัตโนมัติ', DISCORD_LIMITS.embedTitle))
-    .setDescription(truncateDiscordText(config.description ?? 'เติมเครดิต เลือก Quest ที่ต้องการ แล้วติดตามความคืบหน้าได้อัตโนมัติ\nระบบคิดค่าบริการเฉพาะ Quest ที่ทำสำเร็จเท่านั้น', DISCORD_LIMITS.embedDescription));
+    .setTitle(truncateDiscordText(config.title ?? 'Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
+    .setDescription(truncateDiscordText(config.description ?? [
+      'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ',
+      `**ค่าบริการ ${price} / เควสสำเร็จ**`,
+      'ใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ',
+      'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
+    ].join('\n'), DISCORD_LIMITS.embedDescription));
   const mediaUrl = safeHttpsUrl(config.mediaUrl);
   if (mediaUrl) embed.setImage(mediaUrl);
   return {
@@ -43,7 +65,10 @@ export function renderAdminPanel() {
 }
 
 export function renderSurfaceAnchor(surfaceKey, config = {}) {
-  if (surfaceKey === 'QUEST_AUTO') return renderQuestAuto(config.branding);
+  if (surfaceKey === 'QUEST_AUTO') return renderQuestAuto({
+    ...(config.branding ?? {}),
+    priceRange: config.questAutoPriceRange,
+  });
   if (surfaceKey === 'ADMIN_PANEL') return renderAdminPanel();
   const names = {
     QUEST_NEW: 'Quest ใหม่', QUEST_HISTORY: 'ประวัติการทำ Quest', LOG_PAYMENTS: 'บันทึกการเติมเงิน',
