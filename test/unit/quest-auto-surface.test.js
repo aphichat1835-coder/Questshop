@@ -53,11 +53,12 @@ test('configured Quest price range requires all supported TYPE prices', async ()
   assert.equal(await configuredQuestPriceRange(incompletePool), null);
 });
 
-test('Quest Auto bundled demo video decodes as MP4 and missing video marks the surface stale', async () => {
+test('Quest Auto bundled demo video is the exact Owner-uploaded MP4 and missing video marks the surface stale', async () => {
   const video = await loadQuestAutoVideo();
   assert.ok(Buffer.isBuffer(video));
-  assert.ok(video.length > 1_024);
+  assert.equal(video.length, 6_812_564);
   assert.equal(video.subarray(4, 8).toString('ascii'), 'ftyp');
+  assert.equal(QUEST_AUTO_VIDEO_FILENAME, 'videoplayback.mp4');
 
   const payload = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }] };
   const withoutVideo = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }], attachments: new Map() };
