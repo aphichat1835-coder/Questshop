@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
 import test from 'node:test';
 import { SURFACE_COMMANDS } from '../../src/discord/commands/definitions.js';
 import { renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
@@ -7,6 +6,7 @@ import {
   fetchSurfaceMessageFresh, questAutoSurfaceMatches, surfaceNonce, updateOrCreateSurfaceAnchor,
 } from '../../src/discord/surfaces/setup.js';
 import { normalizeDiscordPayload } from '../../src/discord/payload.js';
+import { loadQuestAutoVideo } from '../../src/discord/surfaces/quest-auto-media.js';
 
 function createChannel({ listedMessages = [], sentMessage = { id: 'new-anchor' } } = {}) {
   const fetches = [];
@@ -115,6 +115,13 @@ test('surface setup finds its marker beyond the old 25-message scan without crea
   assert.equal(channel.sent.length, 0);
 });
 
+test('Quest Auto bundled video decodes as the verified MP4 derivative', async () => {
+  const video = await loadQuestAutoVideo();
+  assert.ok(Buffer.isBuffer(video));
+  assert.equal(video.length, 83_273);
+  assert.equal(video.subarray(4, 8).toString('ascii'), 'ftyp');
+});
+
 test('Quest Auto attaches the bundled demo video when the current anchor does not have it', async () => {
   const edits = [];
   const existing = {
@@ -130,7 +137,9 @@ test('Quest Auto attaches the bundled demo video when the current anchor does no
     { pool: priceRangePool(500, 700) });
   assert.equal(edits.length, 1);
   assert.equal(edits[0].files?.[0]?.name, 'quest-auto-demo.mp4');
-  assert.ok(existsSync(edits[0].files[0].attachment));
+  assert.ok(Buffer.isBuffer(edits[0].files[0].attachment));
+  assert.equal(edits[0].files[0].attachment.length, 83_273);
+  assert.equal(edits[0].files[0].attachment.subarray(4, 8).toString('ascii'), 'ftyp');
   assert.match(edits[0].embeds[0].description, /ค่าบริการ 5-7 บาท/);
 });
 
@@ -208,6 +217,7 @@ test('Discord payload boundary also bounds embeds and drops an unsafe link compo
   assert.ok(embed.title.length <= 256);
   assert.ok(embed.description.length <= 4_096);
   assert.ok(embed.fields.length <= 25);
+  assert.ok(embed.fields.every((field) => field.name.length <= 256 && field.value.length <= 1_024));
   assert.ok(body.components[0].components.every((component) => component.url !== 'javascript:alert(1)'));
   assert.equal(body.components[0].components[0].custom_id.length, 100);
 });

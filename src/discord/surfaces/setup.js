@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
@@ -8,9 +7,7 @@ import { reconcileIncident } from '../../domain/incidents/service.js';
 import { configuredQuestPriceRange } from '../../domain/pricing/resolver.js';
 import { fetchDiscordMessage, findDiscordMessage, isMissingDiscordMessage } from '../transport.js';
 import { normalizeDiscordPayload } from '../payload.js';
-
-const QUEST_AUTO_VIDEO_NAME = 'quest-auto-demo.mp4';
-const QUEST_AUTO_VIDEO_PATH = fileURLToPath(new URL('../assets/quest-auto-demo.mp4', import.meta.url));
+import { QUEST_AUTO_VIDEO_FILENAME, loadQuestAutoVideo } from './quest-auto-media.js';
 
 // Setup commands can be issued concurrently from two Discord interactions.
 // The runtime is intentionally all-in-one, so a keyed promise lock prevents
@@ -60,17 +57,17 @@ function messageAttachments(message) {
 
 function hasQuestAutoVideo(message) {
   return messageAttachments(message).some((attachment) => (
-    attachment?.name === QUEST_AUTO_VIDEO_NAME || attachment?.filename === QUEST_AUTO_VIDEO_NAME
+    attachment?.name === QUEST_AUTO_VIDEO_FILENAME || attachment?.filename === QUEST_AUTO_VIDEO_FILENAME
   ));
 }
 
-function withSurfaceFiles(body, surfaceKey, message) {
+async function withSurfaceFiles(body, surfaceKey, message) {
   if (surfaceKey !== 'QUEST_AUTO' || hasQuestAutoVideo(message)) return body;
   return {
     ...body,
     files: [
       ...(body.files ?? []),
-      { attachment: QUEST_AUTO_VIDEO_PATH, name: QUEST_AUTO_VIDEO_NAME },
+      { attachment: await loadQuestAutoVideo(), name: QUEST_AUTO_VIDEO_FILENAME },
     ],
   };
 }
@@ -112,7 +109,7 @@ export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, e
   let message = existingMessage;
   if (message) {
     try {
-      return { message: await message.edit(withSurfaceFiles(body, surfaceKey, message)), recreated: false };
+      return { message: await message.edit(await withSurfaceFiles(body, surfaceKey, message)), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
     }
@@ -120,13 +117,13 @@ export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, e
   message = await findSurfaceMarker(channel, surfaceKey);
   if (message) {
     try {
-      return { message: await message.edit(withSurfaceFiles(body, surfaceKey, message)), recreated: false };
+      return { message: await message.edit(await withSurfaceFiles(body, surfaceKey, message)), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
     }
   }
   const created = await channel.send({
-    ...withSurfaceFiles(body, surfaceKey, null),
+    ...await withSurfaceFiles(body, surfaceKey, null),
     nonce: surfaceNonce(surfaceKey),
     enforceNonce: true,
   });
