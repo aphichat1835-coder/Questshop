@@ -4,6 +4,7 @@ import {
 import { customId } from '../components/custom-id.js';
 import { adminCategoryOptions } from './admin.js';
 import { DISCORD_LIMITS, truncateDiscordText } from '../payload.js';
+import { DEFAULT_QUEST_PRICE_CENTS } from '../../domain/pricing/categories.js';
 
 const COLORS = Object.freeze({ primary: 0x5865f2, success: 0x23a55a, warning: 0xf0b232, danger: 0xf23f43 });
 
@@ -15,32 +16,38 @@ function safeHttpsUrl(value) {
 }
 
 function compactBaht(cents) {
-  const value = BigInt(cents);
-  const whole = value / 100n;
-  const fraction = String(value % 100n).padStart(2, '0');
-  return fraction === '00' ? whole.toString() : `${whole}.${fraction}`;
+  const amount = BigInt(cents);
+  const whole = amount / 100n;
+  const fraction = amount % 100n;
+  if (fraction === 0n) return whole.toLocaleString('th-TH');
+  return `${whole.toLocaleString('th-TH')}.${String(fraction).padStart(2, '0').replace(/0$/, '')}`;
 }
 
-export function questPriceRangeText(priceRange) {
-  if (priceRange?.minCents == null || priceRange?.maxCents == null) return 'ตามราคาที่กำหนด';
-  const minimum = BigInt(priceRange.minCents);
-  const maximum = BigInt(priceRange.maxCents);
-  const minimumText = compactBaht(minimum);
-  if (minimum === maximum) return `${minimumText} บาท`;
-  return `${minimumText}-${compactBaht(maximum)} บาท`;
+export function questAutoPriceRangeLabel(priceRange = undefined) {
+  const normalized = priceRange === undefined
+    ? { minCents: DEFAULT_QUEST_PRICE_CENTS, maxCents: DEFAULT_QUEST_PRICE_CENTS }
+    : priceRange;
+  if (normalized?.minCents == null || normalized?.maxCents == null) return null;
+  const minimum = BigInt(normalized.minCents);
+  const maximum = BigInt(normalized.maxCents);
+  return minimum === maximum
+    ? compactBaht(minimum)
+    : `${compactBaht(minimum)}-${compactBaht(maximum)}`;
 }
 
 export function renderQuestAuto(config = {}) {
-  const price = questPriceRangeText(config.priceRange);
-  const description = [
+  const priceLabel = questAutoPriceRangeLabel(config.priceRange);
+  const defaultDescription = [
     'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ',
-    `**ค่าบริการ ${price} / เควสสำเร็จ**`,
+    priceLabel
+      ? `**ค่าบริการ ${priceLabel} บาท / เควสสำเร็จ**`
+      : '**ค่าบริการยังไม่พร้อม / เควสสำเร็จ**',
     'ใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ',
     'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
   ].join('\n');
   const embed = new EmbedBuilder().setColor(COLORS.primary)
     .setTitle(truncateDiscordText('Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
-    .setDescription(truncateDiscordText(description, DISCORD_LIMITS.embedDescription));
+    .setDescription(truncateDiscordText(defaultDescription, DISCORD_LIMITS.embedDescription));
   const mediaUrl = safeHttpsUrl(config.mediaUrl);
   if (mediaUrl) embed.setImage(mediaUrl);
   return {
@@ -66,10 +73,7 @@ export function renderAdminPanel() {
 }
 
 export function renderSurfaceAnchor(surfaceKey, config = {}) {
-  if (surfaceKey === 'QUEST_AUTO') return renderQuestAuto({
-    ...(config.branding ?? {}),
-    priceRange: config.questAutoPriceRange,
-  });
+  if (surfaceKey === 'QUEST_AUTO') return renderQuestAuto(config.branding);
   if (surfaceKey === 'ADMIN_PANEL') return renderAdminPanel();
   const names = {
     QUEST_NEW: 'Quest ใหม่', QUEST_HISTORY: 'ประวัติการทำ Quest', LOG_PAYMENTS: 'บันทึกการเติมเงิน',

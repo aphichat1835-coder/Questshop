@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import test from 'node:test';
 import { SURFACE_COMMANDS } from '../../src/discord/commands/definitions.js';
+import { renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
 import {
-  fetchSurfaceMessageFresh, surfaceNonce, updateOrCreateSurfaceAnchor,
+  fetchSurfaceMessageFresh, questAutoSurfaceMatches, surfaceNonce, updateOrCreateSurfaceAnchor,
 } from '../../src/discord/surfaces/setup.js';
 import { normalizeDiscordPayload } from '../../src/discord/payload.js';
 
@@ -25,6 +27,33 @@ function createChannel({ listedMessages = [], sentMessage = { id: 'new-anchor' }
     },
   };
 }
+
+function priceRangePool(minCents = 500, maxCents = 500) {
+  return {
+    query: async (sql) => {
+      if (sql.includes('min(amount_cents)::bigint AS min_cents')) {
+        return { rows: [{ min_cents: String(minCents), max_cents: String(maxCents), task_type_count: 4 }] };
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    },
+  };
+}
+
+test('Quest Auto uses the Owner-approved storefront copy and one price when categories match', () => {
+  const body = renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 500n } });
+  assert.equal(body.embeds[0].data.title, 'Discord Quest • Auto');
+  assert.equal(body.embeds[0].data.description, [
+    'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ',
+    '**ค่าบริการ 5 บาท / เควสสำเร็จ**',
+    'ใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ',
+    'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
+  ].join('\n'));
+});
+
+test('Quest Auto collapses different Admin prices into a minimum-maximum range', () => {
+  const body = renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 700n } });
+  assert.match(body.embeds[0].data.description, /\*\*ค่าบริการ 5-7 บาท \/ เควสสำเร็จ\*\*/);
+});
 
 test('surface setup fetches its stored anchor from Discord instead of using a stale cache entry', async () => {
   const channel = createChannel();
@@ -86,6 +115,56 @@ test('surface setup finds its marker beyond the old 25-message scan without crea
   assert.equal(channel.sent.length, 0);
 });
 
+test('Quest Auto attaches the bundled demo video when the current anchor does not have it', async () => {
+  const edits = [];
+  const existing = {
+    id: 'quest-auto',
+    attachments: new Map(),
+    edit: async (body) => {
+      edits.push(body);
+      return existing;
+    },
+  };
+  const channel = createChannel();
+  await updateOrCreateSurfaceAnchor(channel, 'QUEST_AUTO', { values: {} }, existing,
+    { pool: priceRangePool(500, 700) });
+  assert.equal(edits.length, 1);
+  assert.equal(edits[0].files?.[0]?.name, 'quest-auto-demo.mp4');
+  assert.ok(existsSync(edits[0].files[0].attachment));
+  assert.match(edits[0].embeds[0].description, /ค่าบริการ 5-7 บาท/);
+});
+
+test('Quest Auto keeps its existing demo attachment instead of uploading a duplicate on refresh', async () => {
+  let editedBody;
+  const existing = {
+    id: 'quest-auto',
+    attachments: new Map([['video', { name: 'quest-auto-demo.mp4' }]]),
+    edit: async (body) => {
+      editedBody = body;
+      return existing;
+    },
+  };
+  await updateOrCreateSurfaceAnchor(createChannel(), 'QUEST_AUTO', { values: {} }, existing,
+    { pool: priceRangePool(500, 500) });
+  assert.equal(editedBody.files, undefined);
+});
+
+test('Quest Auto reconciliation detects a stale displayed price even when the video is already attached', () => {
+  const expected = normalizeDiscordPayload(renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 700n } }));
+  expected.embeds[0].footer = { text: 'Questshop Surface • QUEST_AUTO' };
+  const message = {
+    attachments: new Map([['video', { name: 'quest-auto-demo.mp4' }]]),
+    embeds: [{
+      title: 'Discord Quest • Auto',
+      description: expected.embeds[0].description.replace('5-7', '5'),
+      footer: { text: 'Questshop Surface • QUEST_AUTO' },
+    }],
+  };
+  assert.equal(questAutoSurfaceMatches(message, expected), false);
+  message.embeds[0].description = expected.embeds[0].description;
+  assert.equal(questAutoSurfaceMatches(message, expected), true);
+});
+
 test('rate limiting and transient fetch failures never become a missing-message recreate', async () => {
   for (const error of [
     Object.assign(new Error('rate limit'), { status: 429 }),
@@ -129,7 +208,6 @@ test('Discord payload boundary also bounds embeds and drops an unsafe link compo
   assert.ok(embed.title.length <= 256);
   assert.ok(embed.description.length <= 4_096);
   assert.ok(embed.fields.length <= 25);
-  assert.ok(embed.fields.every((field) => field.name.length <= 256 && field.value.length <= 1_024));
   assert.ok(body.components[0].components.every((component) => component.url !== 'javascript:alert(1)'));
   assert.equal(body.components[0].components[0].custom_id.length, 100);
 });

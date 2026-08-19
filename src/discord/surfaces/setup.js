@@ -1,15 +1,16 @@
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
-import { configuredQuestPriceRange } from '../../domain/pricing/resolver.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
 import { appendAdminAudit } from '../../domain/admin/audit.js';
 import { reconcileIncident } from '../../domain/incidents/service.js';
+import { configuredQuestPriceRange } from '../../domain/pricing/resolver.js';
 import { fetchDiscordMessage, findDiscordMessage, isMissingDiscordMessage } from '../transport.js';
 import { normalizeDiscordPayload } from '../payload.js';
-import { QUEST_AUTO_VIDEO_FILENAME, loadQuestAutoVideo } from './quest-auto-media.js';
 
-export { QUEST_AUTO_VIDEO_FILENAME, loadQuestAutoVideo } from './quest-auto-media.js';
+const QUEST_AUTO_VIDEO_NAME = 'quest-auto-demo.mp4';
+const QUEST_AUTO_VIDEO_PATH = fileURLToPath(new URL('../assets/quest-auto-demo.mp4', import.meta.url));
 
 // Setup commands can be issued concurrently from two Discord interactions.
 // The runtime is intentionally all-in-one, so a keyed promise lock prevents
@@ -31,49 +32,62 @@ async function withSurfaceSetupLock(surfaceKey, work) {
   }
 }
 
-async function surfaceConfig(surfaceKey, config, pool) {
+function brandingWithPriceRange(config, priceRange) {
   const values = config?.values ?? config ?? {};
-  if (surfaceKey !== 'QUEST_AUTO' || !pool) return values;
-  return { ...values, questAutoPriceRange: await configuredQuestPriceRange(pool) };
+  if (priceRange === undefined) return values;
+  const branding = values.branding && typeof values.branding === 'object' && !Array.isArray(values.branding)
+    ? values.branding
+    : {};
+  return { ...values, branding: { ...branding, priceRange } };
 }
 
-async function surfacePayload(surfaceKey, config, pool) {
-  const body = renderSurfaceAnchor(surfaceKey, await surfaceConfig(surfaceKey, config, pool));
+async function surfacePayload(surfaceKey, config, pool = null) {
+  const priceRange = surfaceKey === 'QUEST_AUTO' && pool
+    ? await configuredQuestPriceRange(pool)
+    : undefined;
+  const body = renderSurfaceAnchor(surfaceKey, brandingWithPriceRange(config, priceRange));
   body.embeds?.[0]?.setFooter?.({ text: `Questshop Surface • ${surfaceKey}` });
   return normalizeDiscordPayload(body);
 }
 
-function attachmentValues(message) {
-  if (!message?.attachments) return [];
-  if (Array.isArray(message.attachments)) return message.attachments;
-  if (typeof message.attachments.values === 'function') return [...message.attachments.values()];
+function messageAttachments(message) {
+  const attachments = message?.attachments;
+  if (!attachments) return [];
+  if (Array.isArray(attachments)) return attachments;
+  if (typeof attachments.values === 'function') return [...attachments.values()];
   return [];
 }
 
-export function hasQuestAutoVideo(message) {
-  return attachmentValues(message).some((attachment) => (
-    attachment?.name === QUEST_AUTO_VIDEO_FILENAME || attachment?.filename === QUEST_AUTO_VIDEO_FILENAME
+function hasQuestAutoVideo(message) {
+  return messageAttachments(message).some((attachment) => (
+    attachment?.name === QUEST_AUTO_VIDEO_NAME || attachment?.filename === QUEST_AUTO_VIDEO_NAME
   ));
 }
 
-function embedValue(embed, key) {
-  return embed?.[key] ?? embed?.data?.[key] ?? null;
-}
-
-export function questAutoSurfacePresentationMatches(message, payload) {
-  if (!message || !hasQuestAutoVideo(message)) return false;
-  const current = message.embeds?.[0];
-  const desired = payload?.embeds?.[0];
-  return embedValue(current, 'title') === embedValue(desired, 'title')
-    && embedValue(current, 'description') === embedValue(desired, 'description');
-}
-
-async function withQuestAutoVideo(body, surfaceKey, message = null) {
+function withSurfaceFiles(body, surfaceKey, message) {
   if (surfaceKey !== 'QUEST_AUTO' || hasQuestAutoVideo(message)) return body;
   return {
     ...body,
-    files: [{ attachment: await loadQuestAutoVideo(), name: QUEST_AUTO_VIDEO_FILENAME }],
+    files: [
+      ...(body.files ?? []),
+      { attachment: QUEST_AUTO_VIDEO_PATH, name: QUEST_AUTO_VIDEO_NAME },
+    ],
   };
+}
+
+function firstEmbedData(value) {
+  const embed = value?.embeds?.[0];
+  if (!embed) return {};
+  return typeof embed.toJSON === 'function' ? embed.toJSON() : embed;
+}
+
+export function questAutoSurfaceMatches(message, expectedBody) {
+  if (!message || !hasQuestAutoVideo(message)) return false;
+  const actual = firstEmbedData(message);
+  const expected = firstEmbedData(expectedBody);
+  return actual.title === expected.title
+    && actual.description === expected.description
+    && actual.footer?.text === expected.footer?.text;
 }
 
 async function findSurfaceMarker(channel, surfaceKey) {
@@ -94,11 +108,11 @@ export function surfaceNonce(surfaceKey) {
 }
 
 export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, existingMessage = null, options = {}) {
-  const body = options.body ?? await surfacePayload(surfaceKey, config, options.pool);
+  const body = await surfacePayload(surfaceKey, config, options.pool);
   let message = existingMessage;
   if (message) {
     try {
-      return { message: await message.edit(await withQuestAutoVideo(body, surfaceKey, message)), recreated: false };
+      return { message: await message.edit(withSurfaceFiles(body, surfaceKey, message)), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
     }
@@ -106,13 +120,16 @@ export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, e
   message = await findSurfaceMarker(channel, surfaceKey);
   if (message) {
     try {
-      return { message: await message.edit(await withQuestAutoVideo(body, surfaceKey, message)), recreated: false };
+      return { message: await message.edit(withSurfaceFiles(body, surfaceKey, message)), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
     }
   }
-  const created = await channel.send({ ...await withQuestAutoVideo(body, surfaceKey),
-    nonce: surfaceNonce(surfaceKey), enforceNonce: true });
+  const created = await channel.send({
+    ...withSurfaceFiles(body, surfaceKey, null),
+    nonce: surfaceNonce(surfaceKey),
+    enforceNonce: true,
+  });
   return { message: created, recreated: true };
 }
 
@@ -231,22 +248,17 @@ async function reconcileOneSurface({ guild, pool, surface, config, context }) {
   }
   let message = surface.message_id ? await fetchSurfaceMessageFresh(channel, surface.message_id) : null;
   message ??= await findSurfaceMarker(channel, surface.surface_key);
-
-  let questAutoBody = null;
-  let questAutoDrift = false;
-  if (surface.surface_key === 'QUEST_AUTO') {
-    questAutoBody = await surfacePayload(surface.surface_key, config, pool);
-    questAutoDrift = !questAutoSurfacePresentationMatches(message, questAutoBody);
-  }
-
-  const needsRefresh = !message || surface.state === 'RECONCILING' || questAutoDrift
-    || Number(surface.rendered_config_version) < Number(config?.version ?? 0);
+  const questAutoChanged = message && surface.surface_key === 'QUEST_AUTO'
+    ? !questAutoSurfaceMatches(message, await surfacePayload(surface.surface_key, config, pool))
+    : false;
+  const needsRefresh = !message || surface.state === 'RECONCILING'
+    || Number(surface.rendered_config_version) < Number(config?.version ?? 0)
+    || questAutoChanged;
   if (!needsRefresh) {
     await resolveSurfaceIncidentSafely(pool, surface.surface_key, context);
     return { surfaceKey: surface.surface_key, skipped: true };
   }
-  const anchor = await updateOrCreateSurfaceAnchor(channel, surface.surface_key, config, message,
-    { pool, body: questAutoBody });
+  const anchor = await updateOrCreateSurfaceAnchor(channel, surface.surface_key, config, message, { pool });
   const updated = await persistReconciledSurface(pool, surface, anchor.message, config, anchor, context);
   if (updated) {
     await resolveSurfaceIncidentSafely(pool, surface.surface_key, context);
