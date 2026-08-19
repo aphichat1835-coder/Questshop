@@ -1,11 +1,18 @@
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
+import { configuredQuestPriceRange } from '../../domain/pricing/resolver.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
 import { appendAdminAudit } from '../../domain/admin/audit.js';
 import { reconcileIncident } from '../../domain/incidents/service.js';
 import { fetchDiscordMessage, findDiscordMessage, isMissingDiscordMessage } from '../transport.js';
 import { normalizeDiscordPayload } from '../payload.js';
+
+export const QUEST_AUTO_VIDEO_FILENAME = 'quest-auto-demo.mp4';
+export const QUEST_AUTO_VIDEO_PATH = fileURLToPath(
+  new URL('../../../assets/quest-auto-demo.mp4', import.meta.url),
+);
 
 // Setup commands can be issued concurrently from two Discord interactions.
 // The runtime is intentionally all-in-one, so a keyed promise lock prevents
@@ -27,10 +34,49 @@ async function withSurfaceSetupLock(surfaceKey, work) {
   }
 }
 
-function surfacePayload(surfaceKey, config) {
-  const body = renderSurfaceAnchor(surfaceKey, config?.values ?? config);
+async function surfaceConfig(surfaceKey, config, pool) {
+  const values = config?.values ?? config ?? {};
+  if (surfaceKey !== 'QUEST_AUTO' || !pool) return values;
+  return { ...values, questAutoPriceRange: await configuredQuestPriceRange(pool) };
+}
+
+async function surfacePayload(surfaceKey, config, pool) {
+  const body = renderSurfaceAnchor(surfaceKey, await surfaceConfig(surfaceKey, config, pool));
   body.embeds?.[0]?.setFooter?.({ text: `Questshop Surface • ${surfaceKey}` });
   return normalizeDiscordPayload(body);
+}
+
+function attachmentValues(message) {
+  if (!message?.attachments) return [];
+  if (Array.isArray(message.attachments)) return message.attachments;
+  if (typeof message.attachments.values === 'function') return [...message.attachments.values()];
+  return [];
+}
+
+export function hasQuestAutoVideo(message) {
+  return attachmentValues(message).some((attachment) => (
+    attachment?.name === QUEST_AUTO_VIDEO_FILENAME || attachment?.filename === QUEST_AUTO_VIDEO_FILENAME
+  ));
+}
+
+function embedValue(embed, key) {
+  return embed?.[key] ?? embed?.data?.[key] ?? null;
+}
+
+export function questAutoSurfacePresentationMatches(message, payload) {
+  if (!message || !hasQuestAutoVideo(message)) return false;
+  const current = message.embeds?.[0];
+  const desired = payload?.embeds?.[0];
+  return embedValue(current, 'title') === embedValue(desired, 'title')
+    && embedValue(current, 'description') === embedValue(desired, 'description');
+}
+
+function withQuestAutoVideo(body, surfaceKey, message = null) {
+  if (surfaceKey !== 'QUEST_AUTO' || hasQuestAutoVideo(message)) return body;
+  return {
+    ...body,
+    files: [{ attachment: QUEST_AUTO_VIDEO_PATH, name: QUEST_AUTO_VIDEO_FILENAME }],
+  };
 }
 
 async function findSurfaceMarker(channel, surfaceKey) {
@@ -50,12 +96,12 @@ export function surfaceNonce(surfaceKey) {
   return `surface-${prefix}-${digest}`;
 }
 
-export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, existingMessage = null) {
-  const body = surfacePayload(surfaceKey, config);
+export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, existingMessage = null, options = {}) {
+  const body = options.body ?? await surfacePayload(surfaceKey, config, options.pool);
   let message = existingMessage;
   if (message) {
     try {
-      return { message: await message.edit(body), recreated: false };
+      return { message: await message.edit(withQuestAutoVideo(body, surfaceKey, message)), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
     }
@@ -63,12 +109,13 @@ export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, e
   message = await findSurfaceMarker(channel, surfaceKey);
   if (message) {
     try {
-      return { message: await message.edit(body), recreated: false };
+      return { message: await message.edit(withQuestAutoVideo(body, surfaceKey, message)), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
     }
   }
-  const created = await channel.send({ ...body, nonce: surfaceNonce(surfaceKey), enforceNonce: true });
+  const created = await channel.send({ ...withQuestAutoVideo(body, surfaceKey),
+    nonce: surfaceNonce(surfaceKey), enforceNonce: true });
   return { message: created, recreated: true };
 }
 
@@ -83,7 +130,7 @@ async function setupSurfaceLocked({ interaction, surfaceKey, config }, context, 
     message = await fetchSurfaceMessageFresh(channel, existing.message_id);
   }
   message ??= await findSurfaceMarker(channel, surfaceKey);
-  const anchor = await updateOrCreateSurfaceAnchor(channel, surfaceKey, config, message);
+  const anchor = await updateOrCreateSurfaceAnchor(channel, surfaceKey, config, message, { pool: options.pool });
   try {
     await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
       const values = [surfaceKey, interaction.guildId, channel.id, anchor.message.id, Number(config?.version ?? 0)];
@@ -113,7 +160,7 @@ async function setupSurfaceLocked({ interaction, surfaceKey, config }, context, 
     try {
       const old = await interaction.guild.channels.fetch(existing.channel_id);
       const oldMessage = old?.isTextBased() ? await fetchSurfaceMessageFresh(old, existing.message_id) : null;
-      await oldMessage?.edit({ content: 'แผงนี้ถูกย้ายแล้ว', embeds: [], components: [] });
+      await oldMessage?.edit({ content: 'แผงนี้ถูกย้ายแล้ว', embeds: [], components: [], attachments: [] });
     } catch (error) {
       await recordSurfaceIncidentSafely(options.pool, surfaceKey, error, context);
       cleanupFailed = true;
@@ -156,7 +203,7 @@ async function recordSurfaceIncidentSafely(pool, surfaceKey, error, context) {
 
 async function deactivateOrphan(message, pool, surfaceKey, context) {
   try {
-    await message.edit({ content: 'แผงนี้ถูกแทนที่แล้ว', embeds: [], components: [] });
+    await message.edit({ content: 'แผงนี้ถูกแทนที่แล้ว', embeds: [], components: [], attachments: [] });
   } catch (error) {
     // The authoritative surface pointer remains unchanged; the next pass will
     // report the delivery failure without treating the orphan as active.
@@ -187,13 +234,22 @@ async function reconcileOneSurface({ guild, pool, surface, config, context }) {
   }
   let message = surface.message_id ? await fetchSurfaceMessageFresh(channel, surface.message_id) : null;
   message ??= await findSurfaceMarker(channel, surface.surface_key);
-  const needsRefresh = !message || surface.state === 'RECONCILING'
+
+  let questAutoBody = null;
+  let questAutoDrift = false;
+  if (surface.surface_key === 'QUEST_AUTO') {
+    questAutoBody = await surfacePayload(surface.surface_key, config, pool);
+    questAutoDrift = !questAutoSurfacePresentationMatches(message, questAutoBody);
+  }
+
+  const needsRefresh = !message || surface.state === 'RECONCILING' || questAutoDrift
     || Number(surface.rendered_config_version) < Number(config?.version ?? 0);
   if (!needsRefresh) {
     await resolveSurfaceIncidentSafely(pool, surface.surface_key, context);
     return { surfaceKey: surface.surface_key, skipped: true };
   }
-  const anchor = await updateOrCreateSurfaceAnchor(channel, surface.surface_key, config, message);
+  const anchor = await updateOrCreateSurfaceAnchor(channel, surface.surface_key, config, message,
+    { pool, body: questAutoBody });
   const updated = await persistReconciledSurface(pool, surface, anchor.message, config, anchor, context);
   if (updated) {
     await resolveSurfaceIncidentSafely(pool, surface.surface_key, context);
