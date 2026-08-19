@@ -17,6 +17,7 @@ ENV PG_DUMP_PATH=/usr/local/bin/pg_dump
 ENV PG_RESTORE_PATH=/usr/local/bin/pg_restore
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
+COPY assets ./assets
 COPY migrations ./migrations
 COPY scripts ./scripts
 COPY src ./src
