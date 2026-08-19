@@ -56,7 +56,8 @@ Primary references, in order:
   price; expiry belongs on quote/review.
 - Final Order DM uses one **รับรางวัลทั้งหมด** link to the first successful Quest and one **ดูประวัติ Quest ทั้งหมด**
   link to the history channel.
-- Branding media is an image/GIF URL in v1. Do not invent a video subsystem.
+- Quest Auto may attach one Owner-approved bundled MP4 demo to the persistent storefront message. This is a fixed
+  asset, not a generic video subsystem; other branding media remains an image/GIF URL in v1.
 - Runtime permission-drift detection and automatic repair are deliberately absent. Discord 403 creates/preserves an
   incident for manual Owner repair; it must not silently alter channel permissions.
 - The Owner intentionally removed human-visibility/privacy preflight checks from backoffice setup and Payment Log
