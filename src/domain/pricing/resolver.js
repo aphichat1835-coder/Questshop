@@ -1,11 +1,6 @@
-import { questPriceCategoryForTaskType } from './categories.js';
+import { QUEST_PRICE_CATEGORIES, questPriceCategoryForTaskType } from './categories.js';
 
-const SUPPORTED_QUEST_TASK_TYPES = Object.freeze([
-  'PLAY_ON_DESKTOP',
-  'PLAY_ON_DESKTOP_V2',
-  'WATCH_VIDEO',
-  'WATCH_VIDEO_ON_MOBILE',
-]);
+const QUEST_TASK_TYPES = Object.freeze(Object.values(QUEST_PRICE_CATEGORIES).flat());
 
 export async function resolvePrice(client, { taskType }) {
   if (!questPriceCategoryForTaskType(taskType)) return null;
@@ -21,13 +16,19 @@ export async function resolvePrice(client, { taskType }) {
 }
 
 export async function configuredQuestPriceRange(client) {
-  const result = await client.query(`SELECT min(amount_cents)::bigint AS min_amount_cents,
-      max(amount_cents)::bigint AS max_amount_cents
+  const result = await client.query(`
+    SELECT min(amount_cents)::bigint AS min_cents,
+      max(amount_cents)::bigint AS max_cents,
+      count(DISTINCT task_type)::integer AS task_type_count
     FROM price_rules
-    WHERE enabled=true AND rule_type='TYPE' AND task_type = ANY($1::text[])`, [SUPPORTED_QUEST_TASK_TYPES]);
+    WHERE enabled = true
+      AND rule_type = 'TYPE'
+      AND task_type = ANY($1::text[])
+  `, [QUEST_TASK_TYPES]);
   const row = result.rows[0];
-  if (row?.min_amount_cents == null || row?.max_amount_cents == null) return null;
-  return { minCents: BigInt(row.min_amount_cents), maxCents: BigInt(row.max_amount_cents) };
+  if (row?.min_cents == null || row?.max_cents == null
+    || Number(row.task_type_count) !== QUEST_TASK_TYPES.length) return null;
+  return { minCents: BigInt(row.min_cents), maxCents: BigInt(row.max_cents) };
 }
 
 export async function minimumSellablePrice(client) {
