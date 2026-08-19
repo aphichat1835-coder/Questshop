@@ -8,7 +8,10 @@ const QUEST_AUTO_VIDEO_DIRECTORY = fileURLToPath(new URL('../assets/quest-auto-d
 const QUEST_AUTO_VIDEO_SIZE = 83_273;
 const QUEST_AUTO_VIDEO_SHA256 = 'daf6b55daf849f14fecb8f8df82e0b59bf1e81b01e082811e46e28b56501e388';
 const QUEST_AUTO_VIDEO_CHUNKS = Object.freeze([
-  '000.b64', '001.b64', '002.b64', '003.b64', '004.b64', '005.b64',
+  '000.b64', '001.b64', '002.b64',
+  '003a.b64', '003b.b64', '003c.b64', '003d.b64',
+  '004a.b64', '004b.b64', '004c.b64', '004d.b64',
+  '005.b64',
 ]);
 
 let cachedVideo = null;

@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { configuredQuestPriceRange } from '../../src/domain/pricing/resolver.js';
-import { questPriceRangeText, renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
+import { questAutoPriceRangeLabel, renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
 import {
   QUEST_AUTO_VIDEO_FILENAME,
   loadQuestAutoVideo,
-  questAutoSurfacePresentationMatches,
-} from '../../src/discord/surfaces/setup.js';
+} from '../../src/discord/surfaces/quest-auto-media.js';
+import { questAutoSurfaceMatches } from '../../src/discord/surfaces/setup.js';
 
 test('Quest Auto storefront renders one price when configured prices are equal', () => {
   const body = renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 500n } });
@@ -32,8 +32,8 @@ test('Quest Auto storefront keeps the Owner-approved title and copy instead of l
 });
 
 test('Quest Auto storefront renders min-max price range with a hyphen', () => {
-  assert.equal(questPriceRangeText({ minCents: 500n, maxCents: 700n }), '5-7 บาท');
-  assert.equal(questPriceRangeText({ minCents: 550n, maxCents: 725n }), '5.50-7.25 บาท');
+  assert.equal(questAutoPriceRangeLabel({ minCents: 500n, maxCents: 700n }), '5-7');
+  assert.equal(questAutoPriceRangeLabel({ minCents: 550n, maxCents: 725n }), '5.5-7.25');
   const body = renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 700n } });
   assert.match(body.embeds[0].data.description, /ค่าบริการ 5-7 บาท \/ เควสสำเร็จ/);
 });
@@ -61,10 +61,10 @@ test('Quest Auto bundled demo video decodes as MP4 and missing video marks the s
 
   const payload = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }] };
   const withoutVideo = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }], attachments: new Map() };
-  assert.equal(questAutoSurfacePresentationMatches(withoutVideo, payload), false);
+  assert.equal(questAutoSurfaceMatches(withoutVideo, payload), false);
   const withVideo = {
     embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }],
     attachments: new Map([['attachment', { name: QUEST_AUTO_VIDEO_FILENAME }]]),
   };
-  assert.equal(questAutoSurfacePresentationMatches(withVideo, payload), true);
+  assert.equal(questAutoSurfaceMatches(withVideo, payload), true);
 });
