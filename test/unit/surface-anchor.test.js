@@ -115,18 +115,18 @@ test('surface setup finds its marker beyond the old 25-message scan without crea
   assert.equal(channel.sent.length, 0);
 });
 
-test('Quest Auto bundled video decodes as the verified MP4 derivative', async () => {
+test('Quest Auto bundled video is the exact uploaded MP4', async () => {
   const video = await loadQuestAutoVideo();
   assert.ok(Buffer.isBuffer(video));
-  assert.equal(video.length, 83_273);
+  assert.equal(video.length, 6_812_564);
   assert.equal(video.subarray(4, 8).toString('ascii'), 'ftyp');
 });
 
-test('Quest Auto attaches the bundled demo video when the current anchor does not have it', async () => {
+test('Quest Auto attaches the uploaded video and clears stale attachments', async () => {
   const edits = [];
   const existing = {
     id: 'quest-auto',
-    attachments: new Map(),
+    attachments: new Map([['legacy', { name: 'quest-auto-demo.mp4' }]]),
     edit: async (body) => {
       edits.push(body);
       return existing;
@@ -136,18 +136,19 @@ test('Quest Auto attaches the bundled demo video when the current anchor does no
   await updateOrCreateSurfaceAnchor(channel, 'QUEST_AUTO', { values: {} }, existing,
     { pool: priceRangePool(500, 700) });
   assert.equal(edits.length, 1);
-  assert.equal(edits[0].files?.[0]?.name, 'quest-auto-demo.mp4');
+  assert.deepEqual(edits[0].attachments, []);
+  assert.equal(edits[0].files?.[0]?.name, 'videoplayback.mp4');
   assert.ok(Buffer.isBuffer(edits[0].files[0].attachment));
-  assert.equal(edits[0].files[0].attachment.length, 83_273);
+  assert.equal(edits[0].files[0].attachment.length, 6_812_564);
   assert.equal(edits[0].files[0].attachment.subarray(4, 8).toString('ascii'), 'ftyp');
   assert.match(edits[0].embeds[0].description, /ค่าบริการ 5-7 บาท/);
 });
 
-test('Quest Auto keeps its existing demo attachment instead of uploading a duplicate on refresh', async () => {
+test('Quest Auto keeps its existing uploaded video instead of uploading a duplicate on refresh', async () => {
   let editedBody;
   const existing = {
     id: 'quest-auto',
-    attachments: new Map([['video', { name: 'quest-auto-demo.mp4' }]]),
+    attachments: new Map([['video', { name: 'videoplayback.mp4' }]]),
     edit: async (body) => {
       editedBody = body;
       return existing;
@@ -156,13 +157,14 @@ test('Quest Auto keeps its existing demo attachment instead of uploading a dupli
   await updateOrCreateSurfaceAnchor(createChannel(), 'QUEST_AUTO', { values: {} }, existing,
     { pool: priceRangePool(500, 500) });
   assert.equal(editedBody.files, undefined);
+  assert.equal(editedBody.attachments, undefined);
 });
 
 test('Quest Auto reconciliation detects a stale displayed price even when the video is already attached', () => {
   const expected = normalizeDiscordPayload(renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 700n } }));
   expected.embeds[0].footer = { text: 'Questshop Surface • QUEST_AUTO' };
   const message = {
-    attachments: new Map([['video', { name: 'quest-auto-demo.mp4' }]]),
+    attachments: new Map([['video', { name: 'videoplayback.mp4' }]]),
     embeds: [{
       title: 'Discord Quest • Auto',
       description: expected.embeds[0].description.replace('5-7', '5'),
