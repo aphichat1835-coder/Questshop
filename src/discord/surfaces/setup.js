@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { configuredQuestPriceRange } from '../../domain/pricing/resolver.js';
@@ -8,11 +7,9 @@ import { appendAdminAudit } from '../../domain/admin/audit.js';
 import { reconcileIncident } from '../../domain/incidents/service.js';
 import { fetchDiscordMessage, findDiscordMessage, isMissingDiscordMessage } from '../transport.js';
 import { normalizeDiscordPayload } from '../payload.js';
+import { QUEST_AUTO_VIDEO_FILENAME, loadQuestAutoVideo } from './quest-auto-media.js';
 
-export const QUEST_AUTO_VIDEO_FILENAME = 'quest-auto-demo.mp4';
-export const QUEST_AUTO_VIDEO_PATH = fileURLToPath(
-  new URL('../../../assets/quest-auto-demo.mp4', import.meta.url),
-);
+export { QUEST_AUTO_VIDEO_FILENAME, loadQuestAutoVideo } from './quest-auto-media.js';
 
 // Setup commands can be issued concurrently from two Discord interactions.
 // The runtime is intentionally all-in-one, so a keyed promise lock prevents
@@ -71,11 +68,11 @@ export function questAutoSurfacePresentationMatches(message, payload) {
     && embedValue(current, 'description') === embedValue(desired, 'description');
 }
 
-function withQuestAutoVideo(body, surfaceKey, message = null) {
+async function withQuestAutoVideo(body, surfaceKey, message = null) {
   if (surfaceKey !== 'QUEST_AUTO' || hasQuestAutoVideo(message)) return body;
   return {
     ...body,
-    files: [{ attachment: QUEST_AUTO_VIDEO_PATH, name: QUEST_AUTO_VIDEO_FILENAME }],
+    files: [{ attachment: await loadQuestAutoVideo(), name: QUEST_AUTO_VIDEO_FILENAME }],
   };
 }
 
@@ -101,7 +98,7 @@ export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, e
   let message = existingMessage;
   if (message) {
     try {
-      return { message: await message.edit(withQuestAutoVideo(body, surfaceKey, message)), recreated: false };
+      return { message: await message.edit(await withQuestAutoVideo(body, surfaceKey, message)), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
     }
@@ -109,12 +106,12 @@ export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, e
   message = await findSurfaceMarker(channel, surfaceKey);
   if (message) {
     try {
-      return { message: await message.edit(withQuestAutoVideo(body, surfaceKey, message)), recreated: false };
+      return { message: await message.edit(await withQuestAutoVideo(body, surfaceKey, message)), recreated: false };
     } catch (error) {
       if (!isMissingDiscordMessage(error)) throw error;
     }
   }
-  const created = await channel.send({ ...withQuestAutoVideo(body, surfaceKey),
+  const created = await channel.send({ ...await withQuestAutoVideo(body, surfaceKey),
     nonce: surfaceNonce(surfaceKey), enforceNonce: true });
   return { message: created, recreated: true };
 }
