@@ -18,7 +18,7 @@ export const ROUTE_CONTRACTS = Object.freeze({
   topup: customer('BUTTON', ['TOPUP_ACCEPTING']),
   payment_method: customer('STRING_SELECT', ['TOPUP_ACCEPTING'], 'MODAL'),
   voucher_submit: customer('MODAL_SUBMIT', ['TOPUP_ACCEPTING']),
-  token_submit: customer('MODAL_SUBMIT', ['ORDER_ACCEPTING']),
+  token_submit: customer('MODAL_SUBMIT', ['ORDER_ACCEPTING'], 'PROGRESS'),
   quest_prev: customer('BUTTON', [], 'UPDATE'), quest_next: customer('BUTTON', [], 'UPDATE'),
   quest_select: customer('STRING_SELECT', [], 'UPDATE'), quest_all: customer('BUTTON', [], 'UPDATE'),
   quest_quote: customer('BUTTON', [], 'UPDATE'), quest_back: customer('BUTTON', [], 'UPDATE'),
