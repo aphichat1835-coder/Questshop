@@ -2,21 +2,23 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 
-export const QUEST_AUTO_VIDEO_FILENAME = 'videoplayback.mp4';
-const QUEST_AUTO_VIDEO_PATH = fileURLToPath(new URL('../assets/videoplayback.mp4', import.meta.url));
-const QUEST_AUTO_VIDEO_SIZE = 6_812_564;
-const QUEST_AUTO_VIDEO_SHA256 = '0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467';
+export const QUEST_AUTO_MEDIA_FILENAME = 'quest-auto-demo.gif';
+export const QUEST_AUTO_MEDIA_ATTACHMENT_URL = `attachment://${QUEST_AUTO_MEDIA_FILENAME}`;
+const QUEST_AUTO_MEDIA_PATH = fileURLToPath(new URL('../assets/quest-auto-demo.gif', import.meta.url));
+const QUEST_AUTO_MEDIA_SIZE = 9_190_692;
+const QUEST_AUTO_MEDIA_SHA256 = 'c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1';
 
-let cachedVideo = null;
+let cachedMedia = null;
 
-export async function loadQuestAutoVideo() {
-  if (cachedVideo) return cachedVideo;
-  const video = await readFile(QUEST_AUTO_VIDEO_PATH);
-  const validContainer = video.subarray(4, 8).toString('ascii') === 'ftyp';
-  const digest = createHash('sha256').update(video).digest('hex');
-  if (video.length !== QUEST_AUTO_VIDEO_SIZE || !validContainer || digest !== QUEST_AUTO_VIDEO_SHA256) {
-    throw new Error('Bundled Quest Auto video failed integrity verification');
+export async function loadQuestAutoMedia() {
+  if (cachedMedia) return cachedMedia;
+  const media = await readFile(QUEST_AUTO_MEDIA_PATH);
+  const signature = media.subarray(0, 6).toString('ascii');
+  const validGif = signature === 'GIF87a' || signature === 'GIF89a';
+  const digest = createHash('sha256').update(media).digest('hex');
+  if (media.length !== QUEST_AUTO_MEDIA_SIZE || !validGif || digest !== QUEST_AUTO_MEDIA_SHA256) {
+    throw new Error('Bundled Quest Auto GIF failed integrity verification');
   }
-  cachedVideo = video;
-  return cachedVideo;
+  cachedMedia = media;
+  return cachedMedia;
 }
