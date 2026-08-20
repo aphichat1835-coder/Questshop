@@ -25,6 +25,56 @@ test('normalizer reads an opaque task key through its declared event_name', () =
   assert.equal(quest.contractComplete, true);
 });
 
+test('normalizer reads Discord Orbs from virtual-currency reward objects', () => {
+  const raw = payload({ event_name: 'WATCH_VIDEO', target: 60 });
+  raw.config.rewards_config = {
+    assignment_method: 1,
+    rewards: [
+      { type: 4, orb_quantity: 750 },
+      { type: 5, quantity: 3 },
+    ],
+  };
+  const quest = normalizeQuest(raw);
+  assert.equal(quest.orbs, 750);
+});
+
+test('normalizer never mistakes non-Orb reward quantity for Discord Orbs', () => {
+  const raw = payload({ event_name: 'WATCH_VIDEO', target: 60 });
+  raw.config.rewards_config = { assignment_method: 1, rewards: [{ type: 5, quantity: 7 }] };
+  const quest = normalizeQuest(raw);
+  assert.equal(quest.orbs, null);
+});
+
+test('normalizer resolves Quest CDN images and ignores video assets for announcement media', () => {
+  const raw = payload({ event_name: 'PLAY_ON_DESKTOP', target: 900 });
+  raw.config.assets = {
+    hero: 'hero.jpg',
+    hero_video: 'hero.mp4',
+    quest_bar_hero: 'questbar.jpg',
+    game_tile: 'gametile.png',
+    logotype: 'wordmark.png',
+  };
+  const quest = normalizeQuest(raw);
+  assert.equal(quest.artworkUrl,
+    'https://cdn.discordapp.com/assets/quests/quest-normalizer/hero.jpg');
+  assert.equal(quest.thumbnailUrl,
+    'https://cdn.discordapp.com/assets/quests/quest-normalizer/gametile.png');
+  assert.doesNotMatch(quest.artworkUrl, /\.mp4/);
+  assert.doesNotMatch(quest.thumbnailUrl, /\.mp4/);
+});
+
+test('normalizer can use the still thumbnail from Quest video assets without embedding the video', () => {
+  const raw = payload({ event_name: 'WATCH_VIDEO', target: 60 });
+  raw.config.video_assets = {
+    video: { url: 'https://cdn.discordapp.com/assets/quests/quest-normalizer/video.mp4',
+      thumbnail: 'https://cdn.discordapp.com/assets/quests/quest-normalizer/video-thumb.jpg' },
+  };
+  const quest = normalizeQuest(raw);
+  assert.equal(quest.artworkUrl,
+    'https://cdn.discordapp.com/assets/quests/quest-normalizer/video-thumb.jpg');
+  assert.equal(quest.thumbnailUrl, null);
+});
+
 test('contract fingerprint changes when the executable progress contract changes', () => {
   const base = normalizeQuest(payload({ event_name: 'WATCH_VIDEO', target: 60 }));
   const changed = normalizeQuest(payload({ event_name: 'WATCH_VIDEO', target: 90 }));

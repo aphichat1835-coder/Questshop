@@ -1,6 +1,7 @@
 import { acquireDelivery, recordDelivery, renewDeliveryLease } from '../domain/outbox/service.js';
 import { withTransaction } from '../db/transaction.js';
 import { renderProjection } from '../discord/renderers/projections.js';
+import { renderQuestNewProjection } from '../discord/renderers/quest-new.js';
 import { FencingLostError } from '../shared/errors.js';
 import { recordTransition } from '../domain/shared/transition.js';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -209,7 +210,12 @@ export async function publishProjection(channel, projection, body) {
   }
 }
 
-export async function processOutbox({ holder, client, pool, env, renderProjectionFunction = renderProjection }) {
+export async function renderProjectionForDelivery(pool, projection, dependencies = {}) {
+  if (projection.projection_type === 'QUEST_NEW') return renderQuestNewProjection(pool, projection);
+  return renderProjection(pool, projection, dependencies);
+}
+
+export async function processOutbox({ holder, client, pool, env, renderProjectionFunction = renderProjectionForDelivery }) {
   const event = await acquireDelivery({ holder }, { pool });
   if (!event) return false;
   const heartbeat = startDeliveryHeartbeat(event, pool);

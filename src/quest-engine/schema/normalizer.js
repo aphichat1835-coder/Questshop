@@ -7,6 +7,9 @@ import {
 } from './compatibility.js';
 import { questContractHash } from './contract.js';
 
+const QUEST_CDN_BASE = 'https://cdn.discordapp.com/assets/quests';
+const VIDEO_MEDIA_EXTENSION = /\.(?:mp4|webm|mov|m4v)(?:$|[?#])/i;
+
 function taskEntries(taskConfig) {
   const tasks = taskConfig?.tasks;
   return tasks && typeof tasks === 'object' && !Array.isArray(tasks) ? Object.entries(tasks) : [];
@@ -54,23 +57,96 @@ function chooseTask(entries, status, options) {
   };
 }
 
-function rewardOrbs(config) {
-  const candidates = [
-    config.rewards_config?.rewards?.[0]?.quantity,
-    config.rewards_config?.rewards?.[0]?.amount,
-    config.reward?.orbs,
-    config.orb_quantity,
-  ];
-  const value = candidates.map(Number).find((item) => Number.isInteger(item) && item >= 0);
-  return value ?? null;
+function nonNegativeInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
 }
 
-function artwork(config) {
-  const value = config.assets?.hero
-    ?? config.assets?.hero_image
-    ?? config.application?.icon_url
-    ?? config.messages?.game_tile;
-  return typeof value === 'string' && value.startsWith('https://') ? value : null;
+function questRewards(config) {
+  const configured = Array.isArray(config.rewards_config?.rewards) ? config.rewards_config.rewards : [];
+  const claimed = Array.isArray(config.rewards) ? config.rewards : [];
+  return configured.length ? configured : claimed;
+}
+
+function rewardOrbs(config) {
+  const rewards = questRewards(config);
+  const orbRewards = rewards.filter((reward) => Number(reward?.type) === 4)
+    .map((reward) => nonNegativeInteger(reward?.orb_quantity)).filter((value) => value != null);
+  if (orbRewards.length) {
+    if (Number(config.rewards_config?.assignment_method) === 1) {
+      return orbRewards.reduce((total, amount) => total + amount, 0);
+    }
+    return orbRewards[0];
+  }
+  const schemaFallback = rewards.map((reward) => nonNegativeInteger(reward?.orb_quantity))
+    .find((value) => value != null);
+  return schemaFallback
+    ?? nonNegativeInteger(config.reward?.orbs)
+    ?? nonNegativeInteger(config.orb_quantity);
+}
+
+function safeStaticHttpsUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== 'https:' || VIDEO_MEDIA_EXTENSION.test(url.pathname)) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function questAssetUrl(id, value, theme = null) {
+  const direct = safeStaticHttpsUrl(value);
+  if (direct) return direct;
+  if (typeof value !== 'string' || !value.trim() || VIDEO_MEDIA_EXTENSION.test(value)) return null;
+  const assetName = value.trim().split('/').filter(Boolean).map(encodeURIComponent).join('/');
+  if (!assetName) return null;
+  const themed = theme ? `/${theme}` : '';
+  return `${QUEST_CDN_BASE}/${encodeURIComponent(id)}${themed}/${assetName}`;
+}
+
+function applicationIcon(config) {
+  const direct = safeStaticHttpsUrl(config.application?.icon_url);
+  if (direct) return direct;
+  const applicationId = config.application?.id;
+  const icon = config.application?.icon;
+  if (applicationId == null || typeof icon !== 'string' || !icon.trim()) return null;
+  return `https://cdn.discordapp.com/app-icons/${encodeURIComponent(String(applicationId))}/${encodeURIComponent(icon.trim())}.png`;
+}
+
+function videoThumbnail(config) {
+  const assets = config.video_assets ?? config.videoAssets;
+  const candidates = [
+    assets?.video?.thumbnail,
+    assets?.video_low_res?.thumbnail,
+    assets?.video_hls?.thumbnail,
+  ];
+  return candidates.map(safeStaticHttpsUrl).find(Boolean) ?? null;
+}
+
+function questMedia(id, config) {
+  const assets = config.assets ?? {};
+  const rewardAsset = questRewards(config).map((reward) => reward?.asset).find(Boolean);
+  const heroCandidates = [
+    questAssetUrl(id, assets.hero),
+    questAssetUrl(id, assets.quest_bar_hero),
+    videoThumbnail(config),
+    questAssetUrl(id, assets.game_tile),
+  ].filter(Boolean);
+  const artworkUrl = heroCandidates[0] ?? null;
+  const thumbnailCandidates = [
+    questAssetUrl(id, assets.game_tile),
+    questAssetUrl(id, assets.logotype),
+    questAssetUrl(id, assets.game_tile_dark, 'dark'),
+    questAssetUrl(id, assets.game_tile_light, 'light'),
+    questAssetUrl(id, assets.logotype_dark, 'dark'),
+    questAssetUrl(id, assets.logotype_light, 'light'),
+    applicationIcon(config),
+    questAssetUrl(id, rewardAsset),
+    videoThumbnail(config),
+  ].filter((url) => url && url !== artworkUrl);
+  return { artworkUrl, thumbnailUrl: thumbnailCandidates[0] ?? null };
 }
 
 function questUrl(id, config) {
@@ -130,6 +206,7 @@ export function normalizeQuest(raw, options = {}) {
   const startsAt = config.starts_at ?? null;
   const expiresAt = config.expires_at ?? null;
   const url = questUrl(id, config);
+  const media = questMedia(id, config);
   const normalized = {
     id,
     name: config.messages?.quest_name ?? config.messages?.quest_title ?? id,
@@ -149,7 +226,8 @@ export function normalizeQuest(raw, options = {}) {
     completed: Boolean(status.completed_at),
     claimed: Boolean(status.claimed_at) || status.orb_quantity_claimed != null,
     orbs: rewardOrbs(config),
-    artworkUrl: artwork(config),
+    artworkUrl: media.artworkUrl,
+    thumbnailUrl: media.thumbnailUrl,
     url,
     schemaIssues: issues.map((issue) => issue.message),
     compatibilityIssues: issues,
