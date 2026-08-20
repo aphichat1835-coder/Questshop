@@ -86,27 +86,30 @@ export NODE_EXTRA_CA_CERTS=/tmp/aiven-ca.pem
 
 Do not write a temporary CA file in the inwcloud startup command for the current source.
 
-## 5. Quest Auto bundled video deployment
+## 5. Quest Auto bundled GIF deployment
 
 The repository must contain the exact source asset:
 
 ```text
-src/discord/assets/videoplayback.mp4
-Size     6,812,564 bytes
-SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+src/discord/assets/quest-auto-demo.gif
+Size     9,190,692 bytes
+SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
 ```
 
-No build-time conversion, compression or Base64 reconstruction is used. Runtime reads this MP4 directly from `src`,
-verifies size + `ftyp` + SHA-256 and uploads it only when the persistent `QUEST_AUTO` message does not already contain
-the expected `videoplayback.mp4` attachment.
+No build-time conversion or Base64 reconstruction is used. Runtime reads this GIF directly from `src`, verifies
+size + GIF signature + SHA-256 and attaches it when the persistent `QUEST_AUTO` message does not already contain the
+expected `quest-auto-demo.gif` attachment.
 
-If startup/runtime reports `Bundled Quest Auto video failed integrity verification`, do not bypass the check.
-Confirm the deployed checkout contains the exact Git-tracked binary and that inwcloud did not fetch an older revision.
+The Rich Embed references `attachment://quest-auto-demo.gif`, so the intended layout is the animation **inside the
+embed**. The old standalone MP4/video block is not part of the current storefront layout.
 
-The 6.8 MB asset is included by the normal `COPY src ./src` Docker/build/deploy source path; no extra media service is
+If startup/runtime reports `Bundled Quest Auto GIF failed integrity verification`, do not bypass the check.
+Confirm the deployed checkout contains the exact Git-tracked GIF and that inwcloud did not fetch an older revision.
+
+The 9.19 MB asset is included by the normal `COPY src ./src` Docker/build/deploy source path; no extra media service is
 required.
 
-## 6. Quest Auto dynamic price behavior
+## 6. Quest Auto dynamic price and anchor behavior
 
 The storefront price is read from active supported `TYPE` price rules:
 
@@ -117,6 +120,9 @@ The storefront price is read from active supported `TYPE` price rules:
 The persistent message is edited automatically through surface reconciliation. The Maintenance worker currently runs
 approximately every 60 seconds, so visible price/media healing is eventual within the maintenance cycle rather than an
 instant same-click guarantee.
+
+Quest Auto no longer renders the customer-visible `Questshop Surface • QUEST_AUTO` footer. Recovery uses the stable
+surface nonce first; legacy footer lookup remains only to migrate older messages.
 
 ## 7. Health endpoints
 
@@ -163,7 +169,7 @@ After runtime is ready, Owner installs/moves the eight surfaces:
 ```
 
 Re-running setup updates/moves the durable surface instead of intentionally creating a second active panel.
-`QUEST_AUTO` setup also heals missing/legacy video attachment and current price text.
+`QUEST_AUTO` setup also heals missing/legacy media, old visible technical footer and current price text.
 
 ## 10. Common failures
 
@@ -174,9 +180,10 @@ Re-running setup updates/moves the durable surface instead of intentionally crea
 | `POSTGRES_RUNTIME_ROLE_CONTRACT_FAILED` | fix Aiven role/bootstrap grants; do not broaden Runtime permissions |
 | Bot Administrator error | grant Discord `Administrator`, then restart |
 | TLS/CA error | verify both URLs use `verify-full` and CA Base64 is complete |
-| Quest Auto media integrity failure | verify exact `videoplayback.mp4` size/hash in deployed checkout |
+| Quest Auto media integrity failure | verify exact `quest-auto-demo.gif` size/hash in deployed checkout |
 | Quest Auto still shows old price | allow one Maintenance cycle; confirm active `TYPE` rules are complete and surface is ACTIVE |
-| Quest Auto still shows old video | confirm attachment filename is not already `videoplayback.mp4`; rerun `/quest-auto` or restart/reconcile |
+| Quest Auto still shows standalone video | confirm the new GIF commit is deployed; rerun `/quest-auto` or restart/reconcile |
+| Quest Auto still shows technical footer | allow reconciliation or rerun `/quest-auto`; stable nonce recovery does not require the footer |
 | Discord 403 | Owner fixes channel permission manually; bot does not auto-repair overwrites |
 
 ## 11. Backup / rollback
@@ -203,7 +210,8 @@ Discord 403 is recorded as an incident but bot does not change permission overwr
 2. Source SHA evidence matches the intended commit when Git metadata is available.
 3. Eight surfaces are installed.
 4. `PRELAUNCH=true` during UAT.
-5. `QUEST_AUTO` shows **Discord Quest • Auto**, expected price text and `videoplayback.mp4` playback.
+5. `QUEST_AUTO` shows **Discord Quest • Auto**, expected price text and `quest-auto-demo.gif` animated inside the embed,
+   with no standalone MP4 block and no `Questshop Surface • QUEST_AUTO` footer.
 6. Change one Admin Quest price and verify the **same message** refreshes within the Maintenance window.
-7. Restart once and confirm no duplicate Quest Auto panel or duplicate video attachment.
+7. Restart once and confirm no duplicate Quest Auto panel or duplicate GIF attachment.
 8. Continue the full checklist in `docs/uat/prelaunch.md` on the same SHA.
