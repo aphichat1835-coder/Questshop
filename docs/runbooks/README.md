@@ -20,8 +20,9 @@ Detect → Contain → Preserve evidence → Recover → Verify → Reopen → R
 | Discord outage / 429 | retain outbox; obey Retry-After | resume coalesced delivery after health recovery |
 | Discord interaction timeout | preserve Support code and Git SHA | restart the current flow; never replay uncertain money action blindly |
 | Quest Auto stale price | keep current anchor; do not create a second panel | verify active `TYPE` prices; allow Maintenance reconciliation or rerun `/quest-auto` |
-| Quest Auto missing/old video | keep current anchor | verify source `videoplayback.mp4`, then rerun `/quest-auto` or allow reconciliation |
-| Quest Auto media integrity failure | do not bypass hash/size check | restore exact Owner-uploaded file in deployed source and redeploy |
+| Quest Auto missing/old media | keep current anchor | verify source `quest-auto-demo.gif`, then rerun `/quest-auto` or allow reconciliation |
+| Quest Auto media integrity failure | do not bypass hash/size check | restore exact approved GIF in deployed source and redeploy |
+| Quest Auto still shows standalone MP4/footer | keep current anchor | deploy current GIF-layout SHA, rerun `/quest-auto` or allow reconciliation |
 | Aiven recovery | keep store closed; preserve ledger/incident evidence | Owner recovers through Aiven Console and reconciles before reopening |
 | Secret compromise | contain affected integration | rotate provider/key version and verify scoped recovery |
 | Deploy rollback | maintenance/drain as required | roll app only when schema compatible, otherwise forward-fix |
@@ -35,16 +36,16 @@ Detect → Contain → Preserve evidence → Recover → Verify → Reopen → R
 ### Expected source asset
 
 ```text
-src/discord/assets/videoplayback.mp4
-Size     6,812,564 bytes
-SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+src/discord/assets/quest-auto-demo.gif
+Size     9,190,692 bytes
+SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
 ```
 
-If `Bundled Quest Auto video failed integrity verification` appears:
+If `Bundled Quest Auto GIF failed integrity verification` appears:
 
 1. confirm the deployed Git SHA is the intended revision;
 2. confirm the file exists at the exact path above;
-3. verify the file was not converted/re-encoded/truncated by a manual upload step;
+3. verify the file was not truncated/replaced by a manual upload step;
 4. redeploy the correct source;
 5. do **not** remove the integrity check just to make startup/surface refresh pass.
 
@@ -58,14 +59,20 @@ The storefront reads active supported `TYPE` price rules. If the visible price i
 4. if needed, Owner reruns `/quest-auto` to force setup/update of the same anchor;
 5. verify the same Discord message ID remains active and no duplicate panel was created.
 
-### Stale/legacy video attachment
+### Stale/legacy media or layout
 
-If the message still contains an old attachment filename such as `quest-auto-demo.mp4`, reconciliation/setup should
-clear attachments and upload `videoplayback.mp4` on the same durable message. If the message already has an attachment
-named `videoplayback.mp4`, runtime intentionally preserves it to avoid duplicate upload.
+The current layout requires one attachment named `quest-auto-demo.gif`, referenced by the embed as
+`attachment://quest-auto-demo.gif`. The animation should appear inside the Rich Embed. If the message still contains
+`videoplayback.mp4`, `quest-auto-demo.mp4`, multiple media attachments, or the visible
+`Questshop Surface • QUEST_AUTO` footer, reconciliation/setup should clear the stale attachment set, attach the GIF and
+rewrite the embed on the **same durable message**.
 
-Therefore, if the Owner intentionally changes the video bytes in a future release, version/change the filename or add
-an explicit attachment migration; otherwise Discord-side filename matching can preserve the older remote bytes.
+Quest Auto recovery uses the stable surface nonce as the primary invisible-anchor marker. The old footer lookup remains
+only so older messages can be migrated without creating a duplicate panel.
+
+If the message already has exactly one `quest-auto-demo.gif` attachment, runtime preserves it to avoid duplicate upload.
+Therefore, if the Owner intentionally changes GIF bytes in a future release, version/change the filename or add an
+explicit attachment migration; otherwise Discord-side filename matching can preserve older remote bytes.
 
 ## Mandatory execution template
 
