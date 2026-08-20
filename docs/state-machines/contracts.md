@@ -40,7 +40,11 @@ For `QUEST_AUTO`:
 - setup/reconciliation edits the current anchor when it exists;
 - only a confirmed missing Discord message permits replacement/recreation;
 - Discord permission/network/rate-limit failures preserve the authoritative pointer and incident evidence;
-- a stale title/description/price/video filename is presentation drift, not a Wallet/Order/Payment transition;
+- a stale title/description/price/GIF attachment/embed image or a legacy visible technical footer is presentation drift,
+  not a Wallet/Order/Payment transition;
+- the approved `quest-auto-demo.gif` is rendered inside the Rich Embed through `attachment://quest-auto-demo.gif`;
+- the customer-facing embed has no `Questshop Surface • QUEST_AUTO` footer; stable nonce lookup is the primary
+  invisible-anchor recovery path and footer lookup is migration fallback only;
 - repairing Quest Auto presentation must not write financial aggregates;
 - the same durable message should remain active when price text or media is refreshed.
 
