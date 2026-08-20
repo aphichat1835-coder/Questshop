@@ -5,15 +5,9 @@ import { customId } from '../components/custom-id.js';
 import { adminCategoryOptions } from './admin.js';
 import { DISCORD_LIMITS, truncateDiscordText } from '../payload.js';
 import { DEFAULT_QUEST_PRICE_CENTS } from '../../domain/pricing/categories.js';
+import { QUEST_AUTO_MEDIA_ATTACHMENT_URL } from '../surfaces/quest-auto-media.js';
 
 const COLORS = Object.freeze({ primary: 0x5865f2, success: 0x23a55a, warning: 0xf0b232, danger: 0xf23f43 });
-
-function safeHttpsUrl(value) {
-  try {
-    const url = new URL(String(value));
-    return url.protocol === 'https:' && url.toString().length <= 512 ? url.toString() : null;
-  } catch { return null; }
-}
 
 function compactBaht(cents) {
   const amount = BigInt(cents);
@@ -47,9 +41,8 @@ export function renderQuestAuto(config = {}) {
   ].join('\n');
   const embed = new EmbedBuilder().setColor(COLORS.primary)
     .setTitle(truncateDiscordText('Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
-    .setDescription(truncateDiscordText(defaultDescription, DISCORD_LIMITS.embedDescription));
-  const mediaUrl = safeHttpsUrl(config.mediaUrl);
-  if (mediaUrl) embed.setImage(mediaUrl);
+    .setDescription(truncateDiscordText(defaultDescription, DISCORD_LIMITS.embedDescription))
+    .setImage(QUEST_AUTO_MEDIA_ATTACHMENT_URL);
   return {
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(
