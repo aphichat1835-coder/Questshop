@@ -99,11 +99,12 @@ export function questAutoSurfaceMatches(message, expectedBody) {
 }
 
 async function findSurfaceMarker(channel, surfaceKey) {
+  const botUserId = channel.client?.user?.id;
   if (surfaceKey === 'QUEST_AUTO') {
     const byNonce = await findDiscordMessageByNonce(channel, surfaceNonce(surfaceKey));
-    if (byNonce?.author?.id === channel.client.user?.id) return byNonce;
+    if (byNonce && byNonce.author?.id === botUserId) return byNonce;
   }
-  return findDiscordMessage(channel, (message) => message.author?.id === channel.client.user?.id
+  return findDiscordMessage(channel, (message) => message.author?.id === botUserId
     && message.embeds?.[0]?.footer?.text === `Questshop Surface • ${surfaceKey}`);
 }
 
