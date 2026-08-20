@@ -26,7 +26,8 @@ The customer-facing Quest Auto embed does not display the technical `Questshop S
 
 ### Price contract
 
-Source: `src/domain/pricing/resolver.js`, `src/discord/renderers/surfaces.js`, `src/discord/surfaces/setup.js`.
+Source: `src/domain/pricing/resolver.js`, `src/domain/admin/config-service.js`, `src/workers/worker-manager.js`,
+`src/discord/renderers/surfaces.js`, `src/discord/surfaces/setup.js`.
 
 - All four supported active `TYPE` task prices must exist before the storefront claims a configured price.
 - Equal prices collapse to one value such as `5 บาท`.
@@ -34,12 +35,16 @@ Source: `src/domain/pricing/resolver.js`, `src/discord/renderers/surfaces.js`, `
 - Incomplete supported configuration renders `ค่าบริการยังไม่พร้อม`.
 - Surface reconciliation compares the current Discord presentation against the expected price text even if runtime
   config version did not change.
-- Maintenance currently reconciles approximately every 60 seconds; therefore Admin price edits are automatic eventual
-  storefront refresh, not a synchronous same-click guarantee.
+- A successful Admin category-price transaction emits `QUEST_CATEGORY_PRICE_CHANGED` only after commit. The running
+  worker manager immediately queues the normal durable surface reconciliation, so the existing `QUEST_AUTO` message is
+  edited in the background without waiting for the next Maintenance interval.
+- Maintenance still reconciles approximately every 60 seconds as a repair fallback if an immediate Discord refresh
+  fails or is missed during runtime shutdown/restart.
 
 Automated evidence:
 
 - `test/integration/pricing-promotion-contract.test.js`
+- `test/unit/price-surface-refresh.test.js`
 - `test/unit/quest-auto-surface.test.js`
 - `test/unit/surface-anchor.test.js`
 - `test/integration/outbox-dlq.test.js`
@@ -66,8 +71,8 @@ Important future-change rule: Discord-side drift detection identifies the expect
 intentionally change later, version/change the filename or add an explicit attachment migration.
 
 Live boundary: real Discord desktop/mobile GIF rendering inside the embed, removal of the old visible technical footer,
-visible price refresh within the Maintenance window, restart/setup repair and no duplicate panel must still be verified
-on one exact Git SHA.
+visible price refresh immediately after Admin confirmation plus Maintenance fallback repair, restart/setup repair and no
+duplicate panel must still be verified on one exact Git SHA.
 
 ## Quest announcement contract
 

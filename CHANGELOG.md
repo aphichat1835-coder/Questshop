@@ -22,13 +22,17 @@ There is no production release/tag evidence yet; current work remains under `[Un
   and the existing **เริ่มทำเควส** / **เติมเงิน** controls.
 - Dynamic storefront price resolver for the four supported Quest task types. Equal active prices render one amount;
   differing GAME/VIDEO prices render a min-max range; incomplete configuration renders a not-ready price message.
+- Immediate post-commit Quest price-change event plus a background surface-refresh listener. This edits the durable
+  `QUEST_AUTO` storefront as soon as an Admin category-price transaction commits, while retaining Maintenance as repair fallback.
 - Owner-approved `src/discord/assets/quest-auto-demo.gif` generated from the supplied Quest demo video and rendered
   inside the Quest Auto embed through `attachment://quest-auto-demo.gif`.
 - Runtime GIF integrity verification using exact file size `9,190,692` bytes, GIF signature and SHA-256
   `c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1`.
 - Surface regression coverage for stale price detection, stale/legacy attachment replacement, invisible nonce-based
   Quest Auto anchor recovery, removal of the legacy visible technical footer, and exact GIF verification.
-- Pricing integration coverage proving storefront price-range source changes when the GAME category price changes.
+- Pricing integration coverage proving storefront price-range source changes when the GAME category price changes and
+  that the immediate refresh event is emitted only after the committed price is visible.
+- Unit coverage proving a committed category-price event immediately schedules the existing surface reconciliation path.
 - Quest-new reward normalization for Discord virtual-currency `orb_quantity`, including truthful min-max display for
   multi-value tiered rewards instead of claiming one tier applies to everyone.
 - Quest-new static media fallback using Quest Hero/Game Tile/Logotype/application/reward assets and selected-task still
@@ -46,9 +50,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Quest Auto surface reconciliation detects presentation drift independently of runtime config version and edits the
   existing durable message when title/description, price text, expected GIF attachment, embed image or legacy footer is stale.
 - A missing or legacy Quest Auto attachment is cleared and replaced with `quest-auto-demo.gif` on the same surface.
-- Automatic price/media healing is driven by the normal Maintenance reconciliation path, currently approximately once
-  per 60 seconds, plus setup/restart repair. This is eventual automatic refresh rather than a synchronous same-click
-  price update guarantee.
+- Admin GAME/VIDEO price changes now trigger immediate background reconciliation after the database commit instead of
+  waiting for the next ~60-second Maintenance pass. Maintenance remains the fallback if immediate Discord delivery fails.
 - Quest-new customer announcements now show Discord Quest **เริ่ม Quest** (`starts_at`) and **หมดอายุ** (`expires_at`)
   instead of scanner **ตรวจพบ** / mutable **อัปเดต** timestamps.
 - `QUEST_NEW` now has one customer-facing renderer source: generic projection rendering and Outbox delivery both route

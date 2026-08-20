@@ -11,7 +11,7 @@ Current status remains **implemented-but-unverified**.
 | Wallet / immutable ledger | wallet domain, reservations, retention | debit/settlement/refund/checkpoint tests | Owner compensation sign-off |
 | TrueMoney / voucher identity | TrueMoney adapter, payment service/worker | URL/schema/HMAC/ambiguity/replay/crash tests | real low-value + ambiguous UAT |
 | Pricing / promotion | pricing resolver, Admin config service | exact-satang + category/promotion tests | Owner Admin pricing UAT |
-| Quest Auto dynamic price | `configuredQuestPriceRange`, surface renderer/reconcile | equal/range/incomplete/stale-price tests | visible live price refresh |
+| Quest Auto dynamic price | `configuredQuestPriceRange`, price-change event, surface renderer/reconcile | equal/range/incomplete/stale-price/immediate-refresh tests | visible live price refresh |
 | Quest Auto embedded GIF | `src/discord/assets/quest-auto-demo.gif`, `quest-auto-media.js` | exact size/GIF/hash + stale attachment/embed tests | desktop/mobile in-embed animation |
 | Quest new reward/lifetime/media | normalizer, catalog revision merge, `quest-new.js` | Orb/tier/media/current-revision tests | real Quest reward/time/artwork fidelity |
 | Catalog / Monitor gate | catalog, discovery/test workers, contract pinning | Monitor-gate + retest + fingerprint tests | real metadata drift / Monitor UAT |
@@ -48,16 +48,20 @@ Current status remains **implemented-but-unverified**.
 - returns `{ minCents, maxCents }` only when all four task types are represented;
 - uses integer satang / `BIGINT`, never float pricing.
 
-### Durable surface reconciliation
+### Immediate price refresh and durable reconciliation
 
+`src/domain/admin/config-service.js` + `src/shared/application-events.js` + `src/workers/worker-manager.js` +
 `src/discord/surfaces/setup.js`
 
-- keeps one durable `QUEST_AUTO` anchor;
-- compares expected title/description, expected GIF attachment, embed-image presence and absence of the legacy visible footer;
-- stale price or missing/legacy media causes an edit/recovery of the same message;
-- stable nonce lookup is the primary invisible-anchor recovery path; footer lookup is migration fallback only;
+- a category-price change emits `QUEST_CATEGORY_PRICE_CHANGED` only after the SERIALIZABLE price transaction commits;
+- the worker manager immediately schedules `reconcileSurfaceAnchors()` in a serialized background chain, so an Admin
+  confirmation does not wait for Discord delivery and rapid price edits do not race each other;
+- the reconciliation edits the same durable `QUEST_AUTO` anchor and still uses the existing nonce/missing-message rules;
+- the surface compares expected title/description, expected GIF attachment, embed-image presence and absence of the
+  legacy visible footer, so the newly committed min-max price is detected without a runtime config-version change;
 - confirmed missing Discord message may be recreated; permission/network failures preserve the pointer and incident evidence;
-- current Maintenance worker runs this reconciliation approximately every 60 seconds.
+- a failed immediate refresh is logged and the normal Maintenance reconciliation, approximately every 60 seconds,
+  remains the repair fallback.
 
 ### Exact bundled media
 
