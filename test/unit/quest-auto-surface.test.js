@@ -3,8 +3,9 @@ import test from 'node:test';
 import { configuredQuestPriceRange } from '../../src/domain/pricing/resolver.js';
 import { questAutoPriceRangeLabel, renderQuestAuto } from '../../src/discord/renderers/surfaces.js';
 import {
-  QUEST_AUTO_VIDEO_FILENAME,
-  loadQuestAutoVideo,
+  QUEST_AUTO_MEDIA_ATTACHMENT_URL,
+  QUEST_AUTO_MEDIA_FILENAME,
+  loadQuestAutoMedia,
 } from '../../src/discord/surfaces/quest-auto-media.js';
 import { questAutoSurfaceMatches } from '../../src/discord/surfaces/setup.js';
 
@@ -14,6 +15,8 @@ test('Quest Auto storefront renders one price when configured prices are equal',
   assert.match(body.embeds[0].data.description, /ค่าบริการ 5 บาท \/ เควสสำเร็จ/);
   assert.match(body.embeds[0].data.description, /Discord Token/);
   assert.match(body.embeds[0].data.description, /Discord Orbs/);
+  assert.equal(body.embeds[0].data.image.url, QUEST_AUTO_MEDIA_ATTACHMENT_URL);
+  assert.equal(body.embeds[0].data.footer, undefined);
 });
 
 test('Quest Auto storefront keeps the Owner-approved title and copy instead of legacy branding overrides', () => {
@@ -53,19 +56,21 @@ test('configured Quest price range requires all supported TYPE prices', async ()
   assert.equal(await configuredQuestPriceRange(incompletePool), null);
 });
 
-test('Quest Auto bundled demo video is the exact Owner-uploaded MP4 and missing video marks the surface stale', async () => {
-  const video = await loadQuestAutoVideo();
-  assert.ok(Buffer.isBuffer(video));
-  assert.equal(video.length, 6_812_564);
-  assert.equal(video.subarray(4, 8).toString('ascii'), 'ftyp');
-  assert.equal(QUEST_AUTO_VIDEO_FILENAME, 'videoplayback.mp4');
+test('Quest Auto bundled GIF is the exact uploaded asset and missing media marks the surface stale', async () => {
+  const media = await loadQuestAutoMedia();
+  assert.ok(Buffer.isBuffer(media));
+  assert.equal(media.length, 9_190_692);
+  assert.equal(media.subarray(0, 6).toString('ascii'), 'GIF89a');
+  assert.equal(QUEST_AUTO_MEDIA_FILENAME, 'quest-auto-demo.gif');
 
-  const payload = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }] };
-  const withoutVideo = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }], attachments: new Map() };
-  assert.equal(questAutoSurfaceMatches(withoutVideo, payload), false);
-  const withVideo = {
-    embeds: [{ title: 'Discord Quest • Auto', description: 'copy' }],
-    attachments: new Map([['attachment', { name: QUEST_AUTO_VIDEO_FILENAME }]]),
+  const payload = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy', image: { url: QUEST_AUTO_MEDIA_ATTACHMENT_URL } }] };
+  const withoutMedia = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy', image: { url: 'https://cdn.example/demo.gif' } }], attachments: new Map() };
+  assert.equal(questAutoSurfaceMatches(withoutMedia, payload), false);
+  const withMedia = {
+    embeds: [{ title: 'Discord Quest • Auto', description: 'copy', image: { url: 'https://cdn.example/demo.gif' } }],
+    attachments: new Map([['attachment', { name: QUEST_AUTO_MEDIA_FILENAME }]]),
   };
-  assert.equal(questAutoSurfaceMatches(withVideo, payload), true);
+  assert.equal(questAutoSurfaceMatches(withMedia, payload), true);
+  withMedia.embeds[0].footer = { text: 'Questshop Surface • QUEST_AUTO' };
+  assert.equal(questAutoSurfaceMatches(withMedia, payload), false);
 });
