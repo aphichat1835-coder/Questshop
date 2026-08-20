@@ -37,24 +37,30 @@ Questshop คือบอท Discord สำหรับรับทำ Discord Q
 Maintenance worker ปัจจุบันรันประมาณทุก **60 วินาที** ดังนั้นการแก้ราคาบนข้อความเดิมเป็น automatic eventual refresh,
 ไม่ใช่ synchronous update ณ จังหวะกดปุ่มยืนยันราคา.
 
-### วิดีโอหน้าร้าน
+### GIF หน้าร้านภายใน Embed
 
-Quest Auto ใช้ไฟล์ต้นฉบับที่ Owner อัปโหลดไว้ตรงนี้:
+Quest Auto ใช้ GIF ที่แปลงจากวิดีโอเดโมที่ Owner ให้มาและเก็บไว้ตรงนี้:
 
 ```text
-src/discord/assets/videoplayback.mp4
+src/discord/assets/quest-auto-demo.gif
 ```
 
 Source contract:
 
 ```text
-Size    6,812,564 bytes
-SHA-256 0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+Size    9,190,692 bytes
+SHA-256 c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
 ```
 
-ก่อนส่งเข้า Discord บอทตรวจ size, MP4 `ftyp` marker และ SHA-256. ถ้าข้อความเดิมไม่มี `videoplayback.mp4`
-หรือยังมี attachment รุ่นเก่า ระบบจะ clear attachment เก่าแล้วอัปโหลดไฟล์นี้เข้า **ข้อความเดิม**.
-ถ้าอนาคตเปลี่ยน bytes ของวิดีโออย่างตั้งใจ ควรเปลี่ยน filename/version ด้วยเพื่อให้ Discord-side drift detection
+ก่อนส่งเข้า Discord บอทตรวจ size, GIF signature และ SHA-256. จากนั้นแนบไฟล์ไว้กับข้อความและให้ Rich Embed
+อ้างผ่าน `attachment://quest-auto-demo.gif` ทำให้ภาพเคลื่อนไหวอยู่ **ภายในกรอบ Embed** แทนการแสดง MP4
+เป็นก้อนวิดีโอแยกด้านบน.
+
+ถ้าข้อความเดิมยังมี MP4/attachment รุ่นเก่า ระบบจะ clear attachment เก่าแล้วแทนด้วย GIF บน **ข้อความเดิม**.
+Quest Auto ยังเอา footer เทคนิค `Questshop Surface • QUEST_AUTO` ออกจากหน้าที่ลูกค้าเห็น และใช้ stable
+Discord nonce เป็นตัวช่วยกู้ anchor; footer แบบเก่ายังคงเป็น migration fallback สำหรับข้อความรุ่นก่อนเท่านั้น.
+
+ถ้าอนาคตเปลี่ยน bytes ของ GIF อย่างตั้งใจ ควรเปลี่ยน filename/version ด้วยเพื่อให้ Discord-side drift detection
 บังคับแทน attachment เดิมได้ชัดเจน.
 
 ## กฎธุรกิจหลัก
@@ -205,7 +211,8 @@ docker build -t questshop:local .
 
 ## Live boundaries ที่ยังต้องพิสูจน์
 
-- Discord desktop/mobile playback ของ `videoplayback.mp4`, panel persistence และ price refresh จริง
+- Discord desktop/mobile rendering ของ `quest-auto-demo.gif` **ภายใน Embed**, panel persistence, removal of the old
+  technical footer และ price refresh จริง
 - TrueMoney success / ambiguous-after-send / schema drift
 - Video/Desktop Quest execution กับ Discord account จริง
 - Aiven TLS/role provisioning, inwcloud restart และ health endpoint
