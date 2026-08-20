@@ -34,21 +34,26 @@ Expected source contract:
 
 ```text
 Title    Discord Quest • Auto
-Video    src/discord/assets/videoplayback.mp4
-Size     6,812,564 bytes
-SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+GIF      src/discord/assets/quest-auto-demo.gif
+Embed    attachment://quest-auto-demo.gif
+Size     9,190,692 bytes
+SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+Footer   none visible to customer
 ```
 
 | Case | Discord Message ID / evidence | Expected outcome | Observed outcome | Owner approval |
 |---|---|---|---|---|
 | `/quest-auto` install/update | | one durable active anchor | | |
-| Desktop video playback | | `videoplayback.mp4` plays correctly | | |
-| Mobile video playback | | same uploaded video plays correctly | | |
+| Desktop GIF rendering | | `quest-auto-demo.gif` animates inside Rich Embed | | |
+| Mobile GIF rendering | | same GIF animates inside Rich Embed | | |
+| Standalone media regression | | no MP4/video block appears above storefront | | |
+| Technical footer regression | | no `Questshop Surface • QUEST_AUTO` visible footer | | |
 | Equal GAME/VIDEO price | | one amount, e.g. `5 บาท` | | |
 | Different GAME/VIDEO price | | min-max range, e.g. `5-7 บาท` | | |
 | Price refresh timing | | same message updates within ~60s Maintenance window | | |
-| Restart | | no duplicate anchor/video attachment | | |
-| Legacy/missing video | | same anchor replaces stale attachment with `videoplayback.mp4` | | |
+| Restart | | no duplicate anchor/GIF attachment | | |
+| Legacy/missing media | | same anchor replaces stale attachment with `quest-auto-demo.gif` | | |
+| Legacy footer migration | | old footer anchor migrates without duplicate panel | | |
 | Deleted anchor | | exactly one replacement becomes authoritative | | |
 | Discord 403 | | incident/pointer preserved; no permission auto-repair | | |
 
