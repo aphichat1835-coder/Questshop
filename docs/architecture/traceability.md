@@ -13,12 +13,12 @@ Current status remains **implemented-but-unverified**.
 | Pricing / promotion | pricing resolver, Admin config service | exact-satang + category/promotion tests | Owner Admin pricing UAT |
 | Quest Auto dynamic price | `configuredQuestPriceRange`, price-change event, surface renderer/reconcile | equal/range/incomplete/stale-price/immediate-refresh tests | visible live price refresh |
 | Quest Auto embedded GIF | `src/discord/assets/quest-auto-demo.gif`, `quest-auto-media.js` | exact size/GIF/hash + stale attachment/embed tests | desktop/mobile in-embed animation |
-| Quest new reward/lifetime/media | normalizer, catalog revision merge, `quest-new.js` | Orb/tier/media/current-revision tests | real Quest reward/time/artwork fidelity |
-| Catalog / Monitor gate | catalog, discovery/test workers, contract pinning | Monitor-gate + retest + fingerprint tests | real metadata drift / Monitor UAT |
+| Quest new reward/lifetime/media | normalizer, catalog revision merge, expiry/outbox guards, `quest-new.js` | Orb/tier/media/current-revision/expired-filter tests | real Quest reward/time/artwork + historical-scan fidelity |
+| Catalog / Monitor gate | catalog, discovery/test workers, contract pinning | Monitor-gate + expiry-stop + retest + fingerprint tests | real metadata drift / Monitor UAT |
 | Checkout / account lock | checkout domain + router | quote/session/account uniqueness tests | mobile checkout UAT |
 | Fair queue / Runner | runner domain, leases, executors | fairness/fencing/retry/atomic settlement tests | real Video/Desktop Quest |
 | Quest API recovery/rate limits | API client + shared coordinator | timeout/403/429/size/retry tests | real Discord REST behavior |
-| Outbox / Discord delivery | outbox domain/workers, transport | coalescing/fencing/403/404/429/DLQ tests | live Discord fault UAT |
+| Outbox / Discord delivery | outbox domain/workers, transport | expiry suppression + coalescing/fencing/403/404/429/DLQ tests | live Discord fault/expiry UAT |
 | Customer/Admin surfaces | commands/router/renderers/surfaces | route/session/payload/setup tests | Guild layout + mobile UI |
 | Admin / Manual Review | Admin/review services | auth/review/adjustment tests | Owner workflow UAT |
 | Backoffice privacy policy | startup/surface/outbox policy | no runtime human-visibility guard; Administrator startup test | Owner channel configuration |
@@ -88,15 +88,27 @@ filename or include an explicit attachment migration.
 - never treats an unrelated reward `quantity` as Discord Orbs;
 - keeps legacy untyped `orb_quantity` compatibility without accepting explicitly non-Orb reward types.
 
-### Lifetime and media normalization
+### Lifetime, expiry filtering and media normalization
 
-`src/quest-engine/schema/normalizer.js` + `src/domain/catalog/service.js`
+`src/quest-engine/schema/normalizer.js` + `src/domain/catalog/service.js` + `src/domain/catalog/test-gate.js` +
+`src/domain/outbox/service.js` + `src/workers/outbox-worker.js`
 
 - stores Discord Quest `starts_at` and `expires_at` as the customer-visible lifetime source;
+- Monitor discovery reconciles expiry before creating a test batch, so an already-expired Quest can remain in durable
+  history but consumes no Monitor test attempt and creates no public `QUEST_NEW` projection;
+- active test batches re-check the Quest deadline before choosing another Monitor, and an expired batch closes without
+  cycling credentials or generating an exhausted-monitor alert;
+- the common Outbox enqueue boundary refuses `QUEST_NEW` for an expired Quest regardless of whether the caller is
+  discovery, Maintenance, Admin or another future path;
+- first-time `QUEST_NEW` delivery re-checks expiry before Discord channel fetch/send. A queued notification that expires
+  during retry/backoff is recorded as suppressed, leaves `message_id` empty and does not mark the Quest `ANNOUNCED`;
 - static media resolution prefers `hero`, `quest_bar_hero`, selected-task video thumbnail, then `game_tile` for the large image;
 - the small image prefers game tile/logotype/theme variants, application icon, reward artwork, then a still video thumbnail;
 - playable video URLs are excluded from announcement media;
 - a complete newly observed payload is authoritative; previous image/reward presentation metadata is inherited only for a partial payload.
+
+Automated expiry evidence: `test/integration/expired-quest-filter.test.js` covers discovery, Maintenance enqueue,
+Outbox delivery-race suppression and Monitor-batch stop behavior.
 
 ### Customer-facing Quest renderer
 
