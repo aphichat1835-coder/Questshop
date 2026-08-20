@@ -47,20 +47,25 @@ customer responses, generic Admin UI, logs or other projections.
 
 ## Quest Auto media and storefront integrity
 
-The persistent `QUEST_AUTO` storefront uses one fixed bundled media file:
+The persistent `QUEST_AUTO` storefront uses one fixed bundled GIF:
 
 ```text
-src/discord/assets/videoplayback.mp4
-Size     6,812,564 bytes
-SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+src/discord/assets/quest-auto-demo.gif
+Size     9,190,692 bytes
+SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
 ```
 
-Before upload, runtime checks the exact byte length, MP4 `ftyp` marker and SHA-256 digest. A mismatch fails the media
-load rather than silently sending a different file.
+Before upload, runtime checks the exact byte length, GIF signature and SHA-256 digest. A mismatch fails the media load
+rather than silently sending a different file.
 
-The Discord-side reconciliation identifies the expected attachment by filename `videoplayback.mp4`. If the Owner
-intentionally replaces the video bytes in a future release, version/change the filename or provide an explicit
-attachment migration so a previously uploaded Discord attachment cannot be mistaken for the new source asset.
+The GIF is attached to the Discord message so the Rich Embed can reference `attachment://quest-auto-demo.gif`; the
+intended customer presentation is the animated image **inside the embed**, not a standalone MP4/video block. Quest Auto
+also removes the visible `Questshop Surface • QUEST_AUTO` technical footer. Durable recovery prefers the stable message
+nonce and retains legacy footer lookup only to migrate older anchors.
+
+Discord-side reconciliation requires the expected GIF attachment filename and an embed image. If the Owner intentionally
+replaces the GIF bytes in a future release, version/change the filename or provide an explicit attachment migration so
+a previously uploaded Discord attachment cannot be mistaken for the new source asset.
 
 `QUEST_AUTO` price text is derived from active supported `TYPE` rules; incomplete configuration renders a not-ready
 message rather than guessing a customer price. Surface reconciliation repairs stale presentation on the existing
@@ -128,7 +133,8 @@ Report immediately if you find:
 - queue/lease/fencing/restart-recovery bypass;
 - SQL injection, migration checksum bypass, Runtime DDL or TLS disablement;
 - unsafe Discord mention/URL rendering or duplicate persistent surfaces;
-- `QUEST_AUTO` media integrity bypass, incorrect customer price presentation or stale-video replacement failure;
+- `QUEST_AUTO` media integrity bypass, incorrect customer price presentation, GIF embed loss, visible legacy footer or
+  stale-media replacement failure;
 - `/statusz` authorization bypass or sensitive operational leakage.
 
 ## Known and accepted risks
