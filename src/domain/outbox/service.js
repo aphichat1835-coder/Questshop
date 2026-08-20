@@ -17,6 +17,14 @@ function outboxContext(event, actorId) {
   };
 }
 
+async function expiredQuestAnnouncement(client, { projectionType, aggregateType, aggregateId }) {
+  if (projectionType !== 'QUEST_NEW' || aggregateType !== 'QUEST') return false;
+  const quest = (await client.query(`SELECT sale_state='EXPIRED'
+      OR (expires_at IS NOT NULL AND expires_at<=clock_timestamp()) AS expired
+    FROM quests WHERE quest_id=$1`, [String(aggregateId)])).rows[0];
+  return quest?.expired === true;
+}
+
 export async function enqueueProjection(client, {
   projectionType,
   aggregateType,
@@ -27,6 +35,12 @@ export async function enqueueProjection(client, {
   notBefore = null,
   context,
 }) {
+  // Public Quest announcements are deny-by-expiry at the durable enqueue
+  // boundary as well as discovery. This catches maintenance/Admin/future call
+  // sites and prevents historical Discord Quest rows from ever becoming a
+  // first-time QUEST_NEW delivery after their deadline has passed.
+  if (await expiredQuestAnnouncement(client, { projectionType, aggregateType, aggregateId })) return null;
+
   const projectionId = uuidv7();
   const projection = (await client.query(`
     INSERT INTO message_projections(
