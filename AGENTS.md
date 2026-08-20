@@ -57,7 +57,8 @@ Primary references:
 - Owner-approved Thai copy mentioning Discord Orbs and Discord Token;
 - buttons **เริ่มทำเควส** and **เติมเงิน**;
 - dynamic active price summary derived from all four supported `TYPE` rules;
-- one exact bundled Owner-uploaded MP4 at `src/discord/assets/videoplayback.mp4`.
+- one exact bundled Owner-approved GIF at `src/discord/assets/quest-auto-demo.gif` rendered **inside the embed** via `attachment://quest-auto-demo.gif`;
+- no customer-visible `Questshop Surface • QUEST_AUTO` technical footer.
 
 Price presentation:
 
@@ -68,17 +69,22 @@ Price presentation:
 Media source contract:
 
 ```text
-Filename videoplayback.mp4
-Size     6,812,564 bytes
-SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+Filename quest-auto-demo.gif
+Size     9,190,692 bytes
+SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
 ```
 
-The runtime verifies size, MP4 `ftyp` and SHA-256 before upload. Surface reconciliation edits/recover the same durable
-message when the price text, title/description/footer or expected video filename drifts. The current Maintenance cadence
-is approximately 60 seconds, so Admin price changes are automatic eventual storefront updates, not a synchronous
-same-click guarantee. Do not invent a generic video subsystem.
+The runtime verifies size, GIF signature and SHA-256 before upload. The GIF is attached to the message only so the embed
+can reference it; it must not be presented as a separate MP4/video block above the storefront. Surface reconciliation
+edits/recovers the same durable message when price text, title/description, expected GIF attachment, embed image or the
+legacy visible technical footer drifts. Quest Auto recovery uses the stable surface nonce first and retains the old
+footer lookup only as a migration fallback for older messages.
 
-When intentionally changing the bundled MP4 in a future release, version/change the expected filename or add an
+The current Maintenance cadence is approximately 60 seconds, so Admin price changes are automatic eventual storefront
+updates, not a synchronous same-click guarantee. Do not reintroduce the standalone MP4 storefront layout or invent a
+generic video subsystem.
+
+When intentionally changing the bundled GIF in a future release, version/change the expected filename or add an
 explicit attachment migration so Discord cannot keep an older remote attachment under the same filename.
 
 ## 3. Architecture and state ownership
