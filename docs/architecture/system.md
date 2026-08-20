@@ -19,21 +19,25 @@ When all configured prices are equal, the storefront renders one value such as `
 it renders the minimum-to-maximum range such as `5-7 บาท`. If any supported TYPE price is missing, the storefront
 fails closed to `ค่าบริการยังไม่พร้อม` instead of inventing a price.
 
-The persistent storefront also carries one fixed Owner-approved MP4 asset at
-`src/discord/assets/videoplayback.mp4`. Before the runtime uploads that file it verifies the exact size
-`6,812,564` bytes, an MP4 `ftyp` container marker, and SHA-256
-`0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467`.
-The media is bundled source, not a generic video subsystem or external URL dependency.
+The persistent storefront carries one fixed Owner-approved GIF at `src/discord/assets/quest-auto-demo.gif`.
+Before upload the runtime verifies exact size `9,190,692` bytes, a valid GIF signature, and SHA-256
+`c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1`.
+The GIF is attached to the Discord message and the Rich Embed references `attachment://quest-auto-demo.gif`, so the
+animation appears inside the embed instead of as a standalone MP4/video block. The media is bundled source, not a
+generic video subsystem or external URL dependency.
 
-Surface reconciliation compares the stored anchor against the expected title/description/footer and the expected
-video filename. A stale price, missing video, old video filename, deleted anchor or config-version drift is repaired
-by editing/recovering the same durable surface. Reconciliation runs through the normal Maintenance worker, currently
-on an approximately 60-second cadence, and setup/restart can also heal the surface. It must not spam a second active
-Quest Auto panel.
+Quest Auto intentionally has no customer-visible `Questshop Surface • QUEST_AUTO` footer. Recovery prefers the stable
+surface nonce; legacy footer lookup remains only as a migration fallback for older messages.
 
-If the MP4 bytes are intentionally changed in a future release, change the expected media filename/version as well
-or explicitly clear the existing attachment during migration/UAT; Discord-side drift detection identifies the
-existing attachment by filename, while local source integrity is enforced by size/hash.
+Surface reconciliation compares the stored anchor against the expected title/description, expected GIF attachment,
+embed image and absence of the legacy visible footer. A stale price, missing/legacy media, deleted anchor or
+config-version drift is repaired by editing/recovering the same durable surface. Reconciliation runs through the
+normal Maintenance worker, currently on an approximately 60-second cadence, and setup/restart can also heal the
+surface. It must not spam a second active Quest Auto panel.
+
+If the GIF bytes are intentionally changed in a future release, change the expected media filename/version as well or
+explicitly clear the existing attachment during migration/UAT; Discord-side drift detection identifies the existing
+attachment by filename, while local source integrity is enforced by size/hash.
 
 PostgreSQL time controls money boundaries, expiry, lease ownership and retention. Application monotonic time
 is used only for latency. Runtime supports schema/engine N and N-1; breaking state migrations require drain.
