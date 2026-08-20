@@ -59,6 +59,13 @@ export function installResponseController(interaction, { onAcknowledged = () => 
       const current = acknowledgementOf(interaction);
       if (current !== ACKNOWLEDGEMENT.NONE) {
         if (current === method) return null;
+        // token_submit is pre-acknowledged with a real ephemeral progress
+        // message so Discord never shows the indefinite "thinking" state.
+        // Its legacy handler still calls deferReply(); treat only that exact
+        // transition as a harmless no-op while keeping all other double-acks
+        // fail-closed.
+        if (interaction.__questshopProgressAcknowledged
+          && current === ACKNOWLEDGEMENT.REPLY && method === ACKNOWLEDGEMENT.DEFER_REPLY) return null;
         throw new QuestshopError('INTERACTION_ALREADY_ACKNOWLEDGED', 'Interaction ถูกตอบรับแล้ว');
       }
       const normalized = normalizeInitialArguments(method, args);
@@ -77,6 +84,13 @@ export function installResponseController(interaction, { onAcknowledged = () => 
 export async function acknowledgeByContract(interaction, response) {
   if (response === 'UPDATE') return interaction.deferUpdate();
   if (response === 'REPLY') return interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (response === 'PROGRESS') {
+    interaction.__questshopProgressAcknowledged = true;
+    return interaction.reply({
+      content: 'กำลังตรวจบัญชีและค้นหา Quest ที่ยังใช้งานได้…',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
   return null;
 }
 
