@@ -4,6 +4,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { configuredQuestPriceRange, resolvePrice } from '../../src/domain/pricing/resolver.js';
 import { setQuestCategoryPrice } from '../../src/domain/admin/config-service.js';
 import { createContext } from '../../src/shared/correlation.js';
+import { APPLICATION_EVENTS, applicationEvents } from '../../src/shared/application-events.js';
 import { resolvePromotionBonus } from '../../src/domain/promotions/resolver.js';
 import { bangkokDayBounds } from '../../src/db/postgres-time.js';
 import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS, TEST_TRANSITIONS } from '../../src/domain/catalog/states.js';
@@ -48,14 +49,27 @@ test('new store resolves all four supported task types from two 5-baht categorie
   assert.deepEqual(await configuredQuestPriceRange(pool), { minCents: 500n, maxCents: 500n });
 });
 
-test('changing GAME price is atomic, versioned, never changes VIDEO, and updates the storefront range source', async (t) => {
+test('changing GAME price is atomic, versioned, emits after commit, never changes VIDEO, and updates the storefront range source', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const before = (await pool.query(`SELECT task_type,state_version FROM price_rules
     WHERE enabled=true AND rule_type='TYPE' AND task_type IN ('PLAY_ON_DESKTOP','PLAY_ON_DESKTOP_V2')`)).rows;
   const context = createContext({ actorType: 'ADMIN', actorId: 'price-admin', guildId: 'guild',
     idempotencyKey: `category-price:${uuidv7()}` });
+  const emitted = new Promise((resolve, reject) => {
+    applicationEvents.once(APPLICATION_EVENTS.QUEST_CATEGORY_PRICE_CHANGED, async (event) => {
+      try {
+        const committed = await resolvePrice(pool, { taskType: 'PLAY_ON_DESKTOP' });
+        resolve({ event, committed });
+      } catch (error) { reject(error); }
+    });
+  });
   await setQuestCategoryPrice({ category: 'GAME', amountCents: 750n,
     expectedVersions: Object.fromEntries(before.map((row) => [row.task_type, String(row.state_version)])) }, context, { pool });
+  const notification = await emitted;
+  assert.equal(notification.event.category, 'GAME');
+  assert.equal(notification.event.amountCents, 750n);
+  assert.equal(notification.event.traceId, context.traceId);
+  assert.equal(BigInt(notification.committed.amount_cents), 750n);
   for (const taskType of ['PLAY_ON_DESKTOP', 'PLAY_ON_DESKTOP_V2']) {
     assert.equal(BigInt((await resolvePrice(pool, { taskType })).amount_cents), 750n);
   }

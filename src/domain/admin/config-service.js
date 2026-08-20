@@ -9,6 +9,7 @@ import {
   taskTypesForQuestPriceCategory,
 } from '../pricing/categories.js';
 import { sanitizeRuntimeConfigValues } from '../../config/runtime-config.js';
+import { APPLICATION_EVENTS, applicationEvents } from '../../shared/application-events.js';
 
 export async function updateFeatureGate({ gate, enabled, reason, expectedVersion, release = null }, context, options = {}) {
   assertFeatureGate(gate);
@@ -45,7 +46,7 @@ export async function setQuestCategoryPrice({ category, amountCents, expectedVer
   if (!expectedVersions || taskTypes.some((taskType) => expectedVersions[taskType] == null)) {
     throw new TypeError('current Quest category price version is required');
   }
-  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+  const result = await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const before = (await client.query(`SELECT * FROM price_rules
       WHERE rule_type='TYPE' AND task_type = ANY($1::text[]) AND enabled=true
       FOR UPDATE`, [taskTypes])).rows;
@@ -75,6 +76,12 @@ export async function setQuestCategoryPrice({ category, amountCents, expectedVer
     });
     return { category: normalizedCategory, amountCents: amount, rules: rows, previousRules: before };
   });
+  applicationEvents.emit(APPLICATION_EVENTS.QUEST_CATEGORY_PRICE_CHANGED, {
+    category: result.category,
+    amountCents: result.amountCents,
+    traceId: context.traceId,
+  });
+  return result;
 }
 
 function validatePromotionTiers(tiers) {
