@@ -22,18 +22,20 @@ test('response controller converts deprecated ephemeral options and owns one ack
     (error) => error.code === 'INTERACTION_ALREADY_ACKNOWLEDGED');
 });
 
-test('Token progress contract sends an immediate ephemeral reply and legacy defer becomes a no-op', async () => {
+test('Token submit sends an immediate ephemeral progress reply and legacy defer becomes a no-op', async () => {
   const calls = [];
   const interaction = {
+    customId: 'qs:v1:token_submit:00000000-0000-0000-0000-000000000000',
     reply: async (options) => { calls.push(['reply', options]); },
     deferReply: async (options) => { calls.push(['deferReply', options]); },
   };
   installResponseController(interaction);
-  await acknowledgeByContract(interaction, 'PROGRESS');
+  await acknowledgeByContract(interaction, 'REPLY');
   assert.equal(acknowledgementOf(interaction), ACKNOWLEDGEMENT.REPLY);
   assert.deepEqual(calls, [['reply', {
     content: 'กำลังตรวจบัญชีและค้นหา Quest ที่ยังใช้งานได้…',
     flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
   }]]);
   assert.equal(await interaction.deferReply({ ephemeral: true }), null);
   assert.equal(calls.length, 1);
