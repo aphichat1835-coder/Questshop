@@ -19,15 +19,19 @@ keyrings or a full voucher URL in UAT evidence.
 - [ ] `/quest-auto` creates/updates exactly one durable storefront anchor.
 - [ ] Embed title is **Discord Quest • Auto**.
 - [ ] Description shows Discord Orbs and Discord Token guidance and the two expected buttons remain usable.
-- [ ] The message contains the Owner-uploaded `videoplayback.mp4` and plays in Discord desktop.
-- [ ] The same video plays in Discord mobile.
-- [ ] Deployed source asset corresponds to size `6,812,564` bytes and SHA-256
-      `0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467`.
+- [ ] The approved `quest-auto-demo.gif` animates **inside the Rich Embed** in Discord desktop.
+- [ ] The same GIF animates inside the embed in Discord mobile.
+- [ ] No standalone MP4/video block appears above the storefront.
+- [ ] No customer-visible `Questshop Surface • QUEST_AUTO` footer remains.
+- [ ] Deployed source asset corresponds to size `9,190,692` bytes and SHA-256
+      `c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1`.
 - [ ] With equal GAME/VIDEO pricing, storefront shows one amount (for example `5 บาท`).
 - [ ] Change one category price so GAME/VIDEO differ; the same storefront message updates to a min-max range
       (for example `5-7 บาท`) within the Maintenance reconciliation window, currently approximately 60 seconds.
 - [ ] Change the price back/equalize categories and verify the same message collapses back to one amount.
-- [ ] Restart runtime and confirm no duplicate Quest Auto panel or duplicate video attachment appears.
+- [ ] Restart runtime and confirm no duplicate Quest Auto panel or duplicate GIF attachment appears.
+- [ ] Remove/corrupt the expected GIF attachment in the test Guild and verify reconciliation repairs the same message.
+- [ ] Confirm legacy Quest Auto messages with the old technical footer can be migrated without creating a duplicate anchor.
 - [ ] Delete the Quest Auto message in the test Guild, rerun/reconcile, and verify exactly one replacement becomes authoritative.
 - [ ] Simulate/fix Discord 403 without letting the bot modify channel permission overwrites automatically.
 
