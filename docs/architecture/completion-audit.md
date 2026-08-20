@@ -69,6 +69,37 @@ Live boundary: real Discord desktop/mobile GIF rendering inside the embed, remov
 visible price refresh within the Maintenance window, restart/setup repair and no duplicate panel must still be verified
 on one exact Git SHA.
 
+## Quest announcement contract
+
+Source: `src/quest-engine/schema/normalizer.js`, `src/domain/catalog/service.js`,
+`src/discord/renderers/quest-new.js`, `src/discord/renderers/projections.js`.
+
+- Customer-facing Quest announcements display Quest **start** (`starts_at`) and **expiry** (`expires_at`) times. They do
+  not expose the scanner detection time or the mutable PostgreSQL `updated_at` value as customer copy.
+- Discord Orb rewards are read from virtual-currency reward entries (`type = 4`, `orb_quantity`). `ALL` reward sets sum
+  their Orb entries. `TIERED` reward sets with different values are represented as a range instead of pretending one
+  exact amount applies to every tier. Non-Orb `quantity` values are never re-labelled as Orbs.
+- The selected task's static video thumbnail is considered before legacy top-level video metadata. Video file URLs are
+  never embedded as the Quest artwork.
+- Large artwork prefers Quest `hero`, then `quest_bar_hero`, then a still video thumbnail, then `game_tile`.
+- The small thumbnail prefers game tile/logotype/theme variants, application icon, reward artwork, then a still video
+  thumbnail. Identical large/small URLs are not duplicated in one embed.
+- Complete newly observed metadata is authoritative. Older presentation metadata may be inherited only while processing
+  a partial Quest payload. The renderer reads thumbnail/reward presentation metadata from the exact
+  `current_metadata_revision`, so a removed image cannot silently reappear from an older revision.
+- `QUEST_NEW` has one rendering implementation: the generic projection registry and Outbox delivery both route to
+  `renderQuestNewProjection()`.
+
+Automated evidence:
+
+- `test/unit/quest-normalizer.test.js`
+- `test/unit/quest-new-renderer.test.js`
+- catalog/Monitor integration tests exercising durable metadata revisions and discovery reconciliation.
+
+Live boundary: at least one real current Discord Quest must confirm Orb value, start/expiry timestamps and available
+static Quest artwork on desktop/mobile. If a real tiered Quest is available, verify the displayed range against its
+payload. Missing assets must remain missing rather than being invented.
+
 ## Requirement matrix
 
 | Area | Primary implementation | Automated evidence | Live boundary |
@@ -79,6 +110,7 @@ on one exact Git SHA.
 | TrueMoney | adapter, payment worker/service | canonical URL/schema/ambiguity/crash tests | real low-value + ambiguous UAT |
 | Pricing / promotions | pricing resolver, Admin config service | category + promotion integration tests | Owner Admin pricing UAT |
 | Quest Auto storefront | renderer, surface setup/reconcile, exact GIF | price/media/surface tests | in-embed animation + visible refresh |
+| Quest new announcement | normalizer, catalog metadata, Quest renderer | Orb/media/current-revision renderer tests | real Quest reward/time/artwork UAT |
 | Catalog / Monitor | catalog, discovery/test workers | Monitor gate, contract-pinning tests | live metadata drift + Monitor UAT |
 | Checkout | checkout domain + router | session/quote/account-lock tests | mobile Discord UAT |
 | Runner | runner service, executors, leases/fencing | crash/retry/atomic settlement tests | live supported Quest execution |
@@ -91,8 +123,7 @@ on one exact Git SHA.
 
 ## Automated evidence status
 
-The latest completed source gate before the GIF layout switch passed the full repository gate. The final GIF-layout SHA
-must pass the same gate again before its automated evidence is considered current:
+Every candidate source SHA must pass the same repository gate before its automated evidence is current:
 
 - `npm run check`
 - `npm run lint`
@@ -102,17 +133,19 @@ must pass the same gate again before its automated evidence is considered curren
 - `npm audit --audit-level=high`
 - Docker build
 
-These results prove source contracts only. They do not prove provider/live behavior.
+The exact passing Git SHA and workflow run belong in release/UAT evidence. A previous green SHA never substitutes for the
+candidate being deployed. These results prove source contracts only; they do not prove provider/live behavior.
 
 ## Explicit non-claims
 
 Do not represent these as completed without controlled live evidence:
 
 1. production Discord login/registration, mobile layout, GIF-in-embed animation and live persistent-surface recovery;
-2. real TrueMoney redemption and post-send ambiguous resolution;
-3. real supported Video/Desktop Quest execution;
-4. managed PostgreSQL TLS/least-privilege provisioning and recovery operation;
-5. same-SHA Owner closeout, rollback rehearsal and alert delivery.
+2. real Quest announcement Orb/start/expiry/artwork fidelity against a current live Quest payload;
+3. real TrueMoney redemption and post-send ambiguous resolution;
+4. real supported Video/Desktop Quest execution;
+5. managed PostgreSQL TLS/least-privilege provisioning and recovery operation;
+6. same-SHA Owner closeout, rollback rehearsal and alert delivery.
 
 ## Release state
 

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { renderQuestNewProjection } from '../../src/discord/renderers/quest-new.js';
 import { renderProjectionForDelivery } from '../../src/workers/outbox-worker.js';
+import { renderProjection } from '../../src/discord/renderers/projections.js';
 
 function questRow(overrides = {}) {
   return {
@@ -10,6 +11,7 @@ function questRow(overrides = {}) {
     task_type: 'PLAY_ON_DESKTOP',
     task_target: 900,
     orbs: 750,
+    orb_reward: null,
     price_cents: 700,
     url: 'https://discord.com/quests/quest-1',
     starts_at: '2026-08-18T17:00:00.000Z',
@@ -45,6 +47,27 @@ test('Quest announcement shows Orbs, Quest lifetime, and two static Quest images
   assert.equal(embed.thumbnail.url, row.thumbnail_url);
 });
 
+test('Quest announcement renders tiered Orb rewards as a truthful range', async () => {
+  const body = await renderQuestNewProjection(poolWithQuest(questRow({
+    orbs: null,
+    orb_reward: { mode: 'TIERED', minOrbs: 250, maxOrbs: 750, values: [250, 750] },
+  })), { projection_type: 'QUEST_NEW', aggregate_id: 'quest-1' });
+  assert.match(body.embeds[0].data.description, /รางวัล:\*\* 250-750 Orbs \(ตาม Tier\)/);
+});
+
+test('Quest announcement reads presentation metadata only from the current durable revision', async () => {
+  let sql = '';
+  const pool = {
+    query: async (query) => {
+      sql = String(query);
+      return { rows: [questRow()] };
+    },
+  };
+  await renderQuestNewProjection(pool, { projection_type: 'QUEST_NEW', aggregate_id: 'quest-1' });
+  assert.match(sql, /m\.revision=q\.current_metadata_revision/);
+  assert.doesNotMatch(sql, /ORDER BY m\.revision DESC/);
+});
+
 test('Quest announcement omits missing media instead of inventing artwork', async () => {
   const body = await renderQuestNewProjection(poolWithQuest(questRow({
     artwork_url: null, thumbnail_url: null,
@@ -64,12 +87,14 @@ test('Quest announcement renderer keeps one image when the two media URLs are id
   assert.equal(embed.thumbnail, undefined);
 });
 
-test('outbox routes QUEST_NEW through the renovated announcement renderer', async () => {
-  const body = await renderProjectionForDelivery(poolWithQuest(questRow()), {
-    projection_type: 'QUEST_NEW', aggregate_id: 'quest-1',
-  });
-  assert.match(body.embeds[0].data.description, /เริ่ม Quest/);
-  assert.doesNotMatch(body.embeds[0].data.description, /อัปเดต/);
+test('generic projection registry and outbox delivery both use the renovated Quest announcement', async () => {
+  const projection = { projection_type: 'QUEST_NEW', aggregate_id: 'quest-1' };
+  const generic = await renderProjection(poolWithQuest(questRow()), projection);
+  const delivery = await renderProjectionForDelivery(poolWithQuest(questRow()), projection);
+  for (const body of [generic, delivery]) {
+    assert.match(body.embeds[0].data.description, /เริ่ม Quest/);
+    assert.doesNotMatch(body.embeds[0].data.description, /ตรวจพบ|อัปเดต/);
+  }
 });
 
 test('Quest announcement missing-row fallback remains safe', async () => {

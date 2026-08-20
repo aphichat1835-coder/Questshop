@@ -13,6 +13,7 @@ Current status remains **implemented-but-unverified**.
 | Pricing / promotion | pricing resolver, Admin config service | exact-satang + category/promotion tests | Owner Admin pricing UAT |
 | Quest Auto dynamic price | `configuredQuestPriceRange`, surface renderer/reconcile | equal/range/incomplete/stale-price tests | visible live price refresh |
 | Quest Auto embedded GIF | `src/discord/assets/quest-auto-demo.gif`, `quest-auto-media.js` | exact size/GIF/hash + stale attachment/embed tests | desktop/mobile in-embed animation |
+| Quest new reward/lifetime/media | normalizer, catalog revision merge, `quest-new.js` | Orb/tier/media/current-revision tests | real Quest reward/time/artwork fidelity |
 | Catalog / Monitor gate | catalog, discovery/test workers, contract pinning | Monitor-gate + retest + fingerprint tests | real metadata drift / Monitor UAT |
 | Checkout / account lock | checkout domain + router | quote/session/account uniqueness tests | mobile checkout UAT |
 | Fair queue / Runner | runner domain, leases, executors | fairness/fencing/retry/atomic settlement tests | real Video/Desktop Quest |
@@ -70,6 +71,39 @@ SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
 Runtime verifies exact size, GIF signature and SHA-256 before upload. The attachment exists to back the Rich Embed image;
 it is not intended as a standalone MP4/video block. Future intentional media replacement should version/change the
 filename or include an explicit attachment migration.
+
+## Quest new announcement trace detail
+
+### Reward normalization
+
+`src/quest-engine/schema/normalizer.js`
+
+- uses `orb_quantity` from Discord virtual-currency reward entries (`type = 4`);
+- sums Orb entries for `assignment_method = 1` (`ALL`);
+- preserves min/max for `assignment_method = 2` (`TIERED`) and does not collapse different tiers into a false exact value;
+- never treats an unrelated reward `quantity` as Discord Orbs;
+- keeps legacy untyped `orb_quantity` compatibility without accepting explicitly non-Orb reward types.
+
+### Lifetime and media normalization
+
+`src/quest-engine/schema/normalizer.js` + `src/domain/catalog/service.js`
+
+- stores Discord Quest `starts_at` and `expires_at` as the customer-visible lifetime source;
+- static media resolution prefers `hero`, `quest_bar_hero`, selected-task video thumbnail, then `game_tile` for the large image;
+- the small image prefers game tile/logotype/theme variants, application icon, reward artwork, then a still video thumbnail;
+- playable video URLs are excluded from announcement media;
+- a complete newly observed payload is authoritative; previous image/reward presentation metadata is inherited only for a partial payload.
+
+### Customer-facing Quest renderer
+
+`src/discord/renderers/quest-new.js` + `src/discord/renderers/projections.js`
+
+- displays **เริ่ม Quest** from `starts_at` and **หมดอายุ** from `expires_at`;
+- omits scanner **ตรวจพบ**, **อัปเดต**, and the mutable embed footer timestamp;
+- shows exact Orbs when exact, or an Orb range for a multi-value tiered reward;
+- reads presentation metadata only from `quests.current_metadata_revision`, preventing an older removed thumbnail from reappearing;
+- supports at most one large embed image plus one distinct thumbnail and invents no artwork when Discord provides none;
+- generic projection rendering and Outbox delivery use the same `renderQuestNewProjection()` implementation.
 
 ## Completion labels
 

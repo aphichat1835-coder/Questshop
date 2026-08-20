@@ -35,6 +35,31 @@ keyrings or a full voucher URL in UAT evidence.
 - [ ] Delete the Quest Auto message in the test Guild, rerun/reconcile, and verify exactly one replacement becomes authoritative.
 - [ ] Simulate/fix Discord 403 without letting the bot modify channel permission overwrites automatically.
 
+## Quest new announcement UAT
+
+Use a newly discovered real Quest after deploying the exact candidate SHA. Compare the public announcement with the
+same Quest payload/evidence; do not infer values from another bot or a screenshot alone.
+
+- [ ] Title remains **🎉 พบ Quest ใหม่: ...** and contains no customer/account/Token identity.
+- [ ] **ประเภท** matches the selected supported task event.
+- [ ] **เป้าหมาย** matches the selected task target from the Quest payload.
+- [ ] **รางวัล** matches Discord virtual-currency `orb_quantity`; an unrelated reward `quantity` is never shown as Orbs.
+- [ ] If a real `ALL` Orb reward has multiple Orb entries, the displayed exact amount equals their sum.
+- [ ] If a real multi-value `TIERED` Orb reward is available, the announcement shows its min-max Orb range rather than one tier as universal.
+- [ ] **ค่าบริการ** matches the latest enabled TYPE rule for the Quest task type.
+- [ ] **ดู Quest ได้ที่นี่** opens the intended Discord Quest URL.
+- [ ] **เริ่ม Quest** matches Discord `starts_at`, not scanner discovery time.
+- [ ] **หมดอายุ** matches Discord `expires_at`.
+- [ ] Customer copy contains no **ตรวจพบ**, **อัปเดต**, or mutable `updated_at` embed timestamp.
+- [ ] When Discord provides a usable `hero`/`quest_bar_hero`, the large embed image is the real Quest static artwork.
+- [ ] When a selected video task provides a still thumbnail under its task assets, the still image may be used but no MP4/WebM/video URL is embedded as artwork.
+- [ ] When Discord provides a distinct game tile/logotype/application/reward static asset, the embed may show it as the small thumbnail.
+- [ ] One identical URL is never duplicated as both the large image and thumbnail.
+- [ ] A Quest with no usable static media remains without invented artwork.
+- [ ] After a complete newer payload removes a previous thumbnail, re-rendering does not resurrect that thumbnail from an older metadata revision.
+- [ ] A genuinely partial payload may retain prior durable presentation metadata until a complete payload becomes authoritative again.
+- [ ] Generic projection rendering and Outbox delivery produce the same renovated Quest announcement contract.
+
 ## Financial proof
 
 - [ ] Real low-value TrueMoney success: `REDEEMED → CREDITED` exactly once.

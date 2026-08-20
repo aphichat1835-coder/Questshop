@@ -4,12 +4,11 @@ import { supportCode } from '../../shared/correlation.js';
 import {
   orderStateIcon,
   orderStateLabel,
-  questTargetLabel,
-  questTypeLabel,
   reservationStateLabel,
   terminalReasonLabel,
 } from './labels.js';
 import { baht } from './checkout.js';
+import { renderQuestNewProjection } from './quest-new.js';
 import { DISCORD_LIMITS, safeDiscordText, truncateDiscordText } from '../payload.js';
 
 const color = { pending: 0xf0b232, success: 0x23a55a, failure: 0xf23f43, info: 0x5865f2 };
@@ -31,10 +30,6 @@ function safeHttpsUrl(value) {
 function setSafeThumbnail(embed, value) {
   const url = safeHttpsUrl(value);
   if (url) embed.setThumbnail(url);
-}
-function setSafeImage(embed, value) {
-  const url = safeHttpsUrl(value);
-  if (url) embed.setImage(url);
 }
 function missingProjection(message) {
   return { embeds: [new EmbedBuilder().setColor(color.info).setTitle(title(message))], allowedMentions: noMentions };
@@ -167,31 +162,6 @@ async function renderPaymentLog(pool, projection, { env, client }) {
     .setTitle(title(logTitle)).setDescription(boundedDescription(description)).setTimestamp(topup.updated_at);
   if (user) setSafeThumbnail(embed, user.displayAvatarURL({ size: 128 }));
   return { embeds: [embed], allowedMentions: { users: [topup.discord_user_id], parse: [] } };
-}
-
-async function renderQuestNew(pool, projection) {
-  const quest = (await pool.query(`SELECT q.*,resolved.amount_cents AS price_cents FROM quests q
-    LEFT JOIN LATERAL (SELECT p.amount_cents FROM price_rules p
-      WHERE p.enabled=true AND p.rule_type='TYPE' AND p.task_type=q.task_type
-      ORDER BY p.created_at DESC LIMIT 1) resolved ON true WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
-  if (!quest) return { embeds: [new EmbedBuilder().setColor(color.info).setTitle('ไม่พบข้อมูล Quest ใหม่')], allowedMentions: noMentions };
-  const price = quest.price_cents == null ? 'ยังไม่กำหนด' : baht(quest.price_cents);
-  const questUrl = safeHttpsUrl(quest.url);
-  const description = [
-    `**ประเภท:** ${questTypeLabel(quest.task_type)}`,
-    `**เป้าหมาย:** ${questTargetLabel(quest.task_type, quest.task_target)}`, `**รางวัล:** ${quest.orbs ?? 'ไม่ระบุ'} Orbs`,
-    `**ค่าบริการ:** ${price}`,
-    questUrl ? `**[ดู Quest ได้ที่นี่](${questUrl})**` : null,
-    '',
-    `**ตรวจพบ:** ${timestamp(quest.detected_at)}`, `**อัปเดต:** ${timestamp(quest.updated_at, 'R')}`,
-    `**หมดอายุ:** ${timestamp(quest.expires_at)}`,
-  ].filter(Boolean).join('\n');
-  const questTitle = title(`🎉 พบ Quest ใหม่: ${escape(quest.name)}`);
-  const embed = new EmbedBuilder().setColor(color.info).setTitle(questTitle)
-    .setDescription(boundedDescription(description)).setTimestamp(quest.updated_at);
-  if (questUrl) embed.setURL(questUrl);
-  setSafeImage(embed, quest.artwork_url);
-  return { embeds: [embed], allowedMentions: noMentions };
 }
 
 async function renderQuestOperation(pool, projection) {
@@ -386,7 +356,7 @@ function renderFallback(_pool, projection) {
 
 const renderers = {
   REFUND_LOG: renderRefund, TOPUP_RECEIPT: renderTopupReceipt, ORDER_DM: renderOrderDm,
-  PAYMENT_LOG: renderPaymentLog, PAYMENT_STATUS_LOG: renderPaymentLog, QUEST_NEW: renderQuestNew,
+  PAYMENT_LOG: renderPaymentLog, PAYMENT_STATUS_LOG: renderPaymentLog, QUEST_NEW: renderQuestNewProjection,
   QUEST_OPERATION: renderQuestOperation, MANUAL_REVIEW: renderManualReview, RUNNER_SUMMARY: renderRunnerSummary,
   CHECKOUT_AUDIT: renderCheckoutAudit, SYSTEM_INCIDENT: renderIncident, ADMIN_AUDIT: renderAdminAudit,
   QUEST_HISTORY: renderQuestHistory, CUSTOMER_QUEST_DISCOVERY: renderCustomerQuestDiscovery,

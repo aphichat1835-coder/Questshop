@@ -36,6 +36,25 @@ test('normalizer reads Discord Orbs from virtual-currency reward objects', () =>
   };
   const quest = normalizeQuest(raw);
   assert.equal(quest.orbs, 750);
+  assert.deepEqual(quest.orbReward, {
+    mode: 'ALL', minOrbs: 750, maxOrbs: 750, values: [750],
+  });
+});
+
+test('normalizer preserves tiered Discord Orbs as a range instead of inventing one exact reward', () => {
+  const raw = payload({ event_name: 'WATCH_VIDEO', target: 60 });
+  raw.config.rewards_config = {
+    assignment_method: 2,
+    rewards: [
+      { type: 4, orb_quantity: 250 },
+      { type: 4, orb_quantity: 750 },
+    ],
+  };
+  const quest = normalizeQuest(raw);
+  assert.equal(quest.orbs, null);
+  assert.deepEqual(quest.orbReward, {
+    mode: 'TIERED', minOrbs: 250, maxOrbs: 750, values: [250, 750],
+  });
 });
 
 test('normalizer never mistakes non-Orb reward quantity for Discord Orbs', () => {
@@ -43,6 +62,7 @@ test('normalizer never mistakes non-Orb reward quantity for Discord Orbs', () =>
   raw.config.rewards_config = { assignment_method: 1, rewards: [{ type: 5, quantity: 7 }] };
   const quest = normalizeQuest(raw);
   assert.equal(quest.orbs, null);
+  assert.equal(quest.orbReward, null);
 });
 
 test('normalizer resolves Quest CDN images and ignores video assets for announcement media', () => {
@@ -63,16 +83,31 @@ test('normalizer resolves Quest CDN images and ignores video assets for announce
   assert.doesNotMatch(quest.thumbnailUrl, /\.mp4/);
 });
 
-test('normalizer can use the still thumbnail from Quest video assets without embedding the video', () => {
-  const raw = payload({ event_name: 'WATCH_VIDEO', target: 60 });
-  raw.config.video_assets = {
-    video: { url: 'https://cdn.discordapp.com/assets/quests/quest-normalizer/video.mp4',
-      thumbnail: 'https://cdn.discordapp.com/assets/quests/quest-normalizer/video-thumb.jpg' },
-  };
+test('normalizer reads the still thumbnail from the selected task assets without embedding video', () => {
+  const raw = payload({
+    event_name: 'WATCH_VIDEO', target: 60,
+    assets: {
+      video: {
+        url: 'https://cdn.discordapp.com/assets/quests/quest-normalizer/video.mp4',
+        thumbnail: 'https://cdn.discordapp.com/assets/quests/quest-normalizer/video-thumb.jpg',
+      },
+    },
+  });
   const quest = normalizeQuest(raw);
   assert.equal(quest.artworkUrl,
     'https://cdn.discordapp.com/assets/quests/quest-normalizer/video-thumb.jpg');
   assert.equal(quest.thumbnailUrl, null);
+  assert.doesNotMatch(quest.artworkUrl, /\.mp4/);
+});
+
+test('normalizer keeps legacy top-level video thumbnail compatibility as a fallback', () => {
+  const raw = payload({ event_name: 'WATCH_VIDEO', target: 60 });
+  raw.config.video_assets = {
+    video: { thumbnail: 'https://cdn.discordapp.com/assets/quests/quest-normalizer/legacy-thumb.jpg' },
+  };
+  const quest = normalizeQuest(raw);
+  assert.equal(quest.artworkUrl,
+    'https://cdn.discordapp.com/assets/quests/quest-normalizer/legacy-thumb.jpg');
 });
 
 test('contract fingerprint changes when the executable progress contract changes', () => {

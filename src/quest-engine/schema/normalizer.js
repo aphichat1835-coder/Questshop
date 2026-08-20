@@ -68,21 +68,39 @@ function questRewards(config) {
   return configured.length ? configured : claimed;
 }
 
-function rewardOrbs(config) {
+function orbReward(config) {
   const rewards = questRewards(config);
-  const orbRewards = rewards.filter((reward) => Number(reward?.type) === 4)
+  const typed = rewards.filter((reward) => Number(reward?.type) === 4)
     .map((reward) => nonNegativeInteger(reward?.orb_quantity)).filter((value) => value != null);
-  if (orbRewards.length) {
-    if (Number(config.rewards_config?.assignment_method) === 1) {
-      return orbRewards.reduce((total, amount) => total + amount, 0);
-    }
-    return orbRewards[0];
+  const untyped = rewards.filter((reward) => reward?.type == null)
+    .map((reward) => nonNegativeInteger(reward?.orb_quantity)).filter((value) => value != null);
+  const values = typed.length ? typed : untyped;
+  const fallback = nonNegativeInteger(config.reward?.orbs) ?? nonNegativeInteger(config.orb_quantity);
+  if (!values.length) {
+    return fallback == null
+      ? { orbs: null, orbReward: null }
+      : { orbs: fallback, orbReward: { mode: 'SINGLE', minOrbs: fallback, maxOrbs: fallback, values: [fallback] } };
   }
-  const schemaFallback = rewards.map((reward) => nonNegativeInteger(reward?.orb_quantity))
-    .find((value) => value != null);
-  return schemaFallback
-    ?? nonNegativeInteger(config.reward?.orbs)
-    ?? nonNegativeInteger(config.orb_quantity);
+
+  const assignmentMethod = Number(config.rewards_config?.assignment_method);
+  if (assignmentMethod === 1) {
+    const total = values.reduce((sum, amount) => sum + amount, 0);
+    return { orbs: total, orbReward: { mode: 'ALL', minOrbs: total, maxOrbs: total, values } };
+  }
+
+  const unique = [...new Set(values)].sort((left, right) => left - right);
+  const minOrbs = unique[0];
+  const maxOrbs = unique[unique.length - 1];
+  if (assignmentMethod === 2) {
+    return {
+      orbs: unique.length === 1 ? minOrbs : null,
+      orbReward: { mode: 'TIERED', minOrbs, maxOrbs, values: unique },
+    };
+  }
+  return {
+    orbs: unique.length === 1 ? minOrbs : null,
+    orbReward: { mode: unique.length === 1 ? 'SINGLE' : 'MULTIPLE', minOrbs, maxOrbs, values: unique },
+  };
 }
 
 function safeStaticHttpsUrl(value) {
@@ -115,23 +133,29 @@ function applicationIcon(config) {
   return `https://cdn.discordapp.com/app-icons/${encodeURIComponent(String(applicationId))}/${encodeURIComponent(icon.trim())}.png`;
 }
 
-function videoThumbnail(config) {
-  const assets = config.video_assets ?? config.videoAssets;
+function videoThumbnail(id, config, taskDefinition) {
+  const taskAssets = taskDefinition?.assets ?? {};
+  const legacyAssets = config.video_assets ?? config.videoAssets ?? {};
   const candidates = [
-    assets?.video?.thumbnail,
-    assets?.video_low_res?.thumbnail,
-    assets?.video_hls?.thumbnail,
+    taskAssets?.video?.thumbnail,
+    taskAssets?.video_low_res?.thumbnail,
+    taskAssets?.video_hls?.thumbnail,
+    taskAssets?.thumbnail,
+    legacyAssets?.video?.thumbnail,
+    legacyAssets?.video_low_res?.thumbnail,
+    legacyAssets?.video_hls?.thumbnail,
   ];
-  return candidates.map(safeStaticHttpsUrl).find(Boolean) ?? null;
+  return candidates.map((value) => questAssetUrl(id, value)).find(Boolean) ?? null;
 }
 
-function questMedia(id, config) {
+function questMedia(id, config, taskDefinition) {
   const assets = config.assets ?? {};
   const rewardAsset = questRewards(config).map((reward) => reward?.asset).find(Boolean);
+  const stillVideoThumbnail = videoThumbnail(id, config, taskDefinition);
   const heroCandidates = [
     questAssetUrl(id, assets.hero),
     questAssetUrl(id, assets.quest_bar_hero),
-    videoThumbnail(config),
+    stillVideoThumbnail,
     questAssetUrl(id, assets.game_tile),
   ].filter(Boolean);
   const artworkUrl = heroCandidates[0] ?? null;
@@ -144,7 +168,7 @@ function questMedia(id, config) {
     questAssetUrl(id, assets.logotype_light, 'light'),
     applicationIcon(config),
     questAssetUrl(id, rewardAsset),
-    videoThumbnail(config),
+    stillVideoThumbnail,
   ].filter((url) => url && url !== artworkUrl);
   return { artworkUrl, thumbnailUrl: thumbnailCandidates[0] ?? null };
 }
@@ -206,7 +230,8 @@ export function normalizeQuest(raw, options = {}) {
   const startsAt = config.starts_at ?? null;
   const expiresAt = config.expires_at ?? null;
   const url = questUrl(id, config);
-  const media = questMedia(id, config);
+  const media = questMedia(id, config, task.definition);
+  const reward = orbReward(config);
   const normalized = {
     id,
     name: config.messages?.quest_name ?? config.messages?.quest_title ?? id,
@@ -225,7 +250,8 @@ export function normalizeQuest(raw, options = {}) {
     completedAt: status.completed_at ?? null,
     completed: Boolean(status.completed_at),
     claimed: Boolean(status.claimed_at) || status.orb_quantity_claimed != null,
-    orbs: rewardOrbs(config),
+    orbs: reward.orbs,
+    orbReward: reward.orbReward,
     artworkUrl: media.artworkUrl,
     thumbnailUrl: media.thumbnailUrl,
     url,

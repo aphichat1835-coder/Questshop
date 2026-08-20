@@ -29,6 +29,12 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Surface regression coverage for stale price detection, stale/legacy attachment replacement, invisible nonce-based
   Quest Auto anchor recovery, removal of the legacy visible technical footer, and exact GIF verification.
 - Pricing integration coverage proving storefront price-range source changes when the GAME category price changes.
+- Quest-new reward normalization for Discord virtual-currency `orb_quantity`, including truthful min-max display for
+  multi-value tiered rewards instead of claiming one tier applies to everyone.
+- Quest-new static media fallback using Quest Hero/Game Tile/Logotype/application/reward assets and selected-task still
+  video thumbnails, while excluding playable video URLs.
+- Regression coverage proving current metadata-revision authority: partial payloads may inherit prior presentation
+  metadata, while a later complete payload can remove an old image/reward without stale resurrection.
 
 ### Changed
 
@@ -43,8 +49,14 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Automatic price/media healing is driven by the normal Maintenance reconciliation path, currently approximately once
   per 60 seconds, plus setup/restart repair. This is eventual automatic refresh rather than a synchronous same-click
   price update guarantee.
-- Documentation is synchronized across README, engineering/security contracts, architecture, deployment, runbooks,
-  traceability, Definition of Done and UAT evidence so source behavior and live boundaries use the same wording.
+- Quest-new customer announcements now show Discord Quest **เริ่ม Quest** (`starts_at`) and **หมดอายุ** (`expires_at`)
+  instead of scanner **ตรวจพบ** / mutable **อัปเดต** timestamps.
+- `QUEST_NEW` now has one customer-facing renderer source: generic projection rendering and Outbox delivery both route
+  to `renderQuestNewProjection()`.
+- Quest presentation metadata is read from the exact current durable revision; an older non-null thumbnail is no longer
+  selected merely because the current complete revision removed it.
+- Documentation is synchronized across engineering contracts, traceability and UAT evidence so Quest Auto and Quest-new
+  source behavior and live boundaries use the same wording.
 - Discord response controller preserves `ModalBuilder` instances and persistent interaction sessions bind to their
   rendered message before controls become usable.
 - Backoffice authorization uses `OWNER_ID` or current Discord `Administrator` permission at every interaction instead
@@ -61,6 +73,7 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Human-visibility/privacy preflight around backoffice setup and Payment Log delivery, per explicit Owner policy.
 - Legacy generic branding overrides for the fixed Quest Auto title/description.
 - Legacy Base64/re-encoded Quest Auto demo derivative and standalone MP4 storefront presentation.
+- The legacy duplicated Quest-new renderer that could still format `ตรวจพบ` / `อัปเดต` independently of Outbox delivery.
 
 ### Security
 
@@ -68,23 +81,13 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Money remains integer satang; Wallet/Ledger settlement paths retain serializable/idempotent/fencing protections.
 - Logger/Discord boundaries retain secret redaction and deny-by-default mentions.
 - Full TrueMoney voucher-link rendering remains the narrow `LOG_PAYMENTS` exception only.
+- Quest reward parsing ignores explicitly non-Orb reward quantities instead of mislabelling them as Discord Orbs.
 
 ### Automated evidence
 
-The latest completed source gate before this GIF layout change passed syntax/check, lint, PostgreSQL-backed coverage,
-LCOV upload, fake-adapter load test, `npm audit --audit-level=high` and Docker build. A fresh gate must pass again on the
-final GIF-layout SHA before treating that SHA as verified source evidence.
+Every candidate Git SHA must freshly pass syntax/check, lint, PostgreSQL-backed coverage, LCOV upload,
+fake-adapter load test, `npm audit --audit-level=high` and Docker build. Record the exact passing workflow run with UAT;
+a previous green SHA is not evidence for a newer candidate.
 
-These are source/CI results only. Discord GIF rendering, visible price refresh, TrueMoney, live Quest execution,
-Aiven/inwcloud restart and Owner UAT remain live evidence boundaries.
-
-### Known live boundaries
-
-- Verify `quest-auto-demo.gif` animates inside the Quest Auto embed in real Discord desktop/mobile clients and that no
-  standalone MP4 block or `Questshop Surface • QUEST_AUTO` footer remains visible.
-- Change Admin GAME/VIDEO pricing and confirm the same `QUEST_AUTO` message refreshes within the Maintenance window
-  without a duplicate panel.
-- Verify restart/setup repair of stale/missing Quest Auto media on the live Guild.
-- Complete TrueMoney success/ambiguity/schema-drift UAT.
-- Complete supported Video/Desktop Quest UAT and Discord-account risk review.
-- Verify managed PostgreSQL TLS/roles, inwcloud restart, rollback rehearsal and Owner pre-launch closeout on one SHA.
+These are source/CI results only. Discord GIF rendering, Quest reward/start/expiry/artwork fidelity, visible price refresh,
+TrueMoney, live Quest execution, Aiven/inwcloud restart and Owner UAT remain live evidence boundaries.

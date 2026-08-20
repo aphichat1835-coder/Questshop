@@ -61,11 +61,17 @@ function requiresRetest(previousQuest, normalized) {
   return previousQuest.current_contract_hash !== normalized.contractHash;
 }
 
+async function loadCurrentMetadataRevision(client, quest) {
+  if (!quest || Number(quest.current_metadata_revision) <= 0) return null;
+  return (await client.query(`SELECT normalized FROM quest_metadata_revisions
+    WHERE quest_id=$1 AND revision=$2`, [quest.quest_id, quest.current_metadata_revision])).rows[0]?.normalized ?? null;
+}
+
 // A Monitor can see a partial Quest payload while another active account sees
-// the complete contract.  Merge only absent core fields from the durable
-// revision; never invent values.  A complete, newly observed payload still
-// wins so contract/executor changes trigger the normal retest path.
-function mergeDiscoveryMetadata(previousQuest, normalized) {
+// the complete contract. Merge only absent fields from durable data; never
+// invent values. A complete, newly observed payload stays authoritative so
+// removed artwork/reward metadata does not leak forward from an older revision.
+function mergeDiscoveryMetadata(previousQuest, normalized, previousMetadata = null) {
   if (!previousQuest || normalized.coreComplete) return normalized;
   const merged = {
     ...normalized,
@@ -76,7 +82,9 @@ function mergeDiscoveryMetadata(previousQuest, normalized) {
     expiresAt: normalized.expiresAt ?? previousQuest.expires_at,
     url: normalized.url ?? previousQuest.url,
     artworkUrl: normalized.artworkUrl ?? previousQuest.artwork_url,
+    thumbnailUrl: normalized.thumbnailUrl ?? previousMetadata?.thumbnailUrl ?? null,
     orbs: normalized.orbs ?? previousQuest.orbs,
+    orbReward: normalized.orbReward ?? previousMetadata?.orbReward ?? null,
     executorId: normalized.eventName === 'UNKNOWN_SCHEMA' ? previousQuest.executor_id : normalized.executorId,
   };
   merged.coreComplete = Boolean(merged.id && merged.eventName && Number(merged.secondsNeeded) > 0
@@ -124,16 +132,16 @@ async function upsertQuest(client, normalized) {
 
 async function recordMetadataRevision(client, quest, normalized, source, redactedRaw, context) {
   const revision = Number(quest.current_metadata_revision) + 1;
-    await client.query(`
+  await client.query(`
       INSERT INTO quest_metadata_revisions(
         id, quest_id, revision, normalized, redacted_raw, source,
         core_complete, schema_issues, contract_hash, contract_complete, trace_id
       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     `, [
-      uuidv7(), quest.quest_id, revision, normalized, redactedRaw ?? normalized,
-      source, normalized.coreComplete, normalized.compatibilityIssues, normalized.contractHash,
-      normalized.contractComplete, context.traceId,
-    ]);
+    uuidv7(), quest.quest_id, revision, normalized, redactedRaw ?? normalized,
+    source, normalized.coreComplete, normalized.compatibilityIssues, normalized.contractHash,
+    normalized.contractComplete, context.traceId,
+  ]);
   const updatedQuest = (await client.query(`
       UPDATE quests SET current_metadata_revision = $2 WHERE quest_id = $1 RETURNING *
     `, [quest.quest_id, revision])).rows[0];
@@ -175,12 +183,12 @@ async function queueDiscoveryProjections(client, quest, revision, context, sourc
     ? (await client.query("SELECT clock_timestamp()+interval '30 seconds' AS value")).rows[0].value
     : null;
   if (shouldPublish) await enqueueProjection(client, {
-      projectionType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: quest.quest_id,
-      aggregateVersion: revision, surfaceKey: 'QUEST_NEW', notBefore: announcementNotBefore, context,
+    projectionType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: quest.quest_id,
+    aggregateVersion: revision, surfaceKey: 'QUEST_NEW', notBefore: announcementNotBefore, context,
   });
   await enqueueProjection(client, {
-      projectionType: 'QUEST_OPERATION', aggregateType: 'QUEST', aggregateId: quest.quest_id,
-      aggregateVersion: revision, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
+    projectionType: 'QUEST_OPERATION', aggregateType: 'QUEST', aggregateId: quest.quest_id,
+    aggregateVersion: revision, surfaceKey: 'LOG_QUEST_OPERATIONS', context,
   });
 }
 
@@ -193,7 +201,8 @@ export async function ingestDiscovery({
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const previousQuest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
       [normalized.id])).rows[0] ?? null;
-    const merged = mergeDiscoveryMetadata(previousQuest, normalized);
+    const previousMetadata = await loadCurrentMetadataRevision(client, previousQuest);
+    const merged = mergeDiscoveryMetadata(previousQuest, normalized, previousMetadata);
     const needsRetest = requiresRetest(previousQuest, merged);
     let quest = await upsertQuest(client, merged);
     const metadata = await recordMetadataRevision(client, quest, merged, source, redactedRaw, context);

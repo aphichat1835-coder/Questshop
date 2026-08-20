@@ -20,18 +20,51 @@ function safeHttpsUrl(value) {
   }
 }
 
+function nonNegativeInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}
+
+function parsedOrbReward(value) {
+  if (!value) return null;
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function rewardLabel(quest) {
+  const reward = parsedOrbReward(quest.orb_reward);
+  const minOrbs = nonNegativeInteger(reward?.minOrbs);
+  const maxOrbs = nonNegativeInteger(reward?.maxOrbs);
+  if (reward?.mode === 'TIERED' && minOrbs != null && maxOrbs != null && minOrbs !== maxOrbs) {
+    return `${minOrbs}-${maxOrbs} Orbs (ตาม Tier)`;
+  }
+  const exact = nonNegativeInteger(quest.orbs);
+  if (exact != null) return `${exact} Orbs`;
+  if (minOrbs != null && maxOrbs != null) {
+    return minOrbs === maxOrbs ? `${minOrbs} Orbs` : `${minOrbs}-${maxOrbs} Orbs`;
+  }
+  return 'ไม่ระบุ Orbs';
+}
+
 export async function renderQuestNewProjection(pool, projection) {
   const quest = (await pool.query(`SELECT q.*,resolved.amount_cents AS price_cents,
-    media.thumbnail_url
+    media.thumbnail_url,media.orb_reward
     FROM quests q
     LEFT JOIN LATERAL (SELECT p.amount_cents FROM price_rules p
       WHERE p.enabled=true AND p.rule_type='TYPE' AND p.task_type=q.task_type
       ORDER BY p.created_at DESC LIMIT 1) resolved ON true
     LEFT JOIN LATERAL (
-      SELECT m.normalized->>'thumbnailUrl' AS thumbnail_url
+      SELECT m.normalized->>'thumbnailUrl' AS thumbnail_url,
+        m.normalized->'orbReward' AS orb_reward
       FROM quest_metadata_revisions m
-      WHERE m.quest_id=q.quest_id AND NULLIF(m.normalized->>'thumbnailUrl','') IS NOT NULL
-      ORDER BY m.revision DESC LIMIT 1
+      WHERE m.quest_id=q.quest_id AND m.revision=q.current_metadata_revision
+      LIMIT 1
     ) media ON true
     WHERE q.quest_id=$1`, [projection.aggregate_id])).rows[0];
   if (!quest) {
@@ -44,7 +77,7 @@ export async function renderQuestNewProjection(pool, projection) {
   const description = [
     `**ประเภท:** ${questTypeLabel(quest.task_type)}`,
     `**เป้าหมาย:** ${questTargetLabel(quest.task_type, quest.task_target)}`,
-    `**รางวัล:** ${quest.orbs ?? 'ไม่ระบุ'} Orbs`,
+    `**รางวัล:** ${rewardLabel(quest)}`,
     `**ค่าบริการ:** ${price}`,
     questUrl ? `**[ดู Quest ได้ที่นี่](${questUrl})**` : null,
     '',
