@@ -36,9 +36,9 @@ test('Quest announcement shows Orbs, Quest lifetime, and two static Quest images
   const expiryUnix = Math.floor(Date.parse(row.expires_at) / 1000);
 
   assert.match(embed.title, /พบ Quest ใหม่/);
-  assert.match(embed.description, /รางวัล:\*\* 750 Orbs/);
-  assert.match(embed.description, new RegExp(`เริ่ม Quest:\*\* <t:${startUnix}:F>`));
-  assert.match(embed.description, new RegExp(`หมดอายุ:\*\* <t:${expiryUnix}:F>`));
+  assert.ok(embed.description.includes('**รางวัล:** 750 Orbs'));
+  assert.ok(embed.description.includes(`**เริ่ม Quest:** <t:${startUnix}:F>`));
+  assert.ok(embed.description.includes(`**หมดอายุ:** <t:${expiryUnix}:F>`));
   assert.doesNotMatch(embed.description, /ตรวจพบ|อัปเดต/);
   assert.equal(embed.timestamp, undefined);
   assert.equal(embed.image.url, row.artwork_url);
