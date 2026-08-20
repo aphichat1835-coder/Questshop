@@ -12,7 +12,7 @@ Current status remains **implemented-but-unverified**.
 | TrueMoney / voucher identity | TrueMoney adapter, payment service/worker | URL/schema/HMAC/ambiguity/replay/crash tests | real low-value + ambiguous UAT |
 | Pricing / promotion | pricing resolver, Admin config service | exact-satang + category/promotion tests | Owner Admin pricing UAT |
 | Quest Auto dynamic price | `configuredQuestPriceRange`, surface renderer/reconcile | equal/range/incomplete/stale-price tests | visible live price refresh |
-| Quest Auto exact MP4 | `src/discord/assets/videoplayback.mp4`, `quest-auto-media.js` | exact size/container/hash + stale attachment tests | desktop/mobile playback |
+| Quest Auto embedded GIF | `src/discord/assets/quest-auto-demo.gif`, `quest-auto-media.js` | exact size/GIF/hash + stale attachment/embed tests | desktop/mobile in-embed animation |
 | Catalog / Monitor gate | catalog, discovery/test workers, contract pinning | Monitor-gate + retest + fingerprint tests | real metadata drift / Monitor UAT |
 | Checkout / account lock | checkout domain + router | quote/session/account uniqueness tests | mobile checkout UAT |
 | Fair queue / Runner | runner domain, leases, executors | fairness/fencing/retry/atomic settlement tests | real Video/Desktop Quest |
@@ -35,7 +35,9 @@ Current status remains **implemented-but-unverified**.
 - title is fixed to **Discord Quest • Auto**;
 - approved description mentions Discord Orbs and Discord Token;
 - `questAutoPriceRangeLabel()` renders one price or a min-max range;
-- incomplete supported price configuration renders a not-ready price line.
+- incomplete supported price configuration renders a not-ready price line;
+- embed image is `attachment://quest-auto-demo.gif`;
+- no customer-visible `Questshop Surface • QUEST_AUTO` footer is rendered.
 
 ### Pricing source
 
@@ -50,22 +52,24 @@ Current status remains **implemented-but-unverified**.
 `src/discord/surfaces/setup.js`
 
 - keeps one durable `QUEST_AUTO` anchor;
-- compares expected title/description/footer and expected media filename;
+- compares expected title/description, expected GIF attachment, embed-image presence and absence of the legacy visible footer;
 - stale price or missing/legacy media causes an edit/recovery of the same message;
+- stable nonce lookup is the primary invisible-anchor recovery path; footer lookup is migration fallback only;
 - confirmed missing Discord message may be recreated; permission/network failures preserve the pointer and incident evidence;
 - current Maintenance worker runs this reconciliation approximately every 60 seconds.
 
 ### Exact bundled media
 
-`src/discord/surfaces/quest-auto-media.js` + `src/discord/assets/videoplayback.mp4`
+`src/discord/surfaces/quest-auto-media.js` + `src/discord/assets/quest-auto-demo.gif`
 
 ```text
-Size     6,812,564 bytes
-SHA-256  0a09d0088a30cc90722af5c1602b4335853246a28ccd46d321cc7c5b64efa467
+Size     9,190,692 bytes
+SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
 ```
 
-Runtime verifies exact size, MP4 `ftyp` marker and SHA-256 before upload.
-Future intentional media replacement should version/change the filename or include an explicit attachment migration.
+Runtime verifies exact size, GIF signature and SHA-256 before upload. The attachment exists to back the Rich Embed image;
+it is not intended as a standalone MP4/video block. Future intentional media replacement should version/change the
+filename or include an explicit attachment migration.
 
 ## Completion labels
 
