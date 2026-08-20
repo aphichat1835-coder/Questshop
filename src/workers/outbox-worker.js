@@ -166,6 +166,14 @@ async function loadActiveSurface(pool, projection) {
   return surface;
 }
 
+async function suppressExpiredQuestAnnouncement(pool, projection) {
+  if (projection?.projection_type !== 'QUEST_NEW' || projection.message_id) return false;
+  const quest = (await pool.query(`SELECT sale_state='EXPIRED'
+      OR (expires_at IS NOT NULL AND expires_at<=clock_timestamp()) AS expired
+    FROM quests WHERE quest_id=$1`, [projection.aggregate_id])).rows[0];
+  return quest?.expired === true;
+}
+
 async function resolveChannel(client, projection, surface) {
   const channel = projection.surface_key.startsWith('DM:')
     ? await (await client.users.fetch(projection.surface_key.slice(3))).createDM()
@@ -225,6 +233,17 @@ export async function processOutbox({ holder, client, pool, env, renderProjectio
       : null;
     if (!projection) {
       await recordDelivery({ outboxId: event.id, holder, fencingToken: event.fencing_token }, { pool });
+      return true;
+    }
+    // A Quest can expire after it was queued but before Discord delivery
+    // (for example during Retry-After/backoff). Never create the first public
+    // message after the deadline; close the durable outbox event without
+    // marking the Quest as announced so a later authoritative extension can
+    // still publish normally.
+    if (await suppressExpiredQuestAnnouncement(pool, projection)) {
+      heartbeat.assertOwned();
+      await recordDelivery({ outboxId: event.id, holder, fencingToken: event.fencing_token,
+        suppressQuestAnnouncement: true }, { pool });
       return true;
     }
     if (!(await claimOrderDmAttempt(pool, event, projection))) {
