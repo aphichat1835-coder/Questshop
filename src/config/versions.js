@@ -19,5 +19,9 @@ export function isRunnerVersionCompatible(value) {
     && supported.contract === value.contract_version
     && supported.stateSchema === Number(value.runner_state_schema_version ?? 1));
 }
-export const MIN_COMPATIBLE_SCHEMA_VERSION = 1;
-export const MAX_COMPATIBLE_SCHEMA_VERSION = 13;
+// Runtime code depends on every migration through the current expand schema.
+// Deployment applies migrations before starting the all-in-one process, so a
+// partially migrated database must fail readiness instead of failing later in
+// a payment/runner worker.
+export const MIN_COMPATIBLE_SCHEMA_VERSION = 28;
+export const MAX_COMPATIBLE_SCHEMA_VERSION = 28;

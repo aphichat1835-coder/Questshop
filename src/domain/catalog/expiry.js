@@ -17,7 +17,7 @@ export async function runtimeEstimateMs(client, quest) {
   return remainingSeconds * 1000 + STATIC_OVERHEAD_MS;
 }
 
-export async function estimatedQueueWaitMs(client, runnerConcurrency = 3) {
+export async function estimatedQueueWaitMs(client, runnerConcurrency = 2) {
   const result = await client.query(`
     SELECT COALESCE(sum(
       GREATEST(0, COALESCE(q.task_target, 0) * (1 - i.progress_actual / 100)) * 1000
@@ -33,14 +33,24 @@ export async function estimatedQueueWaitMs(client, runnerConcurrency = 3) {
 
 export async function evaluateExpiryAdmission(client, {
   quest,
-  runnerConcurrency = 3,
+  runnerConcurrency = 2,
   now = null,
 }) {
+  const startsAt = Date.parse(quest.starts_at ?? quest.startsAt);
   const expiresAt = Date.parse(quest.expires_at ?? quest.expiresAt);
   const databaseNow = now ?? (await client.query(
     'SELECT clock_timestamp() AS value',
   )).rows[0].value;
   const current = Date.parse(databaseNow);
+  // New catalog/checkout admission requires starts_at. Older prelaunch jobs
+  // may legitimately lack it, so do not strand an already-reserved N-1 job.
+  if (Number.isFinite(startsAt) && startsAt > current) {
+    // remainingMs is always time remaining before expiry. Returning null here
+    // lets generic consumers accidentally classify this as expired.
+    return { eligible: false, reason: 'QUEST_NOT_STARTED',
+      remainingMs: Number.isFinite(expiresAt) ? expiresAt - current : null,
+      availableAt: new Date(startsAt).toISOString() };
+  }
   if (!Number.isFinite(expiresAt)) return { eligible: false, reason: 'EXPIRY_MISSING' };
   const [runtimeMs, queueWaitMs] = await Promise.all([
     runtimeEstimateMs(client, quest),

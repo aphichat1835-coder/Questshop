@@ -8,5 +8,9 @@ Top-up: `RECEIVED → VALIDATING → PAYMENT_QUEUED → PROCESSING`; success sep
 `CREDITED`. Uncertain mutations enter Owner-only manual review. Order item success ends at
 `READY_TO_CLAIM`; released terminal states refund wallet credit. There is no automatic claim transition.
 
+Runner rate limits are explicit: a leased/running job may enter `WAITING_RATE_LIMIT` with the
+provider `Retry-After` deadline, then recovery moves it back through `QUEUED`; ordinary transient
+failures use `WAITING_RETRY` and full-jitter backoff.
+
 Outbox: `PENDING → LEASED → DELIVERED | RETRY_WAIT | DEAD_LETTER`. Financial and audit DLQ records
 cannot be discarded.

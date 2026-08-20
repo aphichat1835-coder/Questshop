@@ -10,8 +10,11 @@ export async function runRetention({ pool }) {
     const ledgerDeleted = Number((await client.query(
       'SELECT questshop_prune_wallet_ledger() AS count',
     )).rows[0].count);
-    await client.query(`DELETE FROM interaction_sessions WHERE id IN (SELECT id FROM interaction_sessions
-      WHERE state IN ('EXPIRED','CANCELLED','TERMINAL') AND updated_at<clock_timestamp()-interval '7 days' LIMIT 500)`);
+    await client.query(`WITH stale AS (SELECT id FROM interaction_sessions
+      WHERE state IN ('CONFIRMED','EXPIRED','CANCELLED','TERMINAL')
+        AND updated_at<clock_timestamp()-interval '7 days'
+      ORDER BY updated_at,id LIMIT 500 FOR UPDATE SKIP LOCKED)
+      DELETE FROM interaction_sessions AS session USING stale WHERE session.id=stale.id`);
     await client.query(`DELETE FROM topup_sensitive_payloads WHERE topup_id IN (SELECT p.topup_id
       FROM topup_sensitive_payloads p JOIN topups t ON t.id=p.topup_id
       WHERE p.log_delivered_at<clock_timestamp()-interval '7 days'

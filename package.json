@@ -5,22 +5,33 @@
   "type": "module",
   "main": "src/index.js",
   "engines": {
-    "node": ">=22.12.0 <23"
+    "node": ">=22.22.0 <23"
   },
   "scripts": {
+    "setup": "node scripts/setup.js",
+    "setup:init": "node scripts/setup.js",
+    "setup:verify": "node scripts/setup-verify.js",
+    "setup:preflight": "node scripts/setup-preflight.js",
+    "setup:export-secret-bundle": "node scripts/export-secret-bundle.js",
+    "keys:adopt": "node scripts/adopt-keyring-sentinels.js",
+    "keys:retire:verify": "node scripts/verify-key-retirement.js",
+    "db:verify-roles": "node scripts/verify-postgres-roles.js",
+    "deploy": "npm run setup:verify && npm run migrate && npm run register",
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "register": "node scripts/register-commands.js",
     "migrate": "node scripts/migrate.js",
     "backup": "node scripts/backup.js",
+    "backup:reconcile": "node scripts/reconcile-backups.js",
     "restore:drill": "node scripts/restore-drill.js",
     "prelaunch:closeout": "node scripts/prelaunch-closeout.js",
     "load:test": "node scripts/load-test.js",
     "check": "find src scripts test -type f -name '*.js' -print0 | xargs -0 -n1 node --check",
     "lint": "eslint src scripts test",
-    "test": "node --test --test-concurrency=1 test/*/*.test.js",
+    "test": "node scripts/test-files.js",
+    "test:coverage": "node scripts/test-files.js --coverage && node scripts/check-coverage.js",
     "test:unit": "node --test test/unit/*.test.js",
-    "test:integration": "node --test --test-concurrency=1 test/{integration,concurrency,crash}/*.test.js",
+    "test:integration": "node scripts/test-files.js test/integration test/concurrency test/crash",
     "verify": "npm run check && npm run lint && npm test"
   },
   "dependencies": {

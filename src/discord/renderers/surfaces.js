@@ -2,14 +2,24 @@ import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, StringSelectMenuBuilder,
 } from 'discord.js';
 import { customId } from '../components/custom-id.js';
+import { adminCategoryOptions } from './admin.js';
+import { DISCORD_LIMITS, truncateDiscordText } from '../payload.js';
 
 const COLORS = Object.freeze({ primary: 0x5865f2, success: 0x23a55a, warning: 0xf0b232, danger: 0xf23f43 });
 
+function safeHttpsUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'https:' && url.toString().length <= 512 ? url.toString() : null;
+  } catch { return null; }
+}
+
 export function renderQuestAuto(config = {}) {
   const embed = new EmbedBuilder().setColor(COLORS.primary)
-    .setTitle(config.title ?? 'Discord Quest — ทำเควสอัตโนมัติ')
-    .setDescription(config.description ?? 'เติมเครดิต เลือกเควส และติดตามผลได้จากแผงนี้\nระบบจะจองยอดก่อน และคิดเงินจริงเฉพาะเควสที่สำเร็จ');
-  if (config.mediaUrl) embed.setImage(config.mediaUrl);
+    .setTitle(truncateDiscordText(config.title ?? 'Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
+    .setDescription(truncateDiscordText(config.description ?? 'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ\n**ค่าบริการ 5 บาท / เควสสำเร็จ**\nใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ\nเลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ', DISCORD_LIMITS.embedDescription));
+  const mediaUrl = safeHttpsUrl(config.mediaUrl);
+  if (mediaUrl) embed.setImage(mediaUrl);
   return {
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(
@@ -21,17 +31,10 @@ export function renderQuestAuto(config = {}) {
 }
 
 export function renderAdminPanel() {
-  const options = [
-    ['overview', 'Overview'], ['gates', 'Store และ Feature Gates'], ['catalog', 'Quest Catalog'],
-    ['pricing', 'Pricing'], ['promotions', 'Promotions'], ['orders', 'Orders และ Runner'],
-    ['payments', 'Payments และ Manual Review'], ['wallet', 'Wallet / Refund / Adjustment'],
-    ['blocklist', 'Blocklist'], ['monitors', 'Monitor Accounts'], ['receivers', 'Receiver Versions'],
-    ['surfaces', 'Surfaces และ Permissions'], ['dlq', 'DLQ และ Incidents'], ['backup', 'Backup / Restore'],
-    ['branding', 'Branding / Config'], ['secrets', 'Secret/Key version status'],
-  ].map(([value, label]) => ({ value, label }));
+  const options = adminCategoryOptions();
   return {
-    embeds: [new EmbedBuilder().setColor(COLORS.primary).setTitle('Questshop Admin Panel')
-      .setDescription('เลือกหมวดเพื่อเปิดแผงควบคุมแบบ Ephemeral\nการกระทำที่มีผลต่อเงินต้องมีเหตุผลและยืนยันซ้ำทุกครั้ง')],
+    embeds: [new EmbedBuilder().setColor(COLORS.primary).setTitle('แผงควบคุม Questshop')
+      .setDescription('เลือกหมวดที่ต้องการจัดการจากเมนูด้านล่าง\nรายการที่มีผลต่อเงินจะให้ตรวจสอบและยืนยันซ้ำทุกครั้ง')],
     components: [new ActionRowBuilder().addComponents(
       new StringSelectMenuBuilder().setCustomId(customId('admin')).setPlaceholder('เลือกหมวดการตั้งค่า').addOptions(options),
     )],
@@ -43,12 +46,12 @@ export function renderSurfaceAnchor(surfaceKey, config = {}) {
   if (surfaceKey === 'QUEST_AUTO') return renderQuestAuto(config.branding);
   if (surfaceKey === 'ADMIN_PANEL') return renderAdminPanel();
   const names = {
-    QUEST_NEW: 'Quest ใหม่', QUEST_HISTORY: 'ประวัติการทำ Quest', LOG_PAYMENTS: 'Payment Logs',
-    LOG_QUEST_OPERATIONS: 'Quest Operations', LOG_ADMIN: 'Admin Audit', LOG_SYSTEM: 'System Incidents',
+    QUEST_NEW: 'Quest ใหม่', QUEST_HISTORY: 'ประวัติการทำ Quest', LOG_PAYMENTS: 'บันทึกการเติมเงิน',
+    LOG_QUEST_OPERATIONS: 'บันทึกการทำ Quest', LOG_ADMIN: 'บันทึกการทำงานของแอดมิน', LOG_SYSTEM: 'เหตุขัดข้องของระบบ',
   };
   return {
-    embeds: [new EmbedBuilder().setColor(COLORS.primary).setTitle(names[surfaceKey] ?? surfaceKey)
-      .setDescription('ข้อความหลักของห้องนี้บริหารโดย Questshop และจะถูกอัปเดตแบบ Durable Outbox')],
+    embeds: [new EmbedBuilder().setColor(COLORS.primary).setTitle(truncateDiscordText(names[surfaceKey] ?? surfaceKey, DISCORD_LIMITS.embedTitle))
+      .setDescription('Questshop ดูแลข้อความในห้องนี้และกู้การแจ้งเตือนที่ค้างอยู่ให้อัตโนมัติหลังระบบเริ่มใหม่')],
     allowedMentions: { parse: [] },
   };
 }

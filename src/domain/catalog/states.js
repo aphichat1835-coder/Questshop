@@ -16,11 +16,13 @@ export const SALE_TRANSITIONS = Object.freeze({
 });
 
 export const TEST_TRANSITIONS = Object.freeze({
-  TEST_QUEUED: ['TESTING'],
-  TESTING: ['TEST_PASSED', 'TEST_FAILED', 'MANUAL_REVIEW'],
+  TEST_QUEUED: ['TESTING', 'TEST_FAILED'],
+  // A test that has not performed a Quest mutation may be deferred until its
+  // start window / expiry admission is safe.  It is intentionally distinct
+  // from retrying a failed mutation.
+  TESTING: ['TEST_QUEUED', 'TEST_PASSED', 'TEST_FAILED', 'MANUAL_REVIEW'],
   TEST_PASSED: ['RETEST_REQUIRED'],
   TEST_FAILED: ['RETEST_REQUIRED', 'TEST_QUEUED'],
   MANUAL_REVIEW: ['TEST_QUEUED'],
   RETEST_REQUIRED: ['TEST_QUEUED'],
 });
-

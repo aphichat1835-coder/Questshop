@@ -13,6 +13,8 @@ COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_dump /usr/local/bin/pg_dump
 COPY --from=pgtools /usr/lib/postgresql/16/bin/pg_restore /usr/local/bin/pg_restore
 WORKDIR /app
 ENV NODE_ENV=production
+ENV PG_DUMP_PATH=/usr/local/bin/pg_dump
+ENV PG_RESTORE_PATH=/usr/local/bin/pg_restore
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json ./
 COPY migrations ./migrations

@@ -1,18 +1,29 @@
 import pino from 'pino';
-import { redact } from './redaction.js';
+import { redact, redactText } from './redaction.js';
 
-export function createLogger(bindings = {}) {
-  const base = pino({
+function safeMessage(message) {
+  return typeof message === 'string' ? redactText(message) : message;
+}
+
+function safeFields(object) {
+  return redact(object ?? {});
+}
+
+export function createLogger(bindings = {}, destination = null) {
+  const options = {
     level: process.env.LOG_LEVEL ?? 'info',
-    base: { service: 'questshop', ...bindings },
+    base: redact({ service: 'questshop', ...bindings }),
     redact: {
       paths: ['*.token', '*.authorization', '*.cookie', '*.password', '*.secret', '*.ciphertext'],
       censor: '[REDACTED]',
     },
-  });
-  const wrap = (level) => (object, message) => base[level](redact(object ?? {}), message);
+  };
+  const base = destination == null ? pino(options) : pino(options, destination);
   return Object.freeze({
-    debug: wrap('debug'), info: wrap('info'), warn: wrap('warn'), error: wrap('error'),
-    child: (child) => createLogger({ ...bindings, ...child }),
+    debug: (object, message) => base.debug(safeFields(object), safeMessage(message)),
+    info: (object, message) => base.info(safeFields(object), safeMessage(message)),
+    warn: (object, message) => base.warn(safeFields(object), safeMessage(message)),
+    error: (object, message) => base.error(safeFields(object), safeMessage(message)),
+    child: (child) => createLogger({ ...bindings, ...child }, destination),
   });
 }

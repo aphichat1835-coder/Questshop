@@ -1,79 +1,207 @@
+import { createHash } from 'node:crypto';
 import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
 import { appendAdminAudit } from '../../domain/admin/audit.js';
+import { reconcileIncident } from '../../domain/incidents/service.js';
+import { fetchDiscordMessage, findDiscordMessage, isMissingDiscordMessage } from '../transport.js';
+import { normalizeDiscordPayload } from '../payload.js';
 
-const PRIVATE = new Set(['LOG_PAYMENTS', 'LOG_QUEST_OPERATIONS', 'LOG_ADMIN', 'LOG_SYSTEM', 'ADMIN_PANEL']);
+// Setup commands can be issued concurrently from two Discord interactions.
+// The runtime is intentionally all-in-one, so a keyed promise lock prevents
+// two anchors for the same durable surface from being created in one process.
+const surfaceSetupLocks = new Map();
+
+async function withSurfaceSetupLock(surfaceKey, work) {
+  const previous = surfaceSetupLocks.get(surfaceKey) ?? Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const queued = previous.then(() => current);
+  surfaceSetupLocks.set(surfaceKey, queued);
+  await previous;
+  try {
+    return await work();
+  } finally {
+    release();
+    if (surfaceSetupLocks.get(surfaceKey) === queued) surfaceSetupLocks.delete(surfaceKey);
+  }
+}
 
 function surfacePayload(surfaceKey, config) {
   const body = renderSurfaceAnchor(surfaceKey, config?.values ?? config);
   body.embeds?.[0]?.setFooter?.({ text: `Questshop Surface • ${surfaceKey}` });
-  return body;
+  return normalizeDiscordPayload(body);
 }
 
 async function findSurfaceMarker(channel, surfaceKey) {
-  const messages = await channel.messages.fetch({ limit: 25 }).catch(() => null);
-  return messages?.find((message) => message.author?.id === channel.client.user?.id
-    && message.embeds?.[0]?.footer?.text === `Questshop Surface • ${surfaceKey}`) ?? null;
+  return findDiscordMessage(channel, (message) => message.author?.id === channel.client.user?.id
+    && message.embeds?.[0]?.footer?.text === `Questshop Surface • ${surfaceKey}`);
 }
 
-export async function setupSurface({ interaction, surfaceKey, config }, context, options = {}) {
+export async function fetchSurfaceMessageFresh(channel, messageId) {
+  return fetchDiscordMessage(channel, messageId);
+}
+
+export function surfaceNonce(surfaceKey) {
+  const readable = `surface-${surfaceKey.toLowerCase()}`;
+  if (readable.length <= 25) return readable;
+  const prefix = surfaceKey.toLowerCase().replaceAll('_', '').slice(0, 8);
+  const digest = createHash('sha256').update(surfaceKey).digest('hex').slice(0, 8);
+  return `surface-${prefix}-${digest}`;
+}
+
+export async function updateOrCreateSurfaceAnchor(channel, surfaceKey, config, existingMessage = null) {
+  const body = surfacePayload(surfaceKey, config);
+  let message = existingMessage;
+  if (message) {
+    try {
+      return { message: await message.edit(body), recreated: false };
+    } catch (error) {
+      if (!isMissingDiscordMessage(error)) throw error;
+    }
+  }
+  message = await findSurfaceMarker(channel, surfaceKey);
+  if (message) {
+    try {
+      return { message: await message.edit(body), recreated: false };
+    } catch (error) {
+      if (!isMissingDiscordMessage(error)) throw error;
+    }
+  }
+  const created = await channel.send({ ...body, nonce: surfaceNonce(surfaceKey), enforceNonce: true });
+  return { message: created, recreated: true };
+}
+
+async function setupSurfaceLocked({ interaction, surfaceKey, config }, context, options = {}) {
   const channel = interaction.options.getChannel('channel') ?? interaction.channel;
   if (!channel?.isTextBased() || channel.isDMBased()) {
     throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ต้องเลือกห้องข้อความในเซิร์ฟเวอร์');
   }
-  const member = await interaction.guild.members.fetchMe();
-  const permissions = channel.permissionsFor(member);
-  if (!permissions?.has(['ViewChannel', 'SendMessages', 'EmbedLinks', 'ReadMessageHistory'])) {
-    throw new QuestshopError('SURFACE_PERMISSION_MISSING', 'บอทไม่มีสิทธิ์ที่จำเป็นในห้องปลายทาง');
-  }
-  if (PRIVATE.has(surfaceKey) && channel.permissionsFor(interaction.guild.roles.everyone)?.has('ViewChannel')) {
-    throw new QuestshopError('PRIVATE_SURFACE_EXPOSED', 'ห้องหลังบ้านต้องปิด View Channel ของ @everyone ก่อน');
-  }
-  if (PRIVATE.has(surfaceKey)) {
-    const adminRoleId = config?.values?.adminRoleId;
-    const expected = new Set([interaction.guild.roles.everyone.id, member.id, interaction.client.user.id,
-      interaction.guild.ownerId, ...(adminRoleId ? [adminRoleId] : []), ...member.roles?.cache?.keys?.() ?? []]);
-    const unexpectedRole = [...interaction.guild.roles.cache.values()].find((role) =>
-      role.id !== interaction.guild.roles.everyone.id && !expected.has(role.id)
-      && channel.permissionsFor(role)?.has('ViewChannel'));
-    if (unexpectedRole) {
-      throw new QuestshopError('PRIVATE_SURFACE_EXPOSED', 'ห้องหลังบ้านเปิดให้ Role ที่ไม่ได้อนุญาตเข้าดู');
-    }
-  }
   const existing = (await options.pool.query('SELECT * FROM surfaces WHERE surface_key = $1', [surfaceKey])).rows[0];
   let message = null;
   if (existing?.channel_id === channel.id && existing.message_id) {
-    message = await channel.messages.fetch(existing.message_id).catch(() => null);
+    message = await fetchSurfaceMessageFresh(channel, existing.message_id);
   }
   message ??= await findSurfaceMarker(channel, surfaceKey);
-  const body = surfacePayload(surfaceKey, config);
-  if (message) await message.edit(body);
-  else message = await channel.send({ ...body, nonce: `surface-${surfaceKey.toLowerCase()}`, enforceNonce: true });
-  await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    await client.query(`
-      INSERT INTO surfaces(surface_key, guild_id, channel_id, message_id, expected_permissions,
-        state, last_validated_at, rendered_config_version)
-      VALUES ($1,$2,$3,$4,$5,'ACTIVE',clock_timestamp(),$6)
-      ON CONFLICT (surface_key) DO UPDATE SET guild_id = EXCLUDED.guild_id,
-        channel_id = EXCLUDED.channel_id, message_id = EXCLUDED.message_id,
-        expected_permissions = EXCLUDED.expected_permissions, state = 'ACTIVE',
-        rendered_config_version = EXCLUDED.rendered_config_version,
-        state_version = surfaces.state_version + 1, last_validated_at = clock_timestamp(),
-        updated_at = clock_timestamp()
-    `, [surfaceKey, interaction.guildId, channel.id, message.id, {
-      private: PRIVATE.has(surfaceKey), view: true, send: true, embeds: true, history: true,
-    }, Number(config?.version ?? 0)]);
-    await appendAdminAudit(client, { action: 'SURFACE_SETUP', targetType: 'SURFACE', targetId: surfaceKey,
-      actorId: interaction.user.id, before: existing ?? null,
-      after: { channelId: channel.id, messageId: message.id }, reason: 'setup command', context });
-  });
-  if (existing?.message_id && (existing.channel_id !== channel.id || existing.message_id !== message.id)) {
-    const old = await interaction.guild.channels.fetch(existing.channel_id).catch(() => null);
-    const oldMessage = old?.isTextBased() ? await old.messages.fetch(existing.message_id).catch(() => null) : null;
-    await oldMessage?.edit({ content: 'แผงนี้ถูกย้ายแล้ว', embeds: [], components: [] }).catch(() => null);
+  const anchor = await updateOrCreateSurfaceAnchor(channel, surfaceKey, config, message);
+  try {
+    await withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+      const values = [surfaceKey, interaction.guildId, channel.id, anchor.message.id, Number(config?.version ?? 0)];
+      let persisted;
+      if (existing) {
+        persisted = (await client.query(`UPDATE surfaces SET guild_id=$2,channel_id=$3,message_id=$4,
+          state='ACTIVE',rendered_config_version=$5,state_version=state_version+1,
+          last_validated_at=clock_timestamp(),updated_at=clock_timestamp()
+          WHERE surface_key=$1 AND state_version=$6 RETURNING *`, [...values, existing.state_version])).rows[0];
+      } else {
+        persisted = (await client.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,
+          state,last_validated_at,rendered_config_version)
+          VALUES($1,$2,$3,$4,'ACTIVE',clock_timestamp(),$5)
+          ON CONFLICT(surface_key) DO NOTHING RETURNING *`, values)).rows[0];
+      }
+      if (!persisted) throw new QuestshopError('STALE_SURFACE', 'มีการติดตั้งแผงนี้จากคำสั่งอื่นพร้อมกัน');
+      await appendAdminAudit(client, { action: 'SURFACE_SETUP', targetType: 'SURFACE', targetId: surfaceKey,
+        actorId: interaction.user.id, before: existing ?? null,
+        after: { channelId: channel.id, messageId: anchor.message.id }, reason: 'setup command', context });
+    });
+  } catch (error) {
+    if (anchor.recreated) await deactivateOrphan(anchor.message, options.pool, surfaceKey, context);
+    throw error;
   }
-  return message;
+  let cleanupFailed = false;
+  if (existing?.message_id && (existing.channel_id !== channel.id || existing.message_id !== anchor.message.id)) {
+    try {
+      const old = await interaction.guild.channels.fetch(existing.channel_id);
+      const oldMessage = old?.isTextBased() ? await fetchSurfaceMessageFresh(old, existing.message_id) : null;
+      await oldMessage?.edit({ content: 'แผงนี้ถูกย้ายแล้ว', embeds: [], components: [] });
+    } catch (error) {
+      await recordSurfaceIncidentSafely(options.pool, surfaceKey, error, context);
+      cleanupFailed = true;
+    }
+  }
+  if (!cleanupFailed) await resolveSurfaceIncidentSafely(options.pool, surfaceKey, context);
+  return anchor.message;
+}
+
+export async function setupSurface(input, context, options = {}) {
+  return withSurfaceSetupLock(input.surfaceKey, () => setupSurfaceLocked(input, context, options));
+}
+
+async function recordSurfaceIncident(pool, surfaceKey, error, context) {
+  return reconcileIncident({ code: 'DISCORD_SURFACE_RECONCILE_FAILED', scope: surfaceKey, active: true,
+    severity: 'ERROR', evidence: {
+    code: String(error?.code ?? error?.name ?? 'UNKNOWN').slice(0, 100),
+    status: Number(error?.status) || null,
+  } }, context, { pool });
+}
+
+async function resolveSurfaceIncidentSafely(pool, surfaceKey, context) {
+  try {
+    await reconcileIncident({ code: 'DISCORD_SURFACE_RECONCILE_FAILED', scope: surfaceKey,
+      active: false, severity: 'ERROR', evidence: {} }, context, { pool });
+  } catch {
+    // A successful Discord repair must not be reported as failed because the
+    // non-financial incident projection could not be updated.
+  }
+}
+
+async function recordSurfaceIncidentSafely(pool, surfaceKey, error, context) {
+  try {
+    await recordSurfaceIncident(pool, surfaceKey, error, context);
+  } catch {
+    // A database outage is already the authoritative failure.  Do not hide
+    // the original Discord error or stop reconciliation of other surfaces.
+  }
+}
+
+async function deactivateOrphan(message, pool, surfaceKey, context) {
+  try {
+    await message.edit({ content: 'แผงนี้ถูกแทนที่แล้ว', embeds: [], components: [] });
+  } catch (error) {
+    // The authoritative surface pointer remains unchanged; the next pass will
+    // report the delivery failure without treating the orphan as active.
+    await recordSurfaceIncidentSafely(pool, surfaceKey, error, context);
+  }
+}
+
+async function persistReconciledSurface(pool, surface, message, config, anchor, context) {
+  return withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (database) => {
+    const updated = (await database.query(`UPDATE surfaces SET message_id=$2,state='ACTIVE',
+      rendered_config_version=$4,state_version=state_version+1,updated_at=clock_timestamp()
+      WHERE surface_key=$1 AND state_version=$3 RETURNING *`,
+    [surface.surface_key, message.id, surface.state_version, Number(config?.version ?? 0)])).rows[0];
+    if (!updated) return null;
+    await appendAdminAudit(database, { action: 'SURFACE_RECONCILED', targetType: 'SURFACE',
+      targetId: surface.surface_key, actorId: context.actorId,
+      before: { messageId: surface.message_id, state: surface.state },
+      after: { messageId: message.id, state: 'ACTIVE' },
+      reason: anchor.recreated ? 'anchor missing during reconciliation' : 'anchor refreshed or recovered by marker', context });
+    return updated;
+  });
+}
+
+async function reconcileOneSurface({ guild, pool, surface, config, context }) {
+  const channel = await guild.channels.fetch(surface.channel_id);
+  if (!channel?.isTextBased() || channel.isDMBased()) {
+    throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'Surface channel is unavailable');
+  }
+  let message = surface.message_id ? await fetchSurfaceMessageFresh(channel, surface.message_id) : null;
+  message ??= await findSurfaceMarker(channel, surface.surface_key);
+  const needsRefresh = !message || surface.state === 'RECONCILING'
+    || Number(surface.rendered_config_version) < Number(config?.version ?? 0);
+  if (!needsRefresh) {
+    await resolveSurfaceIncidentSafely(pool, surface.surface_key, context);
+    return { surfaceKey: surface.surface_key, skipped: true };
+  }
+  const anchor = await updateOrCreateSurfaceAnchor(channel, surface.surface_key, config, message);
+  const updated = await persistReconciledSurface(pool, surface, anchor.message, config, anchor, context);
+  if (updated) {
+    await resolveSurfaceIncidentSafely(pool, surface.surface_key, context);
+    return { surfaceKey: surface.surface_key, recreated: anchor.recreated,
+      refreshed: Boolean(message), messageId: anchor.message.id };
+  }
+  if (anchor.recreated) await deactivateOrphan(anchor.message, pool, surface.surface_key, context);
+  return { surfaceKey: surface.surface_key, reconciled: false, reason: 'STALE_SURFACE' };
 }
 
 export async function reconcileSurfaceAnchors({ client, pool, env, config }, context) {
@@ -81,35 +209,12 @@ export async function reconcileSurfaceAnchors({ client, pool, env, config }, con
   const guild = await client.guilds.fetch(env.DISCORD_GUILD_ID);
   const results = [];
   for (const surface of surfaces) {
-    const channel = await guild.channels.fetch(surface.channel_id).catch(() => null);
-    if (!channel?.isTextBased() || channel.isDMBased()) continue;
-    let message = surface.message_id
-      ? await channel.messages.fetch(surface.message_id).catch(() => null) : null;
-    message ??= await findSurfaceMarker(channel, surface.surface_key);
-    if (!message) {
-      message = await channel.send({ ...surfacePayload(surface.surface_key, config),
-        nonce: `surface-${surface.surface_key.toLowerCase()}`, enforceNonce: true });
-      await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (database) => {
-        const updated = (await database.query(`UPDATE surfaces SET message_id=$2,state='ACTIVE',
-          rendered_config_version=$4,state_version=state_version+1,updated_at=clock_timestamp()
-          WHERE surface_key=$1 AND state_version=$3 RETURNING *`,
-        [surface.surface_key, message.id, surface.state_version, Number(config?.version ?? 0)])).rows[0];
-        if (!updated) return;
-        await appendAdminAudit(database, { action: 'SURFACE_RECONCILED', targetType: 'SURFACE',
-          targetId: surface.surface_key, actorId: context.actorId,
-          before: { messageId: surface.message_id, state: surface.state },
-          after: { messageId: message.id, state: 'ACTIVE' }, reason: 'anchor missing during reconciliation', context });
-      });
-      results.push({ surfaceKey: surface.surface_key, recreated: true, messageId: message.id });
-    } else if (surface.state === 'RECONCILING'
-      || Number(surface.rendered_config_version) < Number(config?.version ?? 0)) {
-      await message.edit(surfacePayload(surface.surface_key, config));
-      await pool.query(`UPDATE surfaces SET state='ACTIVE',rendered_config_version=$2,
-        state_version=state_version+1,updated_at=clock_timestamp()
-        WHERE surface_key=$1 AND state_version=$3`,
-      [surface.surface_key, Number(config?.version ?? 0), surface.state_version]);
-      results.push({ surfaceKey: surface.surface_key, recreated: false,
-        refreshed: true, messageId: message.id });
+    try {
+      results.push(await reconcileOneSurface({ guild, pool, surface, config, context }));
+    } catch (error) {
+      await recordSurfaceIncidentSafely(pool, surface.surface_key, error, context);
+      results.push({ surfaceKey: surface.surface_key, reconciled: false,
+        reason: String(error?.code ?? error?.name ?? 'DISCORD_ERROR') });
     }
   }
   return results;

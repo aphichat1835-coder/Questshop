@@ -12,11 +12,45 @@ function fullJitter(attempt, capMs = 1000, baseMs = 25) {
 async function rollbackOrRelease(client, error) {
   try {
     await client.query('ROLLBACK');
-    return false;
-  } catch {
-    client.release(true);
-    if (!isRetryableTransactionError(error)) throw error;
-    return true;
+    return { destroyed: false, error };
+  } catch (rollbackError) {
+    // Mark the client as destroyed before invoking release.  node-postgres
+    // can throw while destroying a broken socket; the outer finally must never
+    // attempt a second release and hide the original transaction failure.
+    const result = { destroyed: true, error };
+    try {
+      client.release(true);
+    } catch (releaseError) {
+      result.rollbackError = rollbackError;
+      result.releaseError = releaseError;
+    }
+    if (!result.rollbackError) result.rollbackError = rollbackError;
+    return result;
+  }
+}
+
+function retryExhausted(error, attempt, maxAttempts) {
+  return !isRetryableTransactionError(error) || attempt + 1 >= maxAttempts;
+}
+
+async function executeAttempt(pool, isolation, callback, attempt) {
+  const client = await pool.connect();
+  let destroyed = false;
+  try {
+    await client.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+    const transactionTime = (await client.query(
+      'SELECT transaction_timestamp() AS transaction_time',
+    )).rows[0].transaction_time;
+    const result = await callback(client, Object.freeze({ attempt, transactionTime }));
+    await client.query('COMMIT');
+    return { result, retry: false };
+  } catch (error) {
+    const rollback = await rollbackOrRelease(client, error);
+    destroyed = rollback.destroyed;
+    if (destroyed || !isRetryableTransactionError(error)) throw rollback.error;
+    return { result: null, retry: true, error: rollback.error };
+  } finally {
+    if (!destroyed) client.release();
   }
 }
 
@@ -37,25 +71,18 @@ export async function withTransaction({
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (performance.now() - started >= deadlineMs) break;
-    const client = await pool.connect();
-    let destroyed = false;
     try {
-      await client.query(`BEGIN ISOLATION LEVEL ${normalizedIsolation}`);
-      const transactionTime = (await client.query(
-        'SELECT transaction_timestamp() AS transaction_time',
-      )).rows[0].transaction_time;
-      const result = await callback(client, Object.freeze({ attempt, transactionTime }));
-      await client.query('COMMIT');
-      return result;
+      const outcome = await executeAttempt(pool, normalizedIsolation, callback, attempt);
+      if (!outcome.retry) return outcome.result;
+      lastError = outcome.error;
     } catch (error) {
       lastError = error;
-      destroyed = await rollbackOrRelease(client, error);
-      if (destroyed) continue;
-      if (!isRetryableTransactionError(error) || attempt + 1 >= maxAttempts) throw error;
-    } finally {
-      if (!destroyed) client.release();
+      if (retryExhausted(error, attempt, maxAttempts)) throw error;
     }
-    await delay(fullJitter(attempt), undefined, { ref: false });
+    if (attempt + 1 >= maxAttempts) break;
+    // A transaction retry owns this wait.  An unref'ed timer can leave an
+    // awaited retry pending while Node exits when this is the final handle.
+    await delay(fullJitter(attempt));
   }
   throw lastError ?? new Error('transaction deadline exceeded');
 }

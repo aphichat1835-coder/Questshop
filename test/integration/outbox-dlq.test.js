@@ -6,7 +6,7 @@ import { processOutbox } from '../../src/workers/outbox-worker.js';
 import { createContext } from '../../src/shared/correlation.js';
 import { replayDeadLetter, discardDeadLetter } from '../../src/domain/outbox/dlq-service.js';
 import { acquireDelivery, recordDelivery, enqueueProjection } from '../../src/domain/outbox/service.js';
-import { reconcileSurfaceAnchors } from '../../src/discord/surfaces/setup.js';
+import { reconcileSurfaceAnchors, setupSurface } from '../../src/discord/surfaces/setup.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -58,9 +58,9 @@ test('outbox exhausts bounded retries into schema-valid DLQ evidence', async (t)
   assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [forbiddenEvent])).rows[0].state,
     'DEAD_LETTER');
   assert.equal((await pool.query("SELECT state FROM surfaces WHERE surface_key='QUEST_NEW'")).rows[0].state,
-    'DRIFTED');
+    'ACTIVE');
   assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM incidents
-    WHERE incident_code='PERMISSION_DRIFT' AND scope='QUEST_NEW' AND state='OPEN'`)).rows[0].count), 1);
+    WHERE incident_code='DISCORD_SURFACE_FORBIDDEN' AND scope='QUEST_NEW' AND state='OPEN'`)).rows[0].count), 1);
 });
 
 test('financial DLQ cannot be discarded', async (t) => {
@@ -145,6 +145,10 @@ test('Discord 404 reconciles only the affected surface and 429 honors Retry-Afte
     FROM outbox_events WHERE id=$1`, [throttledEvent])).rows[0];
   assert.equal(throttled.state, 'RETRY_WAIT');
   assert.ok(Number(throttled.delay) >= 59);
+  // The test intentionally leaves both retry paths queued. Mark them done
+  // after asserting their state so later cases always acquire their own event.
+  await pool.query("UPDATE outbox_events SET state='DELIVERED',lease_owner=NULL,lease_expires_at=NULL WHERE id = ANY($1::uuid[])",
+    [[missingEvent, throttledEvent]]);
 });
 
 test('delivery coalesces obsolete outbox events for the same Discord message', async (t) => {
@@ -189,6 +193,7 @@ test('an old outbox delivery holder cannot acknowledge after a newer projection 
   const secondHolder = uuidv7();
   const second = await acquireDelivery({ holder: secondHolder }, { pool });
   assert.equal(second.id, event);
+  assert.ok(BigInt(second.state_version) > BigInt(first.state_version));
   assert.ok(BigInt(second.fencing_token) > BigInt(first.fencing_token));
   assert.ok(BigInt(second.projection_fencing_token) > BigInt(first.projection_fencing_token));
 
@@ -202,6 +207,12 @@ test('an old outbox delivery holder cannot acknowledge after a newer projection 
   assert.equal(delivered.state, 'DELIVERED');
   assert.equal((await pool.query('SELECT message_id FROM message_projections WHERE id=$1', [projection])).rows[0].message_id,
     'current-message');
+  const transitions = (await pool.query(`SELECT from_state,to_state FROM state_transitions
+    WHERE aggregate_type='OUTBOX_EVENT' AND aggregate_id=$1 ORDER BY created_at`, [event])).rows;
+  assert.deepEqual(transitions, [
+    { from_state: 'PENDING', to_state: 'LEASED' },
+    { from_state: 'LEASED', to_state: 'DELIVERED' },
+  ]);
 });
 
 test('quest-new role ping is durable and is not repeated when the message is recreated', async (t) => {
@@ -240,15 +251,45 @@ test('quest-new role ping is durable and is not repeated when the message is rec
   assert.deepEqual(sent[1].allowedMentions, { parse: [] });
 });
 
+test('payment log delivers without a channel privacy preflight', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const projection = uuidv7(); const event = uuidv7(); const trace = uuidv7(); const topupId = uuidv7();
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state)
+    VALUES('LOG_PAYMENTS','guild','payments-channel','anchor','ACTIVE')
+    ON CONFLICT(surface_key) DO UPDATE SET channel_id=EXCLUDED.channel_id,state='ACTIVE'`);
+  await pool.query(`INSERT INTO message_projections(id,projection_type,aggregate_id,surface_key,nonce)
+    VALUES($1,'PAYMENT_LOG',$2,'LOG_PAYMENTS',$3)`, [projection, topupId, `payment-${event.slice(0, 16)}`]);
+  await pool.query(`INSERT INTO outbox_events(id,topic,aggregate_type,aggregate_id,aggregate_version,
+    projection_id,state,trace_id) VALUES($1,'REFRESH_PROJECTION','TOPUP',$2,1,$3,'PENDING',$4)`,
+  [event, topupId, projection, trace]);
+  let rendered = 0; const sent = [];
+  const channel = {
+    isTextBased: () => true,
+    messages: { fetch: async () => null },
+    send: async (body) => { sent.push(body); return { id: 'payment-log-message' }; },
+  };
+  const client = {
+    channels: { fetch: async () => channel },
+  };
+  assert.equal(await processOutbox({ holder: uuidv7(), client, pool,
+    env: { DISCORD_GUILD_ID: 'guild', OWNER_ID: 'owner' },
+    renderProjectionFunction: async () => { rendered += 1; return { content: 'payment-log' }; } }), true);
+  assert.equal(rendered, 1);
+  assert.equal(sent.length, 1);
+  assert.equal((await pool.query('SELECT state FROM outbox_events WHERE id=$1', [event])).rows[0].state, 'DELIVERED');
+  assert.equal((await pool.query("SELECT state FROM surfaces WHERE surface_key='LOG_PAYMENTS'")).rows[0].state, 'ACTIVE');
+});
+
 test('surface reconciliation refreshes existing anchors after config version changes', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   await pool.query("UPDATE surfaces SET state='DISABLED' WHERE surface_key<>'QUEST_AUTO'");
+  await pool.query("DELETE FROM surfaces WHERE surface_key='QUEST_AUTO'");
   await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state,rendered_config_version)
     VALUES('QUEST_AUTO','guild','channel','anchor','ACTIVE',1)`);
   const edits = [];
   const message = { id: 'anchor', edit: async (body) => { edits.push(body); return message; } };
   const channel = { isTextBased: () => true, isDMBased: () => false,
-    messages: { fetch: async (input) => (input === 'anchor' ? message : new Map()) } };
+    messages: { fetch: async (input) => (input?.message === 'anchor' ? message : []) } };
   const guild = { channels: { fetch: async () => channel } };
   const client = { guilds: { fetch: async () => guild } };
   const context = createContext({ actorType: 'SYSTEM', actorId: 'runtime', guildId: 'guild',
@@ -260,4 +301,68 @@ test('surface reconciliation refreshes existing anchors after config version cha
   assert.equal(result[0].refreshed, true);
   const surface = (await pool.query("SELECT * FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0];
   assert.equal(Number(surface.rendered_config_version), 2);
+});
+
+test('surface reconciliation persists a replacement when an anchor disappears during refresh', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  await pool.query("UPDATE surfaces SET state='DISABLED' WHERE surface_key<>'QUEST_AUTO'");
+  await pool.query(`INSERT INTO surfaces(surface_key,guild_id,channel_id,message_id,state,rendered_config_version)
+    VALUES('QUEST_AUTO','guild','channel','deleted-anchor','RECONCILING',1)
+    ON CONFLICT(surface_key) DO UPDATE SET guild_id=EXCLUDED.guild_id,channel_id=EXCLUDED.channel_id,
+      message_id=EXCLUDED.message_id,state=EXCLUDED.state,rendered_config_version=EXCLUDED.rendered_config_version`);
+  const deleted = { id: 'deleted-anchor', edit: async () => {
+    throw Object.assign(new Error('Unknown Message'), { code: 10008, status: 404 });
+  } };
+  const replacement = { id: 'replacement-anchor' };
+  const channel = { isTextBased: () => true, isDMBased: () => false,
+    messages: { fetch: async (input) => (input?.message === 'deleted-anchor' ? deleted : []) },
+    send: async () => replacement };
+  const guild = { channels: { fetch: async () => channel } };
+  const client = { guilds: { fetch: async () => guild } };
+  const context = createContext({ actorType: 'SYSTEM', actorId: 'runtime', guildId: 'guild',
+    idempotencyKey: 'surface-refresh-replacement' });
+  const result = await reconcileSurfaceAnchors({ client, pool,
+    env: { DISCORD_GUILD_ID: 'guild' }, config: { version: 2, values: {} } }, context);
+  assert.equal(result[0].recreated, true);
+  const surface = (await pool.query("SELECT * FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0];
+  assert.equal(surface.message_id, 'replacement-anchor');
+  assert.equal(Number(surface.rendered_config_version), 2);
+});
+
+test('setup reuses an anchor, moves it atomically, and records old-anchor cleanup failure', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  await pool.query("UPDATE surfaces SET state='DISABLED' WHERE surface_key<>'QUEST_AUTO'");
+  await pool.query("DELETE FROM surfaces WHERE surface_key='QUEST_AUTO'");
+  const created = { id: 'setup-anchor', edit: async (body) => { created.edits.push(body); return created; }, edits: [] };
+  const firstChannel = {
+    id: 'setup-first', isTextBased: () => true, isDMBased: () => false,
+    client: { user: { id: 'bot' } }, messages: { fetch: async () => [] }, send: async () => created,
+  };
+  const context = createContext({ actorType: 'OWNER', actorId: 'owner', guildId: 'guild',
+    idempotencyKey: 'setup-anchor' });
+  const firstInteraction = {
+    guildId: 'guild', user: { id: 'owner' }, channel: firstChannel,
+    options: { getChannel: () => firstChannel }, guild: { channels: { fetch: async () => firstChannel } },
+  };
+  await setupSurface({ interaction: firstInteraction, surfaceKey: 'QUEST_AUTO', config: { version: 1, values: {} } }, context, { pool });
+  assert.equal((await pool.query("SELECT message_id FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0].message_id, 'setup-anchor');
+
+  const replacement = { id: 'setup-replacement', edit: async () => replacement };
+  const secondChannel = {
+    id: 'setup-second', isTextBased: () => true, isDMBased: () => false,
+    client: { user: { id: 'bot' } }, messages: { fetch: async () => [] }, send: async () => replacement,
+  };
+  const oldChannel = {
+    isTextBased: () => true,
+    messages: { fetch: async () => { throw Object.assign(new Error('Missing Permissions'), { status: 403, code: 50013 }); } },
+  };
+  const moveInteraction = {
+    guildId: 'guild', user: { id: 'owner' }, channel: secondChannel,
+    options: { getChannel: () => secondChannel }, guild: { channels: { fetch: async () => oldChannel } },
+  };
+  await setupSurface({ interaction: moveInteraction, surfaceKey: 'QUEST_AUTO', config: { version: 2, values: {} } }, context, { pool });
+  const moved = (await pool.query("SELECT channel_id,message_id FROM surfaces WHERE surface_key='QUEST_AUTO'")).rows[0];
+  assert.deepEqual(moved, { channel_id: 'setup-second', message_id: 'setup-replacement' });
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM incidents
+    WHERE incident_code='DISCORD_SURFACE_RECONCILE_FAILED' AND scope='QUEST_AUTO'`)).rows[0].count), 1);
 });

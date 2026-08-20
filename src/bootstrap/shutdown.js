@@ -27,21 +27,56 @@ async function flushOutbox(runtime, deadline) {
   }
 }
 
-export async function shutdown(runtime, reason = 'shutdown') {
-  const deadline = Date.now() + 25_000;
-  runtime.health.ready = false; runtime.health.status = 'NOT_READY';
-  runtime.abortController.abort(reason);
-  let failure = null;
+async function preserveCleanupFailure(action, failure) {
   try {
-    await bounded(runtime.workers.stop(), Math.min(deadline, Date.now() + 10_000), 'worker checkpoint');
-    await bounded(flushOutbox(runtime, deadline), deadline, 'outbox flush');
-    await bounded(runtime.heartbeat.catch(() => null), deadline, 'runtime heartbeat');
-    await bounded(releaseLease({ resourceType: 'RUNTIME', resourceId: runtime.env.DISCORD_GUILD_ID,
-      holder: runtime.runtimeHolder, fencingToken: runtime.runtimeLease.fencing_token }).catch(() => null),
-    deadline, 'runtime lease release');
-  } catch (error) { failure = error; }
-  runtime.client.destroy();
-  await bounded(closePools().catch(() => null), deadline, 'database close').catch((error) => { failure ??= error; });
+    await action();
+  } catch (error) {
+    return failure ?? error;
+  }
+  return failure;
+}
+
+export function shutdown(runtime, reason = 'shutdown', { leaseLost = false, error = null } = {}) {
+  if (runtime.shutdownPromise) return runtime.shutdownPromise;
+  let resolve;
+  let reject;
+  runtime.shutdownPromise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  // Install the promise before abort() can synchronously trigger a listener
+  // that calls shutdown again.
+  void Promise.resolve().then(() => shutdownOnce(runtime, reason, { leaseLost, error })).then(resolve, reject);
+  return runtime.shutdownPromise;
+}
+
+async function shutdownOnce(runtime, reason, { leaseLost, error }) {
+  const deadline = Date.now() + 25_000;
+  runtime.acceptingInteractions = false;
+  runtime.health.ready = false;
+  runtime.health.status = leaseLost ? 'INCIDENT' : 'NOT_READY';
+  if (error) runtime.health.lastError = error;
+  runtime.abortController.abort(reason);
+  // A process that lost the Runtime lease must stop Discord ingress before any
+  // drain work.  It no longer has authority to publish customer-facing state.
+  let failure = null;
+  if (leaseLost) {
+    failure = await preserveCleanupFailure(async () => runtime.client?.destroy?.(), failure);
+  }
+  try {
+    await bounded(Promise.resolve(runtime.workers?.stop?.()), Math.min(deadline, Date.now() + 10_000), 'worker checkpoint');
+    if (!leaseLost) await bounded(flushOutbox(runtime, deadline), deadline, 'outbox flush');
+    await bounded(Promise.resolve(runtime.heartbeat).catch(() => null), deadline, 'runtime heartbeat');
+    if (!leaseLost) {
+      await bounded(releaseLease({ resourceType: 'RUNTIME', resourceId: runtime.env.DISCORD_GUILD_ID,
+        holder: runtime.runtimeHolder, fencingToken: runtime.runtimeLease.fencing_token }, { pool: runtime.pool }).catch(() => null),
+      deadline, 'runtime lease release');
+    }
+  } catch (error_) { failure ??= error_; }
+  if (!leaseLost) {
+    failure = await preserveCleanupFailure(async () => runtime.client?.destroy?.(), failure);
+  }
+  await bounded(closePools().catch(() => null), deadline, 'database close').catch((error_) => { failure ??= error_; });
   runtime.health.live = false;
   await bounded(closeHealthServer(runtime.server).catch(() => null), deadline, 'health close')
     .catch((error) => { failure ??= error; });

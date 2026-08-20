@@ -96,8 +96,6 @@ test('daily top-up limit credits the full received amount then blocks further to
   assert.equal(BigInt(wallet.available_cents), 350_000n);
   const latest = (await pool.query('SELECT warning_code FROM topups WHERE id=$1', [topups[1]])).rows[0];
   assert.equal(latest.warning_code, 'DAILY_TOPUP_LIMIT_EXCEEDED');
-  const block = (await pool.query(`SELECT * FROM blocklist_entries WHERE discord_user_id='daily-limit-user'
-    AND block_type='TOPUP_BLOCKED' AND revoked_at IS NULL`)).rows[0];
-  assert.equal(block.reason, 'DAILY_TOPUP_LIMIT');
-  assert.ok(new Date(block.expires_at).getTime() > Date.now());
+  const lock = (await pool.query(`SELECT * FROM topup_daily_locks WHERE discord_user_id='daily-limit-user'`)).rows[0];
+  assert.ok(new Date(lock.expires_at).getTime() > Date.now());
 });

@@ -1,6 +1,15 @@
 import { getRuntimePool } from '../db/pools.js';
 import { DEFAULT_FEATURE_GATES } from './feature-gates.js';
 
+export function sanitizeRuntimeConfigValues(payload = {}) {
+  const values = { ...payload };
+  // Human backoffice access is derived from Discord's Administrator
+  // permission at each interaction boundary. Retire the old role-based
+  // setting from every config snapshot the application reads or writes.
+  delete values.adminRoleId;
+  return values;
+}
+
 export async function loadRuntimeConfig(pool = getRuntimePool()) {
   const [gates, config, surfaces] = await Promise.all([
     pool.query('SELECT gate, enabled, version, reason FROM feature_gates'),
@@ -9,7 +18,7 @@ export async function loadRuntimeConfig(pool = getRuntimePool()) {
   ]);
   return Object.freeze({
     version: Number(config.rows[0]?.version ?? 1),
-    values: config.rows[0]?.payload ?? {},
+    values: sanitizeRuntimeConfigValues(config.rows[0]?.payload),
     gates: Object.freeze({
       ...DEFAULT_FEATURE_GATES,
       ...Object.fromEntries(gates.rows.map((row) => [row.gate, row.enabled])),

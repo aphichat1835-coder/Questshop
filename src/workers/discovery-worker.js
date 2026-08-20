@@ -1,8 +1,10 @@
 import { decryptSecret } from '../adapters/crypto/keyring.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createQuestApiClient, profileFromEnv } from '../quest-engine/api/client.js';
+import { getPersistentDiscordRateLimitCoordinator } from '../quest-engine/rate-limits/coordinator.js';
 import { createContext } from '../shared/correlation.js';
 import { ingestDiscovery } from '../domain/catalog/service.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
 
 async function loadScanMonitors(pool) {
   return (await pool.query(`SELECT m.*,c.key_version,c.nonce,c.ciphertext,c.auth_tag
@@ -16,21 +18,21 @@ async function markMonitorFailure(pool, monitor, error, context) {
   let state = 'ACTIVE';
   if (error.fatalAuth || failures >= 5) state = 'QUARANTINED';
   else if (failures >= 3) state = 'COOLDOWN';
-  await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
+  const updated = (await pool.query(`UPDATE monitor_accounts SET state=$2,consecutive_failures=$3,
+    state_version=state_version+1,
     cooldown_until=CASE WHEN $2='COOLDOWN' THEN clock_timestamp()+interval '15 minutes' ELSE cooldown_until END,
-    updated_at=clock_timestamp() WHERE id=$1`, [monitor.id, state, failures]);
-  if (state === 'QUARANTINED') await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-    VALUES(gen_random_uuid(),'MONITOR_QUARANTINED',$1,'OPEN','ERROR',$2,$3)
-    ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED'
-    DO UPDATE SET evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-  [monitor.id, { errorCode: error.code ?? error.name }, context.traceId]);
+    updated_at=clock_timestamp() WHERE id=$1 AND state_version=$4 AND state<>'DISABLED' RETURNING state`,
+  [monitor.id, state, failures, monitor.state_version])).rows[0];
+  if (updated?.state === 'QUARANTINED') await reconcileIncident({ code: 'MONITOR_QUARANTINED', scope: monitor.id,
+    active: true, severity: 'ERROR', evidence: { errorCode: error.code ?? error.name } }, context, { pool });
 }
 
-async function fetchMonitorQuests(monitor, { env, signal }) {
+async function fetchMonitorQuests(monitor, { env, pool, signal }) {
   const token = decryptSecret({ keyVersion: monitor.key_version, nonce: monitor.nonce,
     ciphertext: monitor.ciphertext, authTag: monitor.auth_tag }, env.DATA_ENCRYPTION_KEYS_JSON,
   `monitor:${monitor.id}:${env.DISCORD_GUILD_ID}`);
-  const api = createQuestApiClient({ token, profile: profileFromEnv(env) });
+  const api = createQuestApiClient({ token, profile: profileFromEnv(env),
+    coordinator: getPersistentDiscordRateLimitCoordinator(pool) });
   let last = [];
   // Metadata can lag on one Discord account.  Perform the bounded source
   // retry before moving to a fallback account; network retries are still
@@ -63,7 +65,8 @@ async function scanOneMonitor(monitor, input, context) {
     await ingestMonitorQuests(quests, { source: 'MONITOR', context, pool: input.pool,
       runnerConcurrency: input.runnerConcurrency });
     await input.pool.query(`UPDATE monitor_accounts SET consecutive_failures=0,last_used_at=clock_timestamp(),
-      updated_at=clock_timestamp() WHERE id=$1`, [monitor.id]);
+      state_version=state_version+1,updated_at=clock_timestamp()
+      WHERE id=$1 AND state_version=$2 AND state='ACTIVE'`, [monitor.id, monitor.state_version]);
     return { quests, missingCoreIds: missingCoreQuestIds(quests) };
   } catch (error) {
     await markMonitorFailure(input.pool, monitor, error, context);

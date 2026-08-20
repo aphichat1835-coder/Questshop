@@ -7,48 +7,66 @@ import { enqueueProjection } from '../outbox/service.js';
 import { openReview } from '../reviews/service.js';
 import { assertTransition, recordTransition } from '../shared/transition.js';
 import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
+import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
 import { appendAdminAudit } from './audit.js';
 
-export async function setQuestSaleState({ questId, nextState, runnerConcurrency = 3,
-  reason }, context, options = {}) {
-  if (!['OPEN', 'PAUSED', 'EXPIRED'].includes(nextState) || !reason?.trim()) {
-    throw new TypeError('invalid Quest sale change');
-  }
+// The only approved public-sale bypass for the Monitor gate is the auditable
+// button on that Quest's failed-test alert; it never changes a failed run into
+// TEST_PASSED and there is no generic manual catalog-sale control.
+export async function forcePublishFailedMonitorTest({ alertId, reason }, context, options = {}) {
+  if (!reason?.trim()) throw new TypeError('force publish reason is required');
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
-    const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [questId])).rows[0];
+    const alert = (await client.query(`SELECT * FROM quest_test_failure_alerts
+      WHERE id=$1 FOR UPDATE`, [alertId])).rows[0];
+    if (!alert) throw new QuestshopError('QUEST_TEST_ALERT_NOT_FOUND', 'ไม่พบรายการทดสอบ Quest');
+    if (alert.state === 'OVERRIDDEN') return { alert, idempotent: true };
+    if (alert.state !== 'OPEN') throw new QuestshopError('QUEST_TEST_ALERT_NOT_OPEN', 'รายการนี้ไม่ได้รอการตัดสินใจ');
+    const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [alert.quest_id])).rows[0];
     if (!quest) throw new QuestshopError('QUEST_NOT_FOUND', 'ไม่พบ Quest');
-    if (quest.sale_state === nextState) return quest;
-    assertTransition(SALE_TRANSITIONS, quest.sale_state, nextState);
-    if (nextState === 'OPEN') {
-      const price = await resolvePrice(client, { questId, taskType: quest.task_type });
-      const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency });
-      if (quest.analysis_state !== 'SUPPORTED' || !quest.executor_id || !price || !expiry.eligible) {
-        throw new QuestshopError('QUEST_NOT_SALE_ELIGIBLE', `เปิดขายไม่ได้: ${expiry.reason ?? 'ข้อมูล/Executor/ราคาไม่ครบ'}`);
-      }
+    const batch = (await client.query('SELECT contract_hash FROM quest_test_batches WHERE id=$1 FOR SHARE',
+      [alert.batch_id])).rows[0];
+    if (!batch || batch.contract_hash !== quest.current_contract_hash) {
+      throw new QuestshopError('QUEST_TEST_ALERT_STALE_CONTRACT',
+        'ผลทดสอบนี้เป็นของรูปแบบ Quest เก่า จึงใช้เปิดขายรูปแบบปัจจุบันไม่ได้');
     }
-    const updated = (await client.query(`UPDATE quests SET sale_state=$2,sale_version=sale_version+1,
-      analysis_state=CASE WHEN $2='EXPIRED' AND analysis_state IN ('UNSUPPORTED','MANUAL_REVIEW','SUPPORTED')
-        THEN 'EXPIRED' ELSE analysis_state END,
-      analysis_version=analysis_version+CASE WHEN $2='EXPIRED'
-        AND analysis_state IN ('UNSUPPORTED','MANUAL_REVIEW','SUPPORTED') THEN 1 ELSE 0 END,
-      updated_at=transaction_timestamp() WHERE quest_id=$1 AND sale_version=$3 RETURNING *`,
-    [questId, nextState, quest.sale_version])).rows[0];
-    if (!updated) throw new QuestshopError('STALE_STATE', 'Quest เปลี่ยนพร้อมกัน');
-    await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: questId,
-      fromState: quest.sale_state, toState: nextState, stateVersion: updated.sale_version,
-      reasonCode: 'ADMIN_SALE_CHANGE', context });
-    if (nextState === 'EXPIRED' && ['UNSUPPORTED', 'MANUAL_REVIEW', 'SUPPORTED'].includes(quest.analysis_state)) {
-      await recordTransition(client, { aggregateType: 'QUEST_ANALYSIS', aggregateId: questId,
-        fromState: quest.analysis_state, toState: 'EXPIRED', stateVersion: updated.analysis_version,
-        reasonCode: 'ADMIN_EXPIRED', context });
+    const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
+    const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency: 2 });
+    if (quest.analysis_state !== 'SUPPORTED' || !quest.executor_id || !price || !expiry.eligible) {
+      throw new QuestshopError('QUEST_NOT_SALE_ELIGIBLE', 'Quest ยังมีข้อมูล ราคา หรือเวลาคงเหลือไม่พอสำหรับเปิดขาย');
     }
-    await appendAdminAudit(client, { action: 'QUEST_SALE_CHANGE', targetType: 'QUEST', targetId: questId,
-      actorId: context.actorId, before: { saleState: quest.sale_state },
-      after: { saleState: nextState }, reason, context });
+    if (quest.sale_state !== 'OPEN') assertTransition(SALE_TRANSITIONS, quest.sale_state, 'OPEN');
+    const updatedQuest = (await client.query(`UPDATE quests SET public_test_gate_override=true,
+      public_test_gate_override_by=$2,public_test_gate_override_at=clock_timestamp(),
+      public_test_gate_override_reason=$3,
+      public_test_gate_override_contract_hash=current_contract_hash,
+      sale_state='OPEN',sale_version=sale_version+1,
+      updated_at=clock_timestamp() WHERE quest_id=$1 AND sale_version=$4 RETURNING *`, [
+      quest.quest_id, context.actorId, reason.trim(), quest.sale_version,
+    ])).rows[0];
+    if (!updatedQuest) throw new QuestshopError('STALE_STATE', 'Quest เปลี่ยนพร้อมกัน กรุณาลองใหม่');
+    if (quest.sale_state !== 'OPEN') await recordTransition(client, {
+      aggregateType: 'QUEST_SALE', aggregateId: quest.quest_id, fromState: quest.sale_state,
+      toState: 'OPEN', stateVersion: updatedQuest.sale_version, reasonCode: 'ADMIN_TEST_GATE_OVERRIDE', context,
+    });
+    const overriddenBatch = (await client.query(`UPDATE quest_test_batches SET state='OVERRIDDEN',
+      state_version=state_version+1,completed_at=COALESCE(completed_at,clock_timestamp()),updated_at=clock_timestamp()
+      WHERE id=$1 AND state='FAILED' RETURNING *`, [alert.batch_id])).rows[0];
+    if (overriddenBatch) await recordTransition(client, { aggregateType: 'QUEST_TEST_BATCH',
+      aggregateId: overriddenBatch.id, fromState: 'FAILED', toState: 'OVERRIDDEN',
+      stateVersion: overriddenBatch.state_version, reasonCode: 'ADMIN_TEST_GATE_OVERRIDE', context });
+    const updatedAlert = (await client.query(`UPDATE quest_test_failure_alerts SET state='OVERRIDDEN',
+      state_version=state_version+1,updated_at=clock_timestamp() WHERE id=$1 AND state_version=$2 RETURNING *`,
+    [alert.id, alert.state_version])).rows[0];
+    await appendAdminAudit(client, { action: 'QUEST_TEST_FORCE_PUBLISH', targetType: 'QUEST',
+      targetId: quest.quest_id, actorId: context.actorId,
+      before: { saleState: quest.sale_state, testAlert: alert.id },
+      after: { saleState: 'OPEN', testGateOverride: true, alertState: updatedAlert.state }, reason: reason.trim(), context });
     await enqueueProjection(client, { projectionType: 'QUEST_NEW', aggregateType: 'QUEST',
-      aggregateId: questId, aggregateVersion: updated.sale_version,
-      surfaceKey: 'QUEST_NEW', context });
-    return updated;
+      aggregateId: quest.quest_id, aggregateVersion: updatedQuest.sale_version, surfaceKey: 'QUEST_NEW', context });
+    await enqueueProjection(client, { projectionType: 'QUEST_TEST_FAILURE', aggregateType: 'QUEST_TEST_ALERT',
+      aggregateId: updatedAlert.id, aggregateVersion: updatedAlert.state_version,
+      surfaceKey: 'LOG_QUEST_OPERATIONS', context });
+    return { quest: updatedQuest, alert: updatedAlert, idempotent: false };
   });
 }
 
@@ -62,9 +80,20 @@ export async function openOrderItemReview({ orderItemId, reason, ownerOnly = fal
       const updated = (await client.query(`UPDATE order_items SET state='MANUAL_REVIEW',
         state_version=state_version+1,updated_at=transaction_timestamp()
         WHERE id=$1 AND state_version=$2 RETURNING *`, [orderItemId, item.state_version])).rows[0];
-      await client.query(`UPDATE runner_jobs SET state='MANUAL_REVIEW',state_version=state_version+1,
-        lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
-        WHERE order_item_id=$1 AND state NOT IN ('COMPLETED','FAILED')`, [orderItemId]);
+      if (!updated) throw new QuestshopError('STALE_STATE', `Order item ${orderItemId} changed during review`);
+      const jobs = (await client.query('SELECT * FROM runner_jobs WHERE order_item_id=$1 FOR UPDATE', [orderItemId])).rows;
+      for (const job of jobs) {
+        if (['COMPLETED', 'FAILED', 'MANUAL_REVIEW'].includes(job.state)) continue;
+        assertTransition(RUNNER_JOB_TRANSITIONS, job.state, 'MANUAL_REVIEW');
+        const updatedJob = (await client.query(`UPDATE runner_jobs SET state='MANUAL_REVIEW',
+          state_version=state_version+1,lease_owner=NULL,lease_expires_at=NULL,updated_at=clock_timestamp()
+          WHERE id=$1 AND state=$2 AND state_version=$3 RETURNING *`,
+        [job.id, job.state, job.state_version])).rows[0];
+        if (!updatedJob) throw new QuestshopError('STALE_STATE', `Runner job ${job.id} changed during review`);
+        await recordTransition(client, { aggregateType: 'RUNNER_JOB', aggregateId: job.id,
+          fromState: job.state, toState: 'MANUAL_REVIEW', stateVersion: updatedJob.state_version,
+          reasonCode: 'ADMIN_REVIEW', context });
+      }
       await recordTransition(client, { aggregateType: 'ORDER_ITEM', aggregateId: orderItemId,
         fromState: item.state, toState: 'MANUAL_REVIEW', stateVersion: updated.state_version,
         reasonCode: 'ADMIN_REVIEW', context });

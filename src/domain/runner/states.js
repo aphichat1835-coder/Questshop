@@ -1,6 +1,6 @@
 export const RUNNER_JOB_TRANSITIONS = Object.freeze({
-  QUEUED: ['LEASED', 'FAILED'],
-  LEASED: ['RUNNING', 'QUEUED', 'FAILED', 'MANUAL_REVIEW'],
+  QUEUED: ['LEASED', 'FAILED', 'MANUAL_REVIEW'],
+  LEASED: ['RUNNING', 'QUEUED', 'WAITING_RATE_LIMIT', 'FAILED', 'MANUAL_REVIEW'],
   RUNNING: ['WAITING_RATE_LIMIT', 'WAITING_RETRY', 'VERIFYING', 'FAILED', 'MANUAL_REVIEW'],
   WAITING_RATE_LIMIT: ['QUEUED', 'RUNNING', 'FAILED', 'MANUAL_REVIEW'],
   WAITING_RETRY: ['QUEUED', 'RUNNING', 'FAILED', 'MANUAL_REVIEW'],
@@ -16,4 +16,3 @@ export function progressBucket(actual, completed = false) {
   const bounded = Math.max(0, Math.min(99.999, Number(actual) || 0));
   return Math.floor(bounded / 25) * 25;
 }
-

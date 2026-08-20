@@ -5,16 +5,16 @@ idempotency/concurrency behavior, observability, feature gate, tests, rollback p
 
 | Module | Done criteria |
 |---|---|
-| Foundation | validated environment; separate direct/pooled/backup/restore roles; migration checksum and compatibility; runtime lease; health-first startup; 25-second shutdown |
+| Foundation | validated environment; separate direct/pooled roles; migration checksum and compatibility; runtime lease; health-first startup; 25-second shutdown |
 | Wallet | integer satang; row lock; serializable retry; append-only hash chain; reservation states; compensation and checkpoint retention |
 | Payment | voucher allowlist/HMAC; receiver/promotion snapshot; intent phase; no blind retry after possible send; exact-once credit; Owner-only ambiguity |
-| Catalog | three independent axes; immutable metadata revisions; dynamic price; executor support; expiry admission; discovery does not identify customer |
-| Checkout | actor/guild/channel-bound session; encrypted token; pagination; quote hash/version; signed 30-second external preflight; account uniqueness; bulk item reserve |
-| Queue/Runner | fair scheduling; lazy materialization; durable mutation checkpoint; lease/fencing; bounded retry; fresh verification; capture/release; no claim API |
+| Catalog | three independent axes; immutable metadata revisions; SHA-256 execution-contract fingerprint; test/override evidence valid only for the current fingerprint; dynamic price; executor support; expiry admission; customer discovery is logged privately with the customer and Quest-account identity but never a raw Token |
+| Checkout | actor/guild/channel-bound session; encrypted token; pagination; quote hash/version; signed 30-second external preflight; current-contract revalidation; account uniqueness; bulk item reserve |
+| Queue/Runner | fair scheduling; lazy materialization; atomic terminal item/job settlement; Runner revalidates the pinned execution contract; every initial/controlled mutation has its own durable checkpoint; a possibly-sent mutation is freshly verified and proven completed work captures (not releases) its reservation; missing completion provenance remains reserved for Review; lease/fencing; bounded retry; capture/release; no claim API |
 | Outbox | transactionally enqueued projection; latest-state rendering; heartbeat and fencing for event/projection leases; nonce reconciliation; Discord error contract; durable attempts; replay-linked DLQ |
 | Discord UI | persistent setup/update/move; ephemeral secrets; allowed-mention allowlist; terminal controls disabled; Thai/mobile-safe content |
 | Admin | Owner/Admin split; preview and confirmation for money/repair/receiver; reason/correlation/audit; no token read path |
-| Operations | permission drift; incidents and feature containment; metrics/SLO evaluator; encrypted streaming backup; restore drill; retention/key rotation |
+| Operations | surface setup permission preconditions; incidents and feature containment; metrics/SLO evaluator; Aiven backup policy disclosure; retention/key rotation |
 
 The evidence command set is `npm run check`, `npm run lint`, PostgreSQL-backed `npm test`, `npm audit`,
 Docker build and the fake-adapter load test. Live Discord, TrueMoney, S3 and managed-database evidence is tracked

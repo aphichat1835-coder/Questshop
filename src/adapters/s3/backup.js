@@ -1,10 +1,12 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
+import { promisify } from 'node:util';
 import { Upload } from '@aws-sdk/lib-storage';
 import { GetObjectCommand, HeadObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { v7 as uuidv7 } from 'uuid';
 import { createS3Client } from './client.js';
+import { withPostgresRootCertificate } from './postgres-tls.js';
 import {
   APP_VERSION,
   ENGINE_VERSION,
@@ -14,7 +16,7 @@ import {
 } from '../../config/versions.js';
 
 const MAGIC = Buffer.from('QSBK1');
-const PG_DUMP = '/usr/local/bin/pg_dump';
+const execFileAsync = promisify(execFile);
 
 function currentKey(keyring) {
   return { version: keyring.current, key: Buffer.from(keyring.keys[String(keyring.current)], 'base64') };
@@ -31,7 +33,27 @@ function dumpConnection(urlText) {
   return { url: url.toString(), password };
 }
 function processFailure(child, stderr) {
-  return new Promise((resolve, reject) => child.once('close', (code) => code === 0 ? resolve() : reject(new Error(`pg_dump failed (${code}): ${stderr.value.slice(-500)}`))));
+  return new Promise((resolve, reject) => {
+    child.once('error', (error) => reject(Object.assign(new Error(`pg_dump could not start: ${error.message}`), {
+      code: 'PG_DUMP_SPAWN_FAILED', cause: error,
+    })));
+    child.once('close', (code) => code === 0 ? resolve()
+      : reject(new Error(`pg_dump failed (${code}): ${stderr.value.slice(-500)}`)));
+  });
+}
+
+export async function validateBackupTools(env, { exec = execFileAsync } = {}) {
+  for (const [name, path] of [['pg_dump', env.PG_DUMP_PATH ?? 'pg_dump'],
+    ['pg_restore', env.PG_RESTORE_PATH ?? 'pg_restore']]) {
+    try {
+      await exec(path, ['--version'], { timeout: 5_000, windowsHide: true });
+    } catch (error) {
+      throw Object.assign(new Error(`${name} is unavailable at configured path`), {
+        code: 'BACKUP_TOOL_UNAVAILABLE', cause: error,
+      });
+    }
+  }
+  return true;
 }
 
 export async function createEncryptedBackup({
@@ -39,59 +61,78 @@ export async function createEncryptedBackup({
   schemaVersion,
   reason = 'scheduled',
   backupId = uuidv7(),
+  pgDumpPath = env.PG_DUMP_PATH ?? 'pg_dump',
   s3 = createS3Client(env),
   spawnProcess = spawn,
   upload = (client, params) => new Upload({ client, params }).done(),
 }) {
-  const id = backupId;
-  const { version, key } = currentKey(env.BACKUP_ENCRYPTION_KEYS_JSON);
-  const nonce = randomBytes(12);
-  const sourceDbFingerprint = sourceDatabaseFingerprint(env.DATABASE_BACKUP_URL);
-  const header = Buffer.from(JSON.stringify({ id, keyVersion: version, nonce: nonce.toString('base64'),
-    schemaVersion, gitSha: env.GIT_SHA, appVersion: APP_VERSION, engineVersion: ENGINE_VERSION,
-    executorVersion: EXECUTOR_VERSION, contractVersion: QUEST_CONTRACT_VERSION,
-    runnerStateSchemaVersion: RUNNER_STATE_SCHEMA_VERSION, sourceDbFingerprint,
-    createdAt: new Date().toISOString(), reason }));
-  const prefix = Buffer.concat([MAGIC, Buffer.alloc(4), header]);
-  prefix.writeUInt32BE(header.length, MAGIC.length);
-  const cipher = createCipheriv('aes-256-gcm', key, nonce);
-  cipher.setAAD(header);
-  const connection = dumpConnection(env.DATABASE_BACKUP_URL);
-  const child = spawnProcess(PG_DUMP, ['--format=custom', '--no-owner', '--no-acl', `--dbname=${connection.url}`], {
-    env: { ...process.env, PGPASSWORD: connection.password }, stdio: ['ignore', 'pipe', 'pipe'],
+  return withPostgresRootCertificate(env, async (rootCertificatePath) => {
+    const id = backupId;
+    const { version, key } = currentKey(env.BACKUP_ENCRYPTION_KEYS_JSON);
+    const nonce = randomBytes(12);
+    const sourceDbFingerprint = sourceDatabaseFingerprint(env.DATABASE_BACKUP_URL);
+    const header = Buffer.from(JSON.stringify({ id, keyVersion: version, nonce: nonce.toString('base64'),
+      schemaVersion, gitSha: env.GIT_SHA, appVersion: APP_VERSION, engineVersion: ENGINE_VERSION,
+      executorVersion: EXECUTOR_VERSION, contractVersion: QUEST_CONTRACT_VERSION,
+      runnerStateSchemaVersion: RUNNER_STATE_SCHEMA_VERSION, sourceDbFingerprint,
+      createdAt: new Date().toISOString(), reason }));
+    const prefix = Buffer.concat([MAGIC, Buffer.alloc(4), header]);
+    prefix.writeUInt32BE(header.length, MAGIC.length);
+    const cipher = createCipheriv('aes-256-gcm', key, nonce);
+    cipher.setAAD(header);
+    const connection = dumpConnection(env.DATABASE_BACKUP_URL);
+    const processEnv = { ...process.env, PGPASSWORD: connection.password };
+    delete processEnv.PGSSLROOTCERT;
+    if (rootCertificatePath) processEnv.PGSSLROOTCERT = rootCertificatePath;
+    const child = spawnProcess(pgDumpPath, ['--format=custom', '--no-owner', '--no-acl', `--dbname=${connection.url}`], {
+      env: processEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stderr = { value: '' };
+    child.stderr.on('data', (chunk) => { stderr.value = `${stderr.value}${chunk}`.slice(-4000); });
+    const childDone = processFailure(child, stderr);
+    child.stdout.pipe(cipher);
+    const hash = createHash('sha256');
+    let size = 0;
+    async function* encryptedBody() {
+      hash.update(prefix); size += prefix.length; yield prefix;
+      for await (const chunk of cipher) { hash.update(chunk); size += chunk.length; yield chunk; }
+      await childDone;
+      const tag = cipher.getAuthTag(); hash.update(tag); size += tag.length; yield tag;
+    }
+    const objectKey = `questshop/${new Date().toISOString().slice(0, 10)}/${id}.qsbk`;
+    let uploadCompleted = false;
+    try {
+      await upload(s3, { Bucket: env.S3_BUCKET, Key: objectKey,
+        Body: Readable.from(encryptedBody()), ContentType: 'application/octet-stream' });
+      uploadCompleted = true;
+    } finally {
+      if (!uploadCompleted) {
+        // S3 has already failed, so keeping a database dump alive cannot make
+        // the backup recoverable. Stop it before the temporary CA is removed.
+        child.stdout.unpipe(cipher);
+        if (typeof child.kill === 'function' && !child.killed) child.kill('SIGTERM');
+        void childDone.catch(() => {});
+      }
+    }
+    const checksum = hash.digest('hex');
+    const objectHead = await s3.send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: objectKey }));
+    if (Number(objectHead.ContentLength) !== size) throw new Error('backup object size verification failed');
+    const manifest = { id, objectKey, checksum, sizeBytes: size, schemaVersion, gitSha: env.GIT_SHA,
+      appVersion: APP_VERSION, engineVersion: ENGINE_VERSION, executorVersion: EXECUTOR_VERSION,
+      contractVersion: QUEST_CONTRACT_VERSION, runnerStateSchemaVersion: RUNNER_STATE_SCHEMA_VERSION,
+      sourceDbFingerprint, encryptionKeyVersion: version, objectVersion: objectHead.VersionId ?? null,
+      createdAt: new Date().toISOString(), reason };
+    const manifestKey = `${objectKey}.json`;
+    const manifestBody = Buffer.from(JSON.stringify(manifest));
+    await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: manifestKey,
+      Body: manifestBody, ContentType: 'application/json' }));
+    const manifestHead = await s3.send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: manifestKey }));
+    if (Number(manifestHead.ContentLength) !== manifestBody.length) {
+      throw new Error('backup manifest size verification failed');
+    }
+    return { ...manifest, manifestKey };
   });
-  const stderr = { value: '' };
-  child.stderr.on('data', (chunk) => { stderr.value = `${stderr.value}${chunk}`.slice(-4000); });
-  const childDone = processFailure(child, stderr);
-  child.stdout.pipe(cipher);
-  const hash = createHash('sha256');
-  let size = 0;
-  async function* encryptedBody() {
-    hash.update(prefix); size += prefix.length; yield prefix;
-    for await (const chunk of cipher) { hash.update(chunk); size += chunk.length; yield chunk; }
-    await childDone;
-    const tag = cipher.getAuthTag(); hash.update(tag); size += tag.length; yield tag;
-  }
-  const objectKey = `questshop/${new Date().toISOString().slice(0, 10)}/${id}.qsbk`;
-  await upload(s3, { Bucket: env.S3_BUCKET, Key: objectKey,
-    Body: Readable.from(encryptedBody()), ContentType: 'application/octet-stream' });
-  const checksum = hash.digest('hex');
-  const objectHead = await s3.send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: objectKey }));
-  if (Number(objectHead.ContentLength) !== size) throw new Error('backup object size verification failed');
-  const manifest = { id, objectKey, checksum, sizeBytes: size, schemaVersion, gitSha: env.GIT_SHA,
-    appVersion: APP_VERSION, engineVersion: ENGINE_VERSION, executorVersion: EXECUTOR_VERSION,
-    contractVersion: QUEST_CONTRACT_VERSION, runnerStateSchemaVersion: RUNNER_STATE_SCHEMA_VERSION,
-    sourceDbFingerprint, encryptionKeyVersion: version, objectVersion: objectHead.VersionId ?? null,
-    createdAt: new Date().toISOString(), reason };
-  const manifestKey = `${objectKey}.json`;
-  const manifestBody = Buffer.from(JSON.stringify(manifest));
-  await s3.send(new PutObjectCommand({ Bucket: env.S3_BUCKET, Key: manifestKey,
-    Body: manifestBody, ContentType: 'application/json' }));
-  const manifestHead = await s3.send(new HeadObjectCommand({ Bucket: env.S3_BUCKET, Key: manifestKey }));
-  if (Number(manifestHead.ContentLength) !== manifestBody.length) {
-    throw new Error('backup manifest size verification failed');
-  }
-  return { ...manifest, manifestKey };
 }
 
 export async function downloadAndDecryptBackup({ env, objectKey, expectedChecksum = null,

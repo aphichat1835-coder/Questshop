@@ -2,7 +2,9 @@ import { v7 as uuidv7 } from 'uuid';
 import { runWorkerLoop } from './loop.js';
 import { processPayment } from './payment-worker.js';
 import { processOutbox } from './outbox-worker.js';
-import { acquireRunnableJob, processRunnerJob, renewRunnerJob } from '../domain/runner/service.js';
+import {
+  acquireRunnableJob, processRunnerJob, renewRunnerJob, requeueDueRunnerJobs,
+} from '../domain/runner/service.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { runMaintenance } from './maintenance-worker.js';
 import { createContext } from '../shared/correlation.js';
@@ -13,6 +15,8 @@ import { runRetention } from './retention-worker.js';
 import { rotateEncryptedRows } from './key-rotation-worker.js';
 import { evaluateAlerts } from './alert-worker.js';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { usesApplicationBackup } from '../config/env.js';
+import { reconcileIncident } from '../domain/incidents/service.js';
 
 async function gate(pool, name) {
   return (await pool.query('SELECT enabled FROM feature_gates WHERE gate = $1', [name])).rows[0]?.enabled === true;
@@ -32,22 +36,22 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
       VALUES($1,$2,$3,$4,$5)`, [uuidv7(), `WORKER:${name}`, error ? 'ERROR' : 'SUCCESS',
       Math.max(0, durationMs), error?.category ?? error?.code ?? error?.name ?? null]);
     if (error?.code === 'SECRET_DECRYPT_FAILED') {
-      await pool.query(`INSERT INTO incidents(id,incident_code,scope,state,severity,evidence,trace_id)
-        VALUES($1,'SECRET_DECRYPT_FAILED','CRYPTO','OPEN','CRITICAL',$2,$3)
-        ON CONFLICT (incident_code,scope) WHERE state<>'RESOLVED' DO UPDATE SET
-          severity=EXCLUDED.severity,evidence=EXCLUDED.evidence,updated_at=clock_timestamp()`,
-      [uuidv7(), { worker: name }, uuidv7()]);
+      const context = createContext({ actorType: 'SYSTEM', actorId: 'worker-manager', guildId: env.DISCORD_GUILD_ID,
+        idempotencyKey: `worker-secret-decrypt:${name}` });
+      await reconcileIncident({ code: 'SECRET_DECRYPT_FAILED', scope: 'CRYPTO', active: true,
+        severity: 'CRITICAL', evidence: { worker: name } }, context, { pool });
     }
   };
   const start = (name, runOnce, idleMs) => tasks.push(runWorkerLoop({ name, signal, health, logger,
     runOnce, idleMs, onIteration: recordIteration }));
+  let nextRunnerRequeueAt = 0;
   start('readiness', async () => {
     try {
       await pool.query('SELECT 1');
       health.checks.database = 'OK';
       health.checks.discord = client.isReady() ? 'OK' : 'NOT_READY';
       const ready = client.isReady() && health.checks.schema === 'OK'
-        && health.checks.runtimeLease === 'OK' && health.checks.config === 'OK'
+        && health.checks.runtimeLease === 'OK' && health.checks.config === 'OK' && health.checks.bootstrap === 'READY'
         && health.checks.keyrings === 'OK';
       health.ready = ready;
       if (ready) health.lastError = null;
@@ -78,7 +82,13 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
         if (index >= effectiveConcurrency) return false;
         const acquisitionContext = createContext({ actorType: 'SYSTEM', actorId: holder,
           guildId: env.DISCORD_GUILD_ID, idempotencyKey: `runner-acquire:${uuidv7()}` });
-        const job = await acquireRunnableJob({ holder }, acquisitionContext);
+        // Recovery is durable and also runs in maintenance. Avoid making every
+        // idle runner slot take a locking requeue transaction four times/sec.
+        if (Date.now() >= nextRunnerRequeueAt) {
+          nextRunnerRequeueAt = Date.now() + 5_000;
+          await requeueDueRunnerJobs(acquisitionContext, { pool });
+        }
+        const job = await acquireRunnableJob({ holder }, acquisitionContext, { pool });
         if (!job) return false;
         const leaseAbort = new AbortController();
         const jobSignal = AbortSignal.any([signal, leaseAbort.signal]);
@@ -86,11 +96,15 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
           while (!jobSignal.aborted) {
             await delay(15_000, undefined, { signal: jobSignal, ref: false });
             if (jobSignal.aborted) break;
-            try { await renewRunnerJob(job, 60); }
+            try { await renewRunnerJob(job, 60, { pool }); }
             catch (error) { leaseAbort.abort(error); break; }
           }
         })().catch(() => {});
-        try { await processRunnerJob(job, { env: { ...env, RUNNER_CONCURRENCY: effectiveConcurrency }, signal: jobSignal }); }
+        try {
+          await processRunnerJob(job, {
+            env: { ...env, RUNNER_CONCURRENCY: effectiveConcurrency }, signal: jobSignal, options: { pool },
+          });
+        }
         finally { leaseAbort.abort('runner finished'); await heartbeat; }
         return true;
       }, 250);
@@ -104,10 +118,10 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
     start('quest-test', async () => (await gate(pool, 'QUEST_BACKGROUND_TESTING_ENABLED'))
       && testQuest({ env, pool, signal, holder: testHolder,
         runnerConcurrency: configuredRunnerConcurrency(client, env) }), 1_000);
-    start('backup', () => runScheduledBackup({ env, pool }), 60_000);
+    if (usesApplicationBackup(env)) start('backup', () => runScheduledBackup({ env, pool }), 60_000);
     start('retention', () => runRetention({ pool }), 60_000);
     start('key-rotation', async () => (await rotateEncryptedRows({ pool, env })) > 0, 60_000);
-    start('alerts', () => evaluateAlerts({ pool, health, eventLoopMonitor }), 60_000);
+    start('alerts', () => evaluateAlerts({ env, pool, health, eventLoopMonitor }), 60_000);
     start('maintenance', async () => {
       await runMaintenance({ env, holder: maintenanceHolder, client, pool,
         runnerConcurrency: configuredRunnerConcurrency(client, env) });

@@ -4,6 +4,9 @@ function missingVersions(required, keyring) {
 }
 
 function assertCovered(label, required, keyring) {
+  if (required.length && !keyring) throw Object.assign(new Error(`${label} keyring is not configured`), {
+    code: 'KEYRING_VERSION_MISSING', keyring: label, missingVersions: required,
+  });
   const missing = missingVersions(required, keyring);
   if (missing.length) throw Object.assign(new Error(`${label} keyring is missing required versions: ${missing.join(', ')}`), {
     code: 'KEYRING_VERSION_MISSING', keyring: label, missingVersions: missing,
@@ -28,6 +31,9 @@ export async function validateKeyringCoverage(pool, env) {
     WHERE state='VERIFIED' AND object_key IS NOT NULL ORDER BY version`)).rows.map((row) => row.version);
   assertCovered('DATA_ENCRYPTION', data, env.DATA_ENCRYPTION_KEYS_JSON);
   assertCovered('VOUCHER_HMAC', vouchers, env.VOUCHER_HMAC_KEYS_JSON);
-  assertCovered('BACKUP_ENCRYPTION', backups, env.BACKUP_ENCRYPTION_KEYS_JSON);
+  // Backup encryption is optional outside production.  An empty backup
+  // history therefore must not make a non-backup runtime dereference an
+  // absent keyring; once a verified backup exists, the keyring is mandatory.
+  if (backups.length) assertCovered('BACKUP_ENCRYPTION', backups, env.BACKUP_ENCRYPTION_KEYS_JSON);
   return { data, vouchers, backups };
 }

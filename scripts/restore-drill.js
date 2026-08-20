@@ -1,15 +1,19 @@
+import '../src/config/load-local-environment.js';
 import { spawn } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
 import pg from 'pg';
 import { v7 as uuidv7 } from 'uuid';
-import { loadEnvironment } from '../src/config/env.js';
+import { loadEnvironment, usesApplicationBackup } from '../src/config/env.js';
 import { downloadAndDecryptBackup } from '../src/adapters/s3/backup.js';
-import { getRuntimePool, closePools } from '../src/db/pools.js';
+import { withPostgresRootCertificate } from '../src/adapters/s3/postgres-tls.js';
+import { getRuntimePool, closePools, postgresPoolOptions } from '../src/db/pools.js';
 import { decryptSecret } from '../src/adapters/crypto/keyring.js';
 
 const { Pool } = pg;
-const PG_RESTORE = '/usr/local/bin/pg_restore';
 const env = loadEnvironment();
+if (!usesApplicationBackup(env)) {
+  throw new Error('Aiven-managed backup is active; Questshop cannot run a pg_restore drill');
+}
 const source = getRuntimePool(env);
 const backup = (await source.query("SELECT * FROM backup_runs WHERE state='VERIFIED' ORDER BY completed_at DESC LIMIT 1")).rows[0];
 if (!backup) throw new Error('No verified backup is available for restore drill');
@@ -20,23 +24,32 @@ const direct = new URL(env.DATABASE_RESTORE_URL);
 const password = decodeURIComponent(direct.password);
 direct.password = '';
 direct.pathname = '/postgres';
-const admin = new Pool({ connectionString: direct.toString(), password, ssl: { ca: Buffer.from(env.DATABASE_SSL_CA_BASE64, 'base64').toString('utf8'), rejectUnauthorized: true }, max: 1 });
+const admin = new Pool({ ...postgresPoolOptions(env, direct.toString()), password, max: 1 });
 let target;
 try {
   await admin.query(`CREATE DATABASE ${databaseName}`);
   const restored = await downloadAndDecryptBackup({ env, objectKey: backup.object_key,
     expectedChecksum: backup.checksum });
   const targetUrl = new URL(direct); targetUrl.pathname = `/${databaseName}`;
-  const child = spawn(PG_RESTORE, ['--no-owner', '--no-acl', `--dbname=${targetUrl}`], {
-    env: { ...process.env, PGPASSWORD: password }, stdio: ['pipe', 'ignore', 'pipe'],
+  await withPostgresRootCertificate(env, async (rootCertificatePath) => {
+    const processEnv = { ...process.env, PGPASSWORD: password };
+    delete processEnv.PGSSLROOTCERT;
+    if (rootCertificatePath) processEnv.PGSSLROOTCERT = rootCertificatePath;
+    const child = spawn(env.PG_RESTORE_PATH ?? 'pg_restore', ['--no-owner', '--no-acl', `--dbname=${targetUrl}`], {
+      env: processEnv,
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4000); });
+    const restoreInput = pipeline(restored.dumpStream, child.stdin);
+    const waitForRestore = new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', resolve);
+    });
+    const [code] = await Promise.all([waitForRestore, restoreInput]);
+    if (code !== 0) throw new Error(`pg_restore failed (${code}): ${stderr}`);
   });
-  let stderr = '';
-  child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-4000); });
-  const restoreInput = pipeline(restored.dumpStream, child.stdin);
-  const code = await new Promise((resolve) => child.once('close', resolve));
-  await restoreInput;
-  if (code !== 0) throw new Error(`pg_restore failed (${code}): ${stderr}`);
-  target = new Pool({ connectionString: targetUrl.toString(), password, ssl: { ca: Buffer.from(env.DATABASE_SSL_CA_BASE64, 'base64').toString('utf8'), rejectUnauthorized: true }, max: 1 });
+  target = new Pool({ ...postgresPoolOptions(env, targetUrl.toString()), password, max: 1 });
   const receiver = (await target.query(`SELECT * FROM receiver_versions
     ORDER BY version DESC LIMIT 1`)).rows[0];
   if (receiver) decryptSecret({ keyVersion: receiver.encryption_key_version,

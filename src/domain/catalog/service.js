@@ -3,17 +3,22 @@ import { withTransaction } from '../../db/transaction.js';
 import { ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION } from '../../config/versions.js';
 import { resolvePrice } from '../pricing/resolver.js';
 import { enqueueProjection } from '../outbox/service.js';
-import { recordTransition } from '../shared/transition.js';
+import { assertTransition, recordTransition } from '../shared/transition.js';
 import { evaluateExpiryAdmission } from './expiry.js';
+import { createMonitorTestBatch, hasCurrentTestPass } from './test-gate.js';
+import { ANALYSIS_TRANSITIONS, SALE_TRANSITIONS } from './states.js';
+import { questContractHash } from '../../quest-engine/schema/contract.js';
 
 async function transitionAnalysis(client, quest, next, context) {
   if (quest.analysis_state === next) return quest;
+  assertTransition(ANALYSIS_TRANSITIONS, quest.analysis_state, next);
   const updated = (await client.query(`
     UPDATE quests SET analysis_state = $2, analysis_version = analysis_version + 1,
       updated_at = transaction_timestamp(),
       first_analysis_at = COALESCE(first_analysis_at, transaction_timestamp())
     WHERE quest_id = $1 AND analysis_version = $3 RETURNING *
   `, [quest.quest_id, next, quest.analysis_version])).rows[0];
+  if (!updated) throw new Error(`Quest analysis state changed concurrently: ${quest.quest_id}`);
   await recordTransition(client, {
     aggregateType: 'QUEST_ANALYSIS', aggregateId: quest.quest_id,
     fromState: quest.analysis_state, toState: next, stateVersion: updated.analysis_version, context,
@@ -24,8 +29,9 @@ async function transitionAnalysis(client, quest, next, context) {
 async function reconcileSale(client, quest, normalized, context, runnerConcurrency) {
   const price = await resolvePrice(client, { questId: quest.quest_id, taskType: quest.task_type });
   const expiry = await evaluateExpiryAdmission(client, { quest, runnerConcurrency });
+  const testPassed = await hasCurrentTestPass(client, quest);
   const canSell = quest.analysis_state === 'SUPPORTED'
-    && normalized.coreComplete && Boolean(price) && expiry.eligible;
+    && normalized.coreComplete && normalized.contractComplete && Boolean(price) && expiry.eligible && testPassed;
   let next = quest.sale_state;
   const expired = (await client.query(
     'SELECT $1::timestamptz <= clock_timestamp() AS value',
@@ -35,24 +41,24 @@ async function reconcileSale(client, quest, normalized, context, runnerConcurren
   else if (canSell && ['CLOSED', 'PAUSED'].includes(quest.sale_state)) next = 'OPEN';
   else if (!canSell && quest.sale_state === 'OPEN') next = 'PAUSED';
   if (next === quest.sale_state) return { quest, price, expiry };
+  assertTransition(SALE_TRANSITIONS, quest.sale_state, next);
   const updated = (await client.query(`
     UPDATE quests SET sale_state = $2, sale_version = sale_version + 1,
       updated_at = transaction_timestamp()
     WHERE quest_id = $1 AND sale_version = $3 RETURNING *
   `, [quest.quest_id, next, quest.sale_version])).rows[0];
+  if (!updated) throw new Error(`Quest sale state changed concurrently: ${quest.quest_id}`);
   await recordTransition(client, {
     aggregateType: 'QUEST_SALE', aggregateId: quest.quest_id,
     fromState: quest.sale_state, toState: next, stateVersion: updated.sale_version,
     reasonCode: expiry.reason, context,
   });
-  return { quest: updated, price, expiry };
+  return { quest: updated, price, expiry, testPassed };
 }
 
 function requiresRetest(previousQuest, normalized) {
   if (!previousQuest) return false;
-  return previousQuest.executor_id !== normalized.executorId
-    || previousQuest.contract_version !== QUEST_CONTRACT_VERSION
-    || Number(previousQuest.task_target) !== Number(normalized.secondsNeeded);
+  return previousQuest.current_contract_hash !== normalized.contractHash;
 }
 
 // A Monitor can see a partial Quest payload while another active account sees
@@ -75,10 +81,20 @@ function mergeDiscoveryMetadata(previousQuest, normalized) {
   };
   merged.coreComplete = Boolean(merged.id && merged.eventName && Number(merged.secondsNeeded) > 0
     && merged.startsAt && merged.expiresAt && merged.url);
-  if (merged.coreComplete && previousQuest.analysis_state === 'SUPPORTED') {
+  // A partial payload may borrow cosmetic/absent metadata, but explicit new
+  // incompatibility evidence must never be hidden by a previously supported
+  // contract.
+  if (merged.coreComplete && previousQuest.analysis_state === 'SUPPORTED'
+    && !normalized.compatibilityIssues?.length && normalized.contractHash) {
     merged.autoSupported = true;
   }
-  return merged;
+  const contract = questContractHash(merged, {
+    engineVersion: ENGINE_VERSION,
+    executorVersion: EXECUTOR_VERSION,
+    contractVersion: QUEST_CONTRACT_VERSION,
+  });
+  return { ...merged, contractHash: contract.hash, contractCanonical: contract.canonical,
+    contractComplete: contract.complete && Boolean(merged.autoSupported) };
 }
 
 async function upsertQuest(client, normalized) {
@@ -86,8 +102,8 @@ async function upsertQuest(client, normalized) {
       INSERT INTO quests(
         quest_id, analysis_state, name, task_type, task_target, url, artwork_url,
         orbs, starts_at, expires_at, executor_id, engine_version,
-        executor_version, contract_version
-      ) VALUES ($1,'DETECTED',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        executor_version, contract_version,current_contract_hash
+      ) VALUES ($1,'DETECTED',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       ON CONFLICT (quest_id) DO UPDATE SET
         name = EXCLUDED.name, task_type = EXCLUDED.task_type,
         task_target = EXCLUDED.task_target, url = EXCLUDED.url,
@@ -95,13 +111,14 @@ async function upsertQuest(client, normalized) {
         starts_at = EXCLUDED.starts_at, expires_at = EXCLUDED.expires_at,
         executor_id = EXCLUDED.executor_id, engine_version = EXCLUDED.engine_version,
         executor_version = EXCLUDED.executor_version, contract_version = EXCLUDED.contract_version,
+        current_contract_hash = EXCLUDED.current_contract_hash,
         updated_at = transaction_timestamp()
       RETURNING *
     `, [
       normalized.id, normalized.name, normalized.eventName, normalized.secondsNeeded,
       normalized.url, normalized.artworkUrl, normalized.orbs, normalized.startsAt,
       normalized.expiresAt, normalized.executorId, ENGINE_VERSION, EXECUTOR_VERSION,
-      QUEST_CONTRACT_VERSION,
+      QUEST_CONTRACT_VERSION, normalized.contractHash,
     ])).rows[0];
 }
 
@@ -110,11 +127,12 @@ async function recordMetadataRevision(client, quest, normalized, source, redacte
     await client.query(`
       INSERT INTO quest_metadata_revisions(
         id, quest_id, revision, normalized, redacted_raw, source,
-        core_complete, schema_issues, trace_id
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        core_complete, schema_issues, contract_hash, contract_complete, trace_id
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
     `, [
       uuidv7(), quest.quest_id, revision, normalized, redactedRaw ?? normalized,
-      source, normalized.coreComplete, normalized.compatibilityIssues, context.traceId,
+      source, normalized.coreComplete, normalized.compatibilityIssues, normalized.contractHash,
+      normalized.contractComplete, context.traceId,
     ]);
   const updatedQuest = (await client.query(`
       UPDATE quests SET current_metadata_revision = $2 WHERE quest_id = $1 RETURNING *
@@ -136,33 +154,27 @@ async function analyzeQuest(client, quest, normalized, context) {
 
 export async function pauseQuestForRetest(client, quest, context) {
   if (quest.sale_state !== 'OPEN') return quest;
+  assertTransition(SALE_TRANSITIONS, quest.sale_state, 'PAUSED');
   const paused = (await client.query(`UPDATE quests SET sale_state='PAUSED',sale_version=sale_version+1,
     updated_at=transaction_timestamp() WHERE quest_id=$1 AND sale_state='OPEN'
       AND sale_version=$2 RETURNING *`, [quest.quest_id, quest.sale_version])).rows[0];
+  if (!paused) throw new Error(`Quest sale state changed during retest pause: ${quest.quest_id}`);
   await recordTransition(client, { aggregateType: 'QUEST_SALE', aggregateId: quest.quest_id,
     fromState: 'OPEN', toState: 'PAUSED', stateVersion: paused.sale_version,
     reasonCode: 'RETEST_REQUIRED', context });
   return paused;
 }
 
-async function queueTestIfSupported(client, quest, requiresTest, context) {
-  if (quest.analysis_state !== 'SUPPORTED') return;
-  const testState = requiresTest ? 'RETEST_REQUIRED' : 'TEST_QUEUED';
-  await client.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,executor_version,
-        contract_version,trace_id)
-        SELECT $1,$2,$7,$3,$4,$5,$6
-        WHERE NOT EXISTS(SELECT 1 FROM quest_test_runs WHERE quest_id=$2 AND engine_version=$3
-          AND executor_version=$4 AND contract_version=$5 AND state IN ('TEST_QUEUED','TESTING','TEST_PASSED','RETEST_REQUIRED')
-          AND ($7<>'RETEST_REQUIRED' OR state<>'TEST_PASSED'))`,
-      [uuidv7(), quest.quest_id, ENGINE_VERSION, EXECUTOR_VERSION, QUEST_CONTRACT_VERSION,
-        context.traceId, testState]);
-}
-
-async function queueDiscoveryProjections(client, quest, revision, context) {
+async function queueDiscoveryProjections(client, quest, revision, context, source) {
+  // Monitor discovery waits for a verified test gate. Customer checkout
+  // discovery may be announced after analysis, but it never opens public
+  // sale or identifies the customer in the public projection.
+  const shouldPublish = source === 'CUSTOMER_CHECKOUT'
+    || quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN';
   const announcementNotBefore = quest.announcement_state === 'ANNOUNCED'
     ? (await client.query("SELECT clock_timestamp()+interval '30 seconds' AS value")).rows[0].value
     : null;
-  await enqueueProjection(client, {
+  if (shouldPublish) await enqueueProjection(client, {
       projectionType: 'QUEST_NEW', aggregateType: 'QUEST', aggregateId: quest.quest_id,
       aggregateVersion: revision, surfaceKey: 'QUEST_NEW', notBefore: announcementNotBefore, context,
   });
@@ -176,7 +188,7 @@ export async function ingestDiscovery({
   normalized,
   source,
   redactedRaw = null,
-  runnerConcurrency = 3,
+  runnerConcurrency = 2,
 }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const previousQuest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE',
@@ -186,19 +198,40 @@ export async function ingestDiscovery({
     let quest = await upsertQuest(client, merged);
     const metadata = await recordMetadataRevision(client, quest, merged, source, redactedRaw, context);
     quest = await analyzeQuest(client, metadata.quest, merged, context);
+    // Checkout discovery may be offered to that checked account and announced
+    // after analysis, but it must not consume a Monitor credential or open
+    // public sale before the scanner has independently verified it.
+    if (quest.analysis_state === 'SUPPORTED' && source === 'MONITOR') {
+      await createMonitorTestBatch(client, { quest, context, force: needsRetest });
+    }
     const sale = await reconcileSale(client, quest, merged, context, runnerConcurrency);
     quest = needsRetest ? await pauseQuestForRetest(client, sale.quest, context) : sale.quest;
-    await queueTestIfSupported(client, quest, needsRetest, context);
-    await queueDiscoveryProjections(client, quest, metadata.revision, context);
+    await queueDiscoveryProjections(client, quest, metadata.revision, context, source);
     return { quest, price: sale.price, expiry: sale.expiry, revision: metadata.revision };
   });
 }
 
-export async function resolveSaleEligibility({ questId, progressActual = 0, runnerConcurrency = 3 }, _context, options = {}) {
+function coreMetadataPresent(quest) {
+  return Boolean(quest?.name && quest.task_type && Number(quest.task_target) > 0
+    && quest.url && quest.starts_at && quest.expires_at && quest.executor_id
+    && quest.current_contract_hash);
+}
+
+export async function resolveSaleEligibility({
+  questId,
+  progressActual = 0,
+  runnerConcurrency = 2,
+  allowCustomerAccount = false,
+}, _context, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED', maxAttempts: 1 }, async (client) => {
     const quest = (await client.query('SELECT * FROM quests WHERE quest_id = $1', [questId])).rows[0];
     if (!quest) return { eligible: false, reason: 'QUEST_NOT_FOUND' };
-    if (quest.sale_state !== 'OPEN' || quest.analysis_state !== 'SUPPORTED') {
+    const publicSale = quest.sale_state === 'OPEN' && quest.analysis_state === 'SUPPORTED'
+      && await hasCurrentTestPass(client, quest);
+    const customerAccountSale = allowCustomerAccount && quest.analysis_state === 'SUPPORTED'
+      && !['PAUSED', 'EXPIRED'].includes(quest.sale_state)
+      && coreMetadataPresent(quest);
+    if (!publicSale && !customerAccountSale) {
       return { eligible: false, reason: 'QUEST_NOT_FOR_SALE', quest };
     }
     const price = await resolvePrice(client, { questId, taskType: quest.task_type });
@@ -206,6 +239,7 @@ export async function resolveSaleEligibility({ questId, progressActual = 0, runn
     const expiry = await evaluateExpiryAdmission(client, {
       quest: { ...quest, progress_actual: progressActual }, runnerConcurrency,
     });
-    return { eligible: expiry.eligible, reason: expiry.reason, quest, price, expiry };
+    return { eligible: expiry.eligible, reason: expiry.reason, quest, price, expiry,
+      admissionScope: publicSale ? 'PUBLIC' : 'CUSTOMER_ACCOUNT' };
   });
 }

@@ -1,12 +1,19 @@
+import '../src/config/load-local-environment.js';
 import { loadEnvironment } from '../src/config/env.js';
 import { getRuntimePool, closePools } from '../src/db/pools.js';
 import { createContext } from '../src/shared/correlation.js';
 import { refundCapturedOrderItem, releaseReservation, reverseTopup } from '../src/domain/wallet/service.js';
+import { appendReleaseEvidence, assertReleaseIdentity } from '../src/domain/admin/release-evidence.js';
+import { APP_VERSION, ENGINE_VERSION } from '../src/config/versions.js';
+import { withTransaction } from '../src/db/transaction.js';
+import { appendAdminAudit } from '../src/domain/admin/audit.js';
 
 if (process.env.CONFIRM_PRELAUNCH_CLOSEOUT !== 'I_UNDERSTAND_COMPENSATING_TRANSACTIONS') {
   throw new Error('Set CONFIRM_PRELAUNCH_CLOSEOUT=I_UNDERSTAND_COMPENSATING_TRANSACTIONS after Owner review');
 }
 const env = loadEnvironment();
+const release = assertReleaseIdentity({ prelaunch: env.PRELAUNCH, gitSha: env.GIT_SHA,
+  appVersion: APP_VERSION, engineVersion: ENGINE_VERSION });
 const pool = getRuntimePool(env);
 const context = (key) => createContext({ actorType: 'OWNER', actorId: env.OWNER_ID,
   guildId: env.DISCORD_GUILD_ID, idempotencyKey: `prelaunch-closeout:${key}` });
@@ -38,4 +45,12 @@ try {
   }
   console.log(JSON.stringify(report));
   if (report.failures.length) throw new Error('Pre-launch closeout requires manual review');
+  await withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (client) => {
+    const closeoutContext = context('release-evidence');
+    await appendReleaseEvidence(client, { evidenceType: 'PRELAUNCH_CLOSEOUT', subjectType: 'PRELAUNCH',
+      subjectId: release.gitSha, release, evidence: report }, closeoutContext);
+    await appendAdminAudit(client, { action: 'PRELAUNCH_CLOSEOUT', targetType: 'PRELAUNCH',
+      targetId: release.gitSha, actorId: env.OWNER_ID, after: report,
+      reason: 'pre-launch compensation completed', context: closeoutContext });
+  });
 } finally { await closePools(); }

@@ -5,10 +5,13 @@ import { createTestPool } from '../fixtures/postgres.js';
 import { createContext } from '../../src/shared/correlation.js';
 import { adjustBalance } from '../../src/domain/wallet/service.js';
 import { buildQuote, confirmOrder, createSession, selectAll } from '../../src/domain/checkout/service.js';
+import { questContractHash } from '../../src/quest-engine/schema/contract.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
 after(async () => { await pool?.end(); });
+
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 function checkoutEnvironment() {
   const key = Buffer.alloc(32, 4).toString('base64');
@@ -25,14 +28,17 @@ function checkoutEnvironment() {
 
 function checkoutApi() {
   const now = new Date();
+  const quest = { id: 'race-quest', name: 'Race Quest', eventName: 'WATCH_VIDEO',
+    secondsNeeded: 60, progressSecs: 0, progress: 0, completed: false, completedAt: null,
+    enrolled: true, enrolledAt: now.toISOString(), autoSupported: true, executorId: 'video',
+    startsAt: now.toISOString(), expiresAt: new Date(now.getTime() + ONE_DAY_MS).toISOString(),
+    url: 'https://discord.com/quests/race-quest', artworkUrl: null, orbs: 10,
+    applicationId: 'app-race', progressKey: 'video', coreComplete: true, compatibilityIssues: [] };
+  const contract = questContractHash(quest, { engineVersion: '1.0.0', executorVersion: '1.0.0',
+    contractVersion: '1.0.0' });
   return {
     fetchCurrentUser: async () => ({ id: 'race-account', username: 'Race Account', avatar: null }),
-    fetchQuests: async () => [{ id: 'race-quest', name: 'Race Quest', eventName: 'WATCH_VIDEO',
-      secondsNeeded: 60, progressSecs: 0, progress: 0, completed: false, completedAt: null,
-      enrolled: true, enrolledAt: now.toISOString(), autoSupported: true, executorId: 'video',
-      startsAt: now.toISOString(), expiresAt: new Date(now.getTime() + 86_400_000).toISOString(),
-      url: 'https://discord.com/quests/race-quest', artworkUrl: null, orbs: 10,
-      coreComplete: true, compatibilityIssues: [] }],
+    fetchQuests: async () => [{ ...quest, contractHash: contract.hash, contractComplete: contract.complete }],
   };
 }
 
@@ -40,7 +46,7 @@ function context(actorId, idempotencyKey) {
   return createContext({ actorType: 'CUSTOMER', actorId, guildId: '10000000000000002', idempotencyKey });
 }
 
-test('simultaneous confirmation of one checkout creates one order and one reservation', async (t) => {
+test('simultaneous confirmation of one checkout creates one order and one reservation', { timeout: 60_000 }, async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7();
   const user = 'checkout-race-user';
@@ -62,10 +68,9 @@ test('simultaneous confirmation of one checkout creates one order and one reserv
     confirmOrder(input, context(user, 'race-confirm-a'), options),
     confirmOrder(input, context(user, 'race-confirm-b'), options),
   ]);
-  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
-  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
-  const rejected = results.find((result) => result.status === 'rejected');
-  assert.equal(rejected.reason.code, 'SESSION_EXPIRED');
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 2);
+  assert.equal(results[0].value.orderId, results[1].value.orderId);
+  assert.equal(results.filter((result) => result.value.idempotent === true).length, 1);
   assert.equal(Number((await pool.query('SELECT count(*) AS count FROM orders')).rows[0].count), 1);
   assert.equal(Number((await pool.query('SELECT count(*) AS count FROM wallet_reservations')).rows[0].count), 1);
   const wallet = (await pool.query('SELECT available_cents,reserved_cents FROM wallets WHERE discord_user_id=$1', [user])).rows[0];
