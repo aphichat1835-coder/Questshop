@@ -5,9 +5,11 @@ import { renderSurfaceAnchor } from '../renderers/surfaces.js';
 import { appendAdminAudit } from '../../domain/admin/audit.js';
 import { reconcileIncident } from '../../domain/incidents/service.js';
 import { configuredQuestPriceRange } from '../../domain/pricing/resolver.js';
-import { fetchDiscordMessage, findDiscordMessage, isMissingDiscordMessage } from '../transport.js';
+import {
+  fetchDiscordMessage, findDiscordMessage, findDiscordMessageByNonce, isMissingDiscordMessage,
+} from '../transport.js';
 import { normalizeDiscordPayload } from '../payload.js';
-import { QUEST_AUTO_VIDEO_FILENAME, loadQuestAutoVideo } from './quest-auto-media.js';
+import { QUEST_AUTO_MEDIA_FILENAME, loadQuestAutoMedia } from './quest-auto-media.js';
 
 // Setup commands can be issued concurrently from two Discord interactions.
 // The runtime is intentionally all-in-one, so a keyed promise lock prevents
@@ -43,7 +45,9 @@ async function surfacePayload(surfaceKey, config, pool = null) {
     ? await configuredQuestPriceRange(pool)
     : undefined;
   const body = renderSurfaceAnchor(surfaceKey, brandingWithPriceRange(config, priceRange));
-  body.embeds?.[0]?.setFooter?.({ text: `Questshop Surface • ${surfaceKey}` });
+  if (surfaceKey !== 'QUEST_AUTO') {
+    body.embeds?.[0]?.setFooter?.({ text: `Questshop Surface • ${surfaceKey}` });
+  }
   return normalizeDiscordPayload(body);
 }
 
@@ -55,20 +59,25 @@ function messageAttachments(message) {
   return [];
 }
 
-function hasQuestAutoVideo(message) {
-  return messageAttachments(message).some((attachment) => (
-    attachment?.name === QUEST_AUTO_VIDEO_FILENAME || attachment?.filename === QUEST_AUTO_VIDEO_FILENAME
+function questAutoMediaAttachments(message) {
+  return messageAttachments(message).filter((attachment) => (
+    attachment?.name === QUEST_AUTO_MEDIA_FILENAME || attachment?.filename === QUEST_AUTO_MEDIA_FILENAME
   ));
 }
 
+function hasOnlyQuestAutoMedia(message) {
+  const attachments = messageAttachments(message);
+  return attachments.length === 1 && questAutoMediaAttachments(message).length === 1;
+}
+
 async function withSurfaceFiles(body, surfaceKey, message) {
-  if (surfaceKey !== 'QUEST_AUTO' || hasQuestAutoVideo(message)) return body;
+  if (surfaceKey !== 'QUEST_AUTO' || hasOnlyQuestAutoMedia(message)) return body;
   return {
     ...body,
     attachments: [],
     files: [
       ...(body.files ?? []),
-      { attachment: await loadQuestAutoVideo(), name: QUEST_AUTO_VIDEO_FILENAME },
+      { attachment: await loadQuestAutoMedia(), name: QUEST_AUTO_MEDIA_FILENAME },
     ],
   };
 }
@@ -80,15 +89,20 @@ function firstEmbedData(value) {
 }
 
 export function questAutoSurfaceMatches(message, expectedBody) {
-  if (!message || !hasQuestAutoVideo(message)) return false;
+  if (!message || !hasOnlyQuestAutoMedia(message)) return false;
   const actual = firstEmbedData(message);
   const expected = firstEmbedData(expectedBody);
   return actual.title === expected.title
     && actual.description === expected.description
-    && actual.footer?.text === expected.footer?.text;
+    && !actual.footer?.text
+    && Boolean(actual.image?.url);
 }
 
 async function findSurfaceMarker(channel, surfaceKey) {
+  if (surfaceKey === 'QUEST_AUTO') {
+    const byNonce = await findDiscordMessageByNonce(channel, surfaceNonce(surfaceKey));
+    if (byNonce?.author?.id === channel.client.user?.id) return byNonce;
+  }
   return findDiscordMessage(channel, (message) => message.author?.id === channel.client.user?.id
     && message.embeds?.[0]?.footer?.text === `Questshop Surface • ${surfaceKey}`);
 }
