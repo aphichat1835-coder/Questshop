@@ -9,6 +9,7 @@ import { advanceMonitorTestBatch } from '../../src/domain/catalog/test-gate.js';
 import { enqueueProjection } from '../../src/domain/outbox/service.js';
 import { questContractHash } from '../../src/quest-engine/schema/contract.js';
 import { processOutbox } from '../../src/workers/outbox-worker.js';
+import { reconcileSellableQuests } from '../../src/workers/maintenance-worker.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -83,6 +84,22 @@ test('outbox enqueue boundary refuses a first-time QUEST_NEW for an already expi
     WHERE projection_type='QUEST_NEW' AND aggregate_id='expired-outbox'`)).rows[0].count), 0);
   assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM outbox_events
     WHERE aggregate_type='QUEST' AND aggregate_id='expired-outbox'`)).rows[0].count), 0);
+});
+
+test('maintenance expires historical Quest without creating a first-time QUEST_NEW projection', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const context = createContext({ actorType: 'SYSTEM', actorId: 'maintenance', guildId: 'guild',
+    idempotencyKey: 'expired-maintenance-no-announcement' });
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,sale_state,name,task_type,task_target,url,expires_at,
+    public_test_gate_override)
+    VALUES('expired-maintenance','SUPPORTED','OPEN','Expired maintenance','WATCH_VIDEO',60,
+      'https://discord.com/quests/expired-maintenance',clock_timestamp()-interval '1 minute',true)`);
+
+  await reconcileSellableQuests(pool, context, 2);
+  assert.deepEqual((await pool.query(`SELECT analysis_state,sale_state FROM quests
+    WHERE quest_id='expired-maintenance'`)).rows[0], { analysis_state: 'EXPIRED', sale_state: 'EXPIRED' });
+  assert.equal(Number((await pool.query(`SELECT count(*)::integer AS count FROM message_projections
+    WHERE projection_type='QUEST_NEW' AND aggregate_id='expired-maintenance'`)).rows[0].count), 0);
 });
 
 test('queued QUEST_NEW that expires during delivery backoff is suppressed before Discord send', async (t) => {
