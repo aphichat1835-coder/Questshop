@@ -6,7 +6,9 @@ import {
   fetchSurfaceMessageFresh, questAutoSurfaceMatches, surfaceNonce, updateOrCreateSurfaceAnchor,
 } from '../../src/discord/surfaces/setup.js';
 import { normalizeDiscordPayload } from '../../src/discord/payload.js';
-import { loadQuestAutoVideo } from '../../src/discord/surfaces/quest-auto-media.js';
+import {
+  QUEST_AUTO_MEDIA_ATTACHMENT_URL, QUEST_AUTO_MEDIA_FILENAME, loadQuestAutoMedia,
+} from '../../src/discord/surfaces/quest-auto-media.js';
 
 function createChannel({ listedMessages = [], sentMessage = { id: 'new-anchor' } } = {}) {
   const fetches = [];
@@ -48,6 +50,8 @@ test('Quest Auto uses the Owner-approved storefront copy and one price when cate
     'ใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ',
     'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
   ].join('\n'));
+  assert.equal(body.embeds[0].data.image.url, QUEST_AUTO_MEDIA_ATTACHMENT_URL);
+  assert.equal(body.embeds[0].data.footer, undefined);
 });
 
 test('Quest Auto collapses different Admin prices into a minimum-maximum range', () => {
@@ -115,18 +119,34 @@ test('surface setup finds its marker beyond the old 25-message scan without crea
   assert.equal(channel.sent.length, 0);
 });
 
-test('Quest Auto bundled video is the exact uploaded MP4', async () => {
-  const video = await loadQuestAutoVideo();
-  assert.ok(Buffer.isBuffer(video));
-  assert.equal(video.length, 6_812_564);
-  assert.equal(video.subarray(4, 8).toString('ascii'), 'ftyp');
+test('Quest Auto recovers its invisible anchor by stable nonce instead of a visible footer', async () => {
+  const marker = {
+    id: 'quest-auto-anchor',
+    nonce: surfaceNonce('QUEST_AUTO'),
+    author: { id: 'bot' },
+    attachments: new Map([['gif', { name: QUEST_AUTO_MEDIA_FILENAME }]]),
+    embeds: [{ title: 'Discord Quest • Auto', image: { url: 'https://cdn.example/quest-auto-demo.gif' } }],
+    edit: async () => marker,
+  };
+  const channel = createChannel({ listedMessages: [marker] });
+  const result = await updateOrCreateSurfaceAnchor(channel, 'QUEST_AUTO', { values: {} }, null,
+    { pool: priceRangePool(500, 500) });
+  assert.equal(result.message.id, 'quest-auto-anchor');
+  assert.equal(channel.sent.length, 0);
 });
 
-test('Quest Auto attaches the uploaded video and clears stale attachments', async () => {
+test('Quest Auto bundled GIF is the exact uploaded asset', async () => {
+  const media = await loadQuestAutoMedia();
+  assert.ok(Buffer.isBuffer(media));
+  assert.equal(media.length, 9_190_692);
+  assert.equal(media.subarray(0, 6).toString('ascii'), 'GIF89a');
+});
+
+test('Quest Auto embeds the uploaded GIF and clears stale attachments', async () => {
   const edits = [];
   const existing = {
     id: 'quest-auto',
-    attachments: new Map([['legacy', { name: 'quest-auto-demo.mp4' }]]),
+    attachments: new Map([['legacy', { name: 'videoplayback.mp4' }]]),
     edit: async (body) => {
       edits.push(body);
       return existing;
@@ -137,18 +157,20 @@ test('Quest Auto attaches the uploaded video and clears stale attachments', asyn
     { pool: priceRangePool(500, 700) });
   assert.equal(edits.length, 1);
   assert.deepEqual(edits[0].attachments, []);
-  assert.equal(edits[0].files?.[0]?.name, 'videoplayback.mp4');
+  assert.equal(edits[0].files?.[0]?.name, QUEST_AUTO_MEDIA_FILENAME);
   assert.ok(Buffer.isBuffer(edits[0].files[0].attachment));
-  assert.equal(edits[0].files[0].attachment.length, 6_812_564);
-  assert.equal(edits[0].files[0].attachment.subarray(4, 8).toString('ascii'), 'ftyp');
+  assert.equal(edits[0].files[0].attachment.length, 9_190_692);
+  assert.equal(edits[0].files[0].attachment.subarray(0, 6).toString('ascii'), 'GIF89a');
+  assert.equal(edits[0].embeds[0].image.url, QUEST_AUTO_MEDIA_ATTACHMENT_URL);
+  assert.equal(edits[0].embeds[0].footer, undefined);
   assert.match(edits[0].embeds[0].description, /ค่าบริการ 5-7 บาท/);
 });
 
-test('Quest Auto keeps its existing uploaded video instead of uploading a duplicate on refresh', async () => {
+test('Quest Auto keeps its existing uploaded GIF instead of uploading a duplicate on refresh', async () => {
   let editedBody;
   const existing = {
     id: 'quest-auto',
-    attachments: new Map([['video', { name: 'videoplayback.mp4' }]]),
+    attachments: new Map([['gif', { name: QUEST_AUTO_MEDIA_FILENAME }]]),
     edit: async (body) => {
       editedBody = body;
       return existing;
@@ -158,22 +180,24 @@ test('Quest Auto keeps its existing uploaded video instead of uploading a duplic
     { pool: priceRangePool(500, 500) });
   assert.equal(editedBody.files, undefined);
   assert.equal(editedBody.attachments, undefined);
+  assert.equal(editedBody.embeds[0].image.url, QUEST_AUTO_MEDIA_ATTACHMENT_URL);
 });
 
-test('Quest Auto reconciliation detects a stale displayed price even when the video is already attached', () => {
+test('Quest Auto reconciliation detects stale price and rejects the old visible technical footer', () => {
   const expected = normalizeDiscordPayload(renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 700n } }));
-  expected.embeds[0].footer = { text: 'Questshop Surface • QUEST_AUTO' };
   const message = {
-    attachments: new Map([['video', { name: 'videoplayback.mp4' }]]),
+    attachments: new Map([['gif', { name: QUEST_AUTO_MEDIA_FILENAME }]]),
     embeds: [{
       title: 'Discord Quest • Auto',
       description: expected.embeds[0].description.replace('5-7', '5'),
-      footer: { text: 'Questshop Surface • QUEST_AUTO' },
+      image: { url: 'https://cdn.example/quest-auto-demo.gif' },
     }],
   };
   assert.equal(questAutoSurfaceMatches(message, expected), false);
   message.embeds[0].description = expected.embeds[0].description;
   assert.equal(questAutoSurfaceMatches(message, expected), true);
+  message.embeds[0].footer = { text: 'Questshop Surface • QUEST_AUTO' };
+  assert.equal(questAutoSurfaceMatches(message, expected), false);
 });
 
 test('rate limiting and transient fetch failures never become a missing-message recreate', async () => {
