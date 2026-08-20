@@ -174,11 +174,11 @@ export async function pauseQuestForRetest(client, quest, context) {
 }
 
 async function queueDiscoveryProjections(client, quest, revision, context, source) {
-  // Monitor discovery waits for a verified test gate. Customer checkout
-  // discovery may be announced after analysis, but it never opens public
-  // sale or identifies the customer in the public projection.
-  const shouldPublish = source === 'CUSTOMER_CHECKOUT'
-    || quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN';
+  // Expired Quest records remain durable catalog/history evidence, but they
+  // must never become a customer-facing QUEST_NEW notification. Monitor
+  // discovery still writes the operational projection for diagnostics.
+  const shouldPublish = quest.sale_state !== 'EXPIRED' && (source === 'CUSTOMER_CHECKOUT'
+    || quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN');
   const announcementNotBefore = quest.announcement_state === 'ANNOUNCED'
     ? (await client.query("SELECT clock_timestamp()+interval '30 seconds' AS value")).rows[0].value
     : null;
@@ -207,14 +207,20 @@ export async function ingestDiscovery({
     let quest = await upsertQuest(client, merged);
     const metadata = await recordMetadataRevision(client, quest, merged, source, redactedRaw, context);
     quest = await analyzeQuest(client, metadata.quest, merged, context);
+
+    // Expiry is reconciled before any Monitor test batch is created. This is
+    // intentionally earlier than the test gate so first-run scans can ingest
+    // Discord's historical Quest list without burning Monitor tokens/rate
+    // limit on Quest records that are already impossible to run.
+    const sale = await reconcileSale(client, quest, merged, context, runnerConcurrency);
+    quest = sale.quest;
     // Checkout discovery may be offered to that checked account and announced
     // after analysis, but it must not consume a Monitor credential or open
     // public sale before the scanner has independently verified it.
-    if (quest.analysis_state === 'SUPPORTED' && source === 'MONITOR') {
+    if (quest.analysis_state === 'SUPPORTED' && source === 'MONITOR' && quest.sale_state !== 'EXPIRED') {
       await createMonitorTestBatch(client, { quest, context, force: needsRetest });
     }
-    const sale = await reconcileSale(client, quest, merged, context, runnerConcurrency);
-    quest = needsRetest ? await pauseQuestForRetest(client, sale.quest, context) : sale.quest;
+    quest = needsRetest ? await pauseQuestForRetest(client, quest, context) : quest;
     await queueDiscoveryProjections(client, quest, metadata.revision, context, source);
     return { quest, price: sale.price, expiry: sale.expiry, revision: metadata.revision };
   });
