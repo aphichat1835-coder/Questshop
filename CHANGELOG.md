@@ -24,6 +24,10 @@ There is no production release/tag evidence yet; current work remains under `[Un
   differing GAME/VIDEO prices render a min-max range; incomplete configuration renders a not-ready price message.
 - Immediate post-commit Quest price-change event plus a background surface-refresh listener. This edits the durable
   `QUEST_AUTO` storefront as soon as an Admin category-price transaction commits, while retaining Maintenance as repair fallback.
+- Multi-layer expired-Quest guards across Monitor discovery, Monitor test batching, Outbox enqueue and first-time Discord
+  delivery. Historical Quest can remain durable evidence without consuming Monitor test attempts or creating stale `QUEST_NEW` spam.
+- Integration coverage for first-run expired Quest filtering, Maintenance notification suppression, delivery-time expiry
+  races and stopping an active test batch without cycling to another Monitor Token.
 - Owner-approved `src/discord/assets/quest-auto-demo.gif` generated from the supplied Quest demo video and rendered
   inside the Quest Auto embed through `attachment://quest-auto-demo.gif`.
 - Runtime GIF integrity verification using exact file size `9,190,692` bytes, GIF signature and SHA-256
@@ -52,6 +56,12 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - A missing or legacy Quest Auto attachment is cleared and replaced with `quest-auto-demo.gif` on the same surface.
 - Admin GAME/VIDEO price changes now trigger immediate background reconciliation after the database commit instead of
   waiting for the next ~60-second Maintenance pass. Maintenance remains the fallback if immediate Discord delivery fails.
+- Monitor discovery now reconciles `expires_at` before creating a test batch. Already-expired Quest is marked `EXPIRED`,
+  kept as history/operations evidence, and never consumes a Monitor Token or public announcement slot.
+- A Quest that expires while a Monitor test batch is active stops that batch without switching to another Monitor or
+  raising a misleading exhausted-monitor failure alert; retry controls do not restart an already-expired Quest.
+- `QUEST_NEW` is expiry-gated again at Outbox enqueue and before first Discord send. Notifications that expire during
+  retry/backoff are durably suppressed without pinging a role or marking the Quest as `ANNOUNCED`.
 - Quest-new customer announcements now show Discord Quest **เริ่ม Quest** (`starts_at`) and **หมดอายุ** (`expires_at`)
   instead of scanner **ตรวจพบ** / mutable **อัปเดต** timestamps.
 - `QUEST_NEW` now has one customer-facing renderer source: generic projection rendering and Outbox delivery both route
@@ -92,5 +102,6 @@ Every candidate Git SHA must freshly pass syntax/check, lint, PostgreSQL-backed 
 fake-adapter load test, `npm audit --audit-level=high` and Docker build. Record the exact passing workflow run with UAT;
 a previous green SHA is not evidence for a newer candidate.
 
-These are source/CI results only. Discord GIF rendering, Quest reward/start/expiry/artwork fidelity, visible price refresh,
-TrueMoney, live Quest execution, Aiven/inwcloud restart and Owner UAT remain live evidence boundaries.
+These are source/CI results only. Discord GIF rendering, Quest reward/start/expiry/artwork fidelity, first-run historical
+Quest filtering, visible price refresh, TrueMoney, live Quest execution, Aiven/inwcloud restart and Owner UAT remain live
+evidence boundaries.
