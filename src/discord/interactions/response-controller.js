@@ -1,6 +1,7 @@
 import { MessageFlags } from 'discord.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { normalizeDiscordPayload } from '../payload.js';
+import { parseCustomId } from '../components/custom-id.js';
 
 export const ACKNOWLEDGEMENT = Object.freeze({
   NONE: 'NONE',
@@ -83,13 +84,15 @@ export function installResponseController(interaction, { onAcknowledged = () => 
 
 export async function acknowledgeByContract(interaction, response) {
   if (response === 'UPDATE') return interaction.deferUpdate();
-  if (response === 'REPLY') return interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  if (response === 'PROGRESS') {
-    interaction.__questshopProgressAcknowledged = true;
-    return interaction.reply({
-      content: 'กำลังตรวจบัญชีและค้นหา Quest ที่ยังใช้งานได้…',
-      flags: MessageFlags.Ephemeral,
-    });
+  if (response === 'REPLY') {
+    if (parseCustomId(interaction.customId)?.route === 'token_submit') {
+      interaction.__questshopProgressAcknowledged = true;
+      return interaction.reply({
+        content: 'กำลังตรวจบัญชีและค้นหา Quest ที่ยังใช้งานได้…',
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+    return interaction.deferReply({ flags: MessageFlags.Ephemeral });
   }
   return null;
 }
