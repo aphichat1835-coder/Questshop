@@ -52,10 +52,11 @@ export function normalizeVoucherUrl(input) {
 function singleRecipientConfirmed(data) {
   const member = data?.voucher?.member;
   const available = data?.voucher?.available;
-  if (member == null && available == null) return false;
-  if (member != null && member !== 1) return false;
-  if (available != null && available !== 1) return false;
-  return member === 1 || available === 1;
+  // `member` is the stronger recipient-count signal when the provider returns
+  // it. `available` remains a backwards-compatible fallback for payloads that
+  // omit member; do not require both fields to have identical post-redeem semantics.
+  if (member != null) return member === 1;
+  return available === 1;
 }
 
 function successfulHttpStatus(status) {
@@ -103,9 +104,6 @@ export async function redeemVoucher({
   receiverPhone,
   signal,
   onPossiblySent = () => {},
-  // Dependency injection is intentionally limited to the transport factory.
-  // It makes the pinned provider contract testable without ever allowing a
-  // caller to control the endpoint, host, request path, or payload shape.
   requestFactory = https.request,
 }) {
   if (!VOUCHER_CODE.test(code)) throw new TypeError('invalid voucher code');
