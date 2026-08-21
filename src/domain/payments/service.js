@@ -38,7 +38,7 @@ function assertVoucherOwner(existing, discordUserId) {
 
 async function findCommittedVoucher(pool, hashes) {
   // PostgreSQL may report a serialization failure while the concurrent owner
-  // is still committing.  This is a read-only bounded reconciliation; it
+  // is still committing. This is a read-only bounded reconciliation; it
   // never attempts to redeem or recreate a voucher.
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const existing = await withTransaction({ pool, isolation: 'READ COMMITTED', maxAttempts: 1 }, (client) => (
@@ -138,9 +138,6 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
     return { topup, idempotent: false };
     });
   } catch (error) {
-    // Concurrent submissions of the same voucher may exhaust SERIALIZABLE
-    // retries after the competing transaction has become its durable owner.
-    // Re-read only the HMAC identity; never re-run creation or encryption.
     if (error.code !== '23505' && !isRetryableTransactionError(error)) throw error;
     const existing = await findCommittedVoucher(options.pool, hashes);
     if (!existing) throw error;
@@ -217,9 +214,7 @@ export async function recordProviderResult({ topup, attemptId, result }, context
       SELECT * FROM topups WHERE id = $1 AND lease_owner=$2 AND fencing_token=$3
         AND lease_expires_at>clock_timestamp() FOR UPDATE
     `, [topup.id, topup.lease_owner, topup.fencing_token])).rows[0];
-    if (!locked) {
-      throw new FencingLostError(`topup:${topup.id}`);
-    }
+    if (!locked) throw new FencingLostError(`topup:${topup.id}`);
     const next = result.outcome;
     if (!(TOPUP_TRANSITIONS[locked.status] ?? []).includes(next)) {
       throw new QuestshopError('TOPUP_TRANSITION_INVALID', `${locked.status} cannot become ${next}`);
@@ -229,61 +224,43 @@ export async function recordProviderResult({ topup, attemptId, result }, context
       UPDATE payment_attempts SET dispatch_state = $2, provider_status_code = $3,
         provider_http_status = $4, provider_evidence = $5,
         error_class=$6,error_code=$7,completed_at = clock_timestamp() WHERE id = $1
-    `, [
-      attemptId, paymentAttemptState(next),
-      result.providerCode ?? null, result.httpStatus ?? null,
-      { receiverConfirmation: result.receiverConfirmation ?? null },
-      attemptError.errorClass, attemptError.errorCode,
-    ]);
+    `, [attemptId, paymentAttemptState(next), result.providerCode ?? null, result.httpStatus ?? null,
+      { receiverConfirmation: result.receiverConfirmation ?? null }, attemptError.errorClass, attemptError.errorCode]);
     let updated = (await client.query(`
       UPDATE topups SET status = $2, state_version = state_version + 1,
-        provider_transaction_id = $3, amount_cents = $4, currency = $5,
+        provider_transaction_id = $3, amount_cents = $4::bigint, currency = $5,
         sender_name = $6, sender_phone = $7, failure_code = $8,
-        warning_code = CASE WHEN $4 > 100000 THEN 'AMOUNT_OVER_CONFIGURED_LIMIT'
-          WHEN $4 < 1000 THEN 'AMOUNT_BELOW_CONFIGURED_LIMIT' ELSE warning_code END,
+        warning_code = CASE WHEN $4::bigint > 100000::bigint THEN 'AMOUNT_OVER_CONFIGURED_LIMIT'
+          WHEN $4::bigint < 1000::bigint THEN 'AMOUNT_BELOW_CONFIGURED_LIMIT' ELSE warning_code END,
         redeemed_at = CASE WHEN $2 = 'REDEEMED' THEN transaction_timestamp() ELSE redeemed_at END,
-        -- Full jitter: a request proven not sent may retry at most three times
-        -- inside the two-minute payment budget. A possibly-sent request never
-        -- reaches this branch (it is sent to Manual Review instead).
         available_at = CASE WHEN $2 = 'RETRY_WAIT' THEN clock_timestamp() + make_interval(
           secs => floor(random() * LEAST(60::double precision,
             10::double precision * power(2::double precision, GREATEST(0, $10 - 1))))::integer
         ) ELSE available_at END,
         lease_owner = NULL, lease_expires_at = NULL, updated_at = transaction_timestamp()
       WHERE id = $1 AND state_version = $9 RETURNING *
-    `, [
-      topup.id, next, result.providerTransactionId ?? null, result.amountCents ?? null,
+    `, [topup.id, next, result.providerTransactionId ?? null, result.amountCents ?? null,
       result.currency ?? null, result.senderName ?? null, result.senderPhone ?? null,
-      result.providerCode ?? null, locked.state_version, topup.attempt_count,
-    ])).rows[0];
+      result.providerCode ?? null, locked.state_version, topup.attempt_count])).rows[0];
     if (!updated) throw new QuestshopError('TOPUP_STALE', 'Top-up changed concurrently');
-    await recordTransition(client, {
-      aggregateType: 'TOPUP', aggregateId: topup.id,
-      fromState: locked.status, toState: next, stateVersion: updated.state_version, context,
-    });
+    await recordTransition(client, { aggregateType: 'TOPUP', aggregateId: topup.id,
+      fromState: locked.status, toState: next, stateVersion: updated.state_version, context });
     if (['INVALID', 'EXPIRED', 'ALREADY_REDEEMED'].includes(next)) {
       await client.query(`INSERT INTO customer_rate_limit_events(id,discord_user_id,operation,trace_id)
         VALUES($1,$2,'VOUCHER_INVALID',$3)`, [uuidv7(), updated.discord_user_id, context.traceId]);
     }
     if (next === 'AMBIGUOUS') {
       const ambiguous = updated;
-      updated = (await client.query(`
-        UPDATE topups SET status = 'MANUAL_REVIEW', state_version = state_version + 1,
-          updated_at = transaction_timestamp() WHERE id = $1 AND state_version = $2 RETURNING *
-      `, [topup.id, ambiguous.state_version])).rows[0];
-      await recordTransition(client, {
-        aggregateType: 'TOPUP', aggregateId: topup.id,
-        fromState: 'AMBIGUOUS', toState: 'MANUAL_REVIEW', stateVersion: updated.state_version,
-        context,
-      });
-      await openReview(client, {
-        subjectType: 'TOPUP', subjectId: topup.id,
-        reason: 'AMBIGUOUS_PROVIDER_RESULT', financial: true, ownerOnly: true, context,
-      });
+      updated = (await client.query(`UPDATE topups SET status = 'MANUAL_REVIEW', state_version = state_version + 1,
+        updated_at = transaction_timestamp() WHERE id = $1 AND state_version = $2 RETURNING *`,
+      [topup.id, ambiguous.state_version])).rows[0];
+      await recordTransition(client, { aggregateType: 'TOPUP', aggregateId: topup.id,
+        fromState: 'AMBIGUOUS', toState: 'MANUAL_REVIEW', stateVersion: updated.state_version, context });
+      await openReview(client, { subjectType: 'TOPUP', subjectId: topup.id,
+        reason: 'AMBIGUOUS_PROVIDER_RESULT', financial: true, ownerOnly: true, context });
     }
     await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
-      aggregateId: topup.id, aggregateVersion: updated.state_version,
-      surfaceKey: 'LOG_PAYMENTS', context });
+      aggregateId: topup.id, aggregateVersion: updated.state_version, surfaceKey: 'LOG_PAYMENTS', context });
     return updated;
   });
 }
@@ -296,9 +273,7 @@ async function moveRedeemedTopupToReviewInTransaction(client, { topupId, reason 
       reason, financial: true, ownerOnly: true, context });
     return { topup: locked, review, idempotent: true };
   }
-  if (locked.status !== 'REDEEMED') {
-    throw new QuestshopError('STALE_STATE', 'สถานะรายการเติมเงินเปลี่ยนไปแล้ว');
-  }
+  if (locked.status !== 'REDEEMED') throw new QuestshopError('STALE_STATE', 'สถานะรายการเติมเงินเปลี่ยนไปแล้ว');
   const updated = (await client.query(`UPDATE topups SET status='MANUAL_REVIEW',
     state_version=state_version+1,failure_code=$2,lease_owner=NULL,lease_expires_at=NULL,
     updated_at=clock_timestamp() WHERE id=$1 AND status='REDEEMED' AND state_version=$3 RETURNING *`,
@@ -310,8 +285,7 @@ async function moveRedeemedTopupToReviewInTransaction(client, { topupId, reason 
   const review = await openReview(client, { subjectType: 'TOPUP', subjectId: topupId,
     reason, financial: true, ownerOnly: true, context });
   await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
-    aggregateId: topupId, aggregateVersion: updated.state_version,
-    surfaceKey: 'LOG_PAYMENTS', context });
+    aggregateId: topupId, aggregateVersion: updated.state_version, surfaceKey: 'LOG_PAYMENTS', context });
   return { topup: updated, review, idempotent: false };
 }
 
