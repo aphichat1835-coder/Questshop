@@ -34,7 +34,7 @@ test('crash/replay at REDEEMED to CREDITED credits exactly once', async (t) => {
   assert.equal(ledger.count, 1);
 });
 
-test('owner manual review credits ambiguous top-up atomically with audit', async (t) => {
+test('owner manual review requires a matching second confirmation before crediting atomically with audit', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const topup = uuidv7(); const review = uuidv7(); const trace = uuidv7();
   const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE'")).rows[0].id;
@@ -46,9 +46,17 @@ test('owner manual review credits ambiguous top-up atomically with audit', async
   [review, topup, trace]);
   const context = createContext({ traceId: trace, actorType: 'OWNER', actorId: 'owner',
     guildId: '10000000000000002', idempotencyKey: 'manual-credit' });
-  const result = await resolveSubjectReview({ reviewId: review, decision: 'CREDIT',
+  const input = { reviewId: review, decision: 'CREDIT',
     reason: 'verified in TrueMoney application', isOwner: true, amountCents: 1_250n,
-    providerTransactionId: 'provider-manual-1' }, context, { pool });
+    providerTransactionId: 'provider-manual-1' };
+  const prepared = await resolveSubjectReview(input, context, { pool });
+  assert.equal(prepared.applied.confirmationRequired, true);
+  assert.equal(prepared.review.state, 'OPEN');
+  assert.equal((await pool.query('SELECT status FROM topups WHERE id=$1', [topup])).rows[0].status, 'MANUAL_REVIEW');
+  assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM review_evidence
+    WHERE review_id=$1 AND evidence_type='CREDIT_CONFIRMATION_PREPARED'`, [review])).rows[0].count), 1);
+
+  const result = await resolveSubjectReview(input, context, { pool });
   assert.equal(result.review.state, 'RESOLVED');
   assert.equal(result.applied.status, 'CREDITED');
   const wallet = (await pool.query("SELECT * FROM wallets WHERE discord_user_id='review-user'")).rows[0];
@@ -64,17 +72,44 @@ test('owner manual review credits ambiguous top-up atomically with audit', async
   ]);
   assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM review_evidence
     WHERE review_id=$1 AND evidence_type='DECISION_INPUT'`, [review])).rows[0].count), 1);
-  assert.equal(Number((await pool.query(`SELECT count(*) AS count FROM admin_audit_logs
-    WHERE target_type='TOPUP' AND target_id=$1`, [topup])).rows[0].count), 1);
+  assert.ok(Number((await pool.query(`SELECT count(*) AS count FROM admin_audit_logs
+    WHERE target_type='TOPUP' AND target_id=$1`, [topup])).rows[0].count) >= 2);
   await adjustBalance({ discordUserId: 'review-user', amountCents: -1_000n,
     reason: 'spent before reversal' }, createContext({ traceId: trace, actorType: 'OWNER', actorId: 'owner',
     guildId: '10000000000000002', idempotencyKey: 'spend-before-reversal' }), { pool });
   const reversal = await reverseTopup({ topupId: topup, reason: 'provider reversal requested' },
     createContext({ traceId: trace, actorType: 'OWNER', actorId: 'owner',
-      guildId: '10000000000000002', idempotencyKey: 'reversal-review' }), { pool });
+    guildId: '10000000000000002', idempotencyKey: 'reversal-review' }), { pool });
   assert.equal(reversal.pendingReview, true);
   assert.equal((await pool.query('SELECT status FROM topups WHERE id=$1', [topup])).rows[0].status, 'CREDITED');
   assert.equal(reversal.review.owner_only, true);
+});
+
+test('owner manual review maps duplicate provider transaction id to a safe business error', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0].id;
+  const trace = uuidv7();
+  const existing = uuidv7();
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,provider_transaction_id,amount_cents,currency,trace_id,credited_at)
+    VALUES($1,'existing-tx-user','CREDITED',1,$2,$3,'1234','provider-duplicate',1000,'THB',$4,clock_timestamp())`,
+  [existing, Buffer.alloc(32, 50), receiver, trace]);
+  const topup = uuidv7(); const review = uuidv7();
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,trace_id) VALUES($1,'duplicate-review-user','MANUAL_REVIEW',1,$2,$3,'1234',$4)`,
+  [topup, Buffer.alloc(32, 51), receiver, trace]);
+  await pool.query(`INSERT INTO manual_reviews(id,subject_type,subject_id,state,financial,owner_only,
+    opened_reason,trace_id) VALUES($1,'TOPUP',$2,'OPEN',true,true,'AMBIGUOUS',$3)`, [review, topup, trace]);
+  const context = createContext({ traceId: trace, actorType: 'OWNER', actorId: 'owner',
+    guildId: '10000000000000002', idempotencyKey: 'duplicate-manual-credit' });
+  const input = { reviewId: review, decision: 'CREDIT', reason: 'verified duplicate check', isOwner: true,
+    amountCents: 1_000n, providerTransactionId: 'provider-duplicate' };
+  const prepared = await resolveSubjectReview(input, context, { pool });
+  assert.equal(prepared.applied.confirmationRequired, true);
+  await assert.rejects(() => resolveSubjectReview(input, context, { pool }),
+    (error) => error.code === 'STALE_STATE' && /ถูกใช้/.test(error.message));
+  assert.equal((await pool.query('SELECT status FROM topups WHERE id=$1', [topup])).rows[0].status, 'MANUAL_REVIEW');
+  assert.equal((await pool.query('SELECT state FROM manual_reviews WHERE id=$1', [review])).rows[0].state, 'OPEN');
 });
 
 test('daily top-up limit credits the full received amount then blocks further top-ups until Bangkok midnight', async (t) => {
