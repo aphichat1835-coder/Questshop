@@ -12,9 +12,6 @@ import {
 import { normalizeDiscordPayload } from '../payload.js';
 import { QUEST_AUTO_MEDIA_FILENAME, loadQuestAutoMedia } from './quest-auto-media.js';
 
-// Setup commands can be issued concurrently from two Discord interactions.
-// The runtime is intentionally all-in-one, so a keyed promise lock prevents
-// two anchors for the same durable surface from being created in one process.
 const surfaceSetupLocks = new Map();
 
 async function withSurfaceSetupLock(surfaceKey, work) {
@@ -251,11 +248,18 @@ async function resolveSurfaceIncidentSafely(pool, surfaceKey, context) {
   }
 }
 
+async function quarantineSensitiveSurface(pool, surfaceKey, error) {
+  if (surfaceKey !== 'LOG_PAYMENTS' || error?.code !== 'SURFACE_CHANNEL_INVALID') return;
+  await pool.query(`UPDATE surfaces SET state='DISABLED',state_version=state_version+1,
+    updated_at=clock_timestamp() WHERE surface_key=$1 AND state<>'DISABLED'`, [surfaceKey]);
+}
+
 async function recordSurfaceIncidentSafely(pool, surfaceKey, error, context) {
   try {
+    await quarantineSensitiveSurface(pool, surfaceKey, error);
     await recordSurfaceIncident(pool, surfaceKey, error, context);
   } catch {
-    // A database outage is already the authoritative failure.  Do not hide
+    // A database outage is already the authoritative failure. Do not hide
     // the original Discord error or stop reconciliation of other surfaces.
   }
 }
@@ -264,8 +268,6 @@ async function deactivateOrphan(message, pool, surfaceKey, context) {
   try {
     await message.edit({ content: 'แผงนี้ถูกแทนที่แล้ว', embeds: [], components: [], attachments: [] });
   } catch (error) {
-    // The authoritative surface pointer remains unchanged; the next pass will
-    // report the delivery failure without treating the orphan as active.
     await recordSurfaceIncidentSafely(pool, surfaceKey, error, context);
   }
 }
