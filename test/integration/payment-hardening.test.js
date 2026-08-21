@@ -17,6 +17,8 @@ before(async () => { pool = await createTestPool(); });
 after(async () => { await pool?.end(); });
 
 async function createReceiver(traceId) {
+  const active = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0];
+  if (active) return active.id;
   const receiver = uuidv7();
   const version = Number((await pool.query('SELECT COALESCE(max(version),0)+1 AS version FROM receiver_versions')).rows[0].version);
   await pool.query(`INSERT INTO receiver_versions(id,version,encrypted_phone,encryption_key_version,
@@ -54,8 +56,7 @@ test('payment limits are configurable and upper/daily caps can be disabled', () 
 test('daily top-up limit follows successful redeemed_at even while the top-up is in manual review', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7();
-  const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0]?.id
-    ?? await createReceiver(trace);
+  const receiver = await createReceiver(trace);
   const currentUser = `redeemed-day-current-${trace}`;
   const oldUser = `redeemed-day-old-${trace}`;
   await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
@@ -97,8 +98,7 @@ test('daily top-up lock blocks a voucher that was queued before the lock existed
 test('stuck redeemed top-up is escalated to an Owner-only manual review', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7();
-  const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0]?.id
-    ?? await createReceiver(trace);
+  const receiver = await createReceiver(trace);
   const topup = uuidv7();
   await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
     receiver_version_id,receiver_phone_last4,provider_transaction_id,amount_cents,currency,trace_id,redeemed_at)
@@ -121,8 +121,7 @@ test('stuck redeemed top-up is escalated to an Owner-only manual review', async 
 test('payment attempts retain retry ancestry and normalized error metadata', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const trace = uuidv7();
-  const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0]?.id
-    ?? await createReceiver(trace);
+  const receiver = await createReceiver(trace);
   const topupId = uuidv7();
   const firstHolder = uuidv7();
   await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
