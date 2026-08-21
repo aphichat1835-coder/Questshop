@@ -7,6 +7,10 @@ import {
   acquirePaymentJob, createPaymentAttempt, escalateStuckRedeemedTopups, recordProviderResult,
   topupAmountNeedsReview,
 } from '../../src/domain/payments/service.js';
+import {
+  paymentPolicyFromConfigValues,
+  reconcileDailyTopupLock,
+} from '../../src/domain/payments/policy.js';
 
 let pool;
 before(async () => { pool = await createTestPool(); });
@@ -32,6 +36,43 @@ test('automatic credit range is fail-safe outside 10 to 1000 baht', () => {
   assert.equal(topupAmountNeedsReview(1_000n), false);
   assert.equal(topupAmountNeedsReview(100_000n), false);
   assert.equal(topupAmountNeedsReview(100_001n), true);
+});
+
+test('payment limits are configurable and upper/daily caps can be disabled', () => {
+  const policy = paymentPolicyFromConfigValues({
+    topupAutoCreditMinCents: '2500',
+    topupAutoCreditMaxCents: null,
+    topupDailyLimitCents: null,
+  });
+  assert.equal(policy.autoCreditMinCents, 2_500n);
+  assert.equal(policy.autoCreditMaxCents, null);
+  assert.equal(policy.dailyRedeemedLimitCents, null);
+  assert.equal(topupAmountNeedsReview(2_499n, policy), true);
+  assert.equal(topupAmountNeedsReview(5_000_000n, policy), false);
+});
+
+test('daily top-up limit follows successful redeemed_at even while the top-up is in manual review', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const trace = uuidv7();
+  const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0]?.id
+    ?? await createReceiver(trace);
+  const currentUser = `redeemed-day-current-${trace}`;
+  const oldUser = `redeemed-day-old-${trace}`;
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,provider_transaction_id,amount_cents,currency,trace_id,redeemed_at)
+    VALUES($1,$2,'MANUAL_REVIEW',1,$3,$4,'1234',$5,300000,'THB',$6,clock_timestamp()),
+      ($7,$8,'MANUAL_REVIEW',1,$9,$4,'1234',$10,300000,'THB',$6,clock_timestamp()-interval '1 day')`, [
+    uuidv7(), currentUser, Buffer.alloc(32, 93), receiver, `current-${trace}`, trace,
+    uuidv7(), oldUser, Buffer.alloc(32, 94), `old-${trace}`,
+  ]);
+  const current = await reconcileDailyTopupLock({ discordUserId: currentUser },
+    context(trace, 'current-redeemed-day'), { pool });
+  const old = await reconcileDailyTopupLock({ discordUserId: oldUser },
+    context(trace, 'old-redeemed-day'), { pool });
+  assert.equal(current.locked, true);
+  assert.equal(current.totalCents, 300_000n);
+  assert.equal(old.locked, false);
+  assert.equal(old.totalCents, 0n);
 });
 
 test('daily top-up lock blocks a voucher that was queued before the lock existed', async (t) => {
