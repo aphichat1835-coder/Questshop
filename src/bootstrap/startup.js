@@ -38,6 +38,25 @@ export async function openRuntimeDatabase(env, health, dependencies = {}) {
   return pool;
 }
 
+export async function validatePaymentReadiness(pool, health) {
+  const [gateResult, receiverResult] = await Promise.all([
+    pool.query(`SELECT gate,enabled FROM feature_gates
+      WHERE gate IN ('TOPUP_ACCEPTING','AUTO_CREDIT_ENABLED')`),
+    pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1"),
+  ]);
+  const gates = new Map(gateResult.rows.map((row) => [row.gate, row.enabled === true]));
+  const paymentEnabled = gates.get('TOPUP_ACCEPTING') || gates.get('AUTO_CREDIT_ENABLED');
+  const hasReceiver = receiverResult.rowCount > 0;
+  if (paymentEnabled && !hasReceiver) {
+    health.checks.payments = 'MISSING_RECEIVER';
+    throw Object.assign(new Error('TrueMoney payments are enabled without an active receiver'), {
+      code: 'TRUEMONEY_RECEIVER_REQUIRED',
+    });
+  }
+  health.checks.payments = hasReceiver ? 'OK' : 'DISABLED';
+  return { paymentEnabled, hasReceiver };
+}
+
 async function acquireRuntimeOwnership(pool, env, health) {
   const holder = uuidv7();
   const runtimeLease = await acquireLease({ resourceType: 'RUNTIME', resourceId: env.DISCORD_GUILD_ID, holder, ttlSeconds: 60 }, { pool });
@@ -216,6 +235,7 @@ export async function startup({ health = createHealthState(), server: existingSe
     const { holder, runtimeLease } = await acquireRuntimeOwnership(pool, env, health);
     assertStarting();
     const config = await loadRuntimeConfig(pool);
+    await validatePaymentReadiness(pool, health);
     health.checks.bootstrap = 'RECOVERING';
     runtime = { env, logger, health, server, pool, client: null, config, workers: null, abortController,
       heartbeat: null, runtimeLease, runtimeHolder: holder, acceptingInteractions: false, shutdownPromise: null };
