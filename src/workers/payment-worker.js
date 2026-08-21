@@ -19,6 +19,12 @@ async function creditPendingRedemption({ holder, env, pool }) {
   return true;
 }
 
+async function stopTopupIntakeWhenSettlementDisabled(pool) {
+  await pool.query(`UPDATE feature_gates SET enabled=false,reason='AUTO_CREDIT_DISABLED',
+    version=version+1,actor_type='SYSTEM',actor_id='payment-worker',updated_at=clock_timestamp()
+    WHERE gate='TOPUP_ACCEPTING' AND enabled=true`);
+}
+
 function startLeaseHeartbeat(topup, pool, parentSignal) {
   const leaseAbort = new AbortController();
   const signal = AbortSignal.any([parentSignal, leaseAbort.signal]);
@@ -161,9 +167,14 @@ export async function processPayment({ holder, env, signal, autoCredit = false, 
   const breaker = (await pool.query("SELECT state FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
   if (breaker?.state === 'OPEN') return false;
   // Financial containment: never redeem a new real voucher while automatic
-  // settlement is disabled. The only exception is the explicit HALF_OPEN
-  // recovery probe, which is credited immediately if it redeems successfully.
-  if (!autoCredit && breaker?.state !== 'HALF_OPEN') return false;
+  // settlement is disabled. Stop new top-up intake as well so customers do not
+  // queue vouchers behind a settlement gate that cannot safely finish them.
+  // The only exception is the explicit HALF_OPEN recovery probe, which is
+  // credited immediately if it redeems successfully.
+  if (!autoCredit && breaker?.state !== 'HALF_OPEN') {
+    await stopTopupIntakeWhenSettlementDisabled(pool);
+    return false;
+  }
   const topup = await acquirePaymentJob({ holder }, { pool });
   if (!topup) return false;
   await processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, pool });
