@@ -8,15 +8,19 @@ import { recordTransition } from '../shared/transition.js';
 import { openReview } from '../reviews/service.js';
 import { TOPUP_TRANSITIONS } from './states.js';
 import { enqueueProjection } from '../outbox/service.js';
+import {
+  assertDailyTopupAdmissionInTransaction,
+  DEFAULT_PAYMENT_POLICY,
+  loadPaymentPolicy,
+  topupAmountNeedsReview as paymentPolicyNeedsReview,
+} from './policy.js';
 
 const ACTIVE_TOPUP_STATES = ['RECEIVED', 'VALIDATING', 'PAYMENT_QUEUED', 'PROCESSING', 'RETRY_WAIT'];
-export const AUTO_CREDIT_MIN_CENTS = 1_000n;
-export const AUTO_CREDIT_MAX_CENTS = 100_000n;
+export const AUTO_CREDIT_MIN_CENTS = DEFAULT_PAYMENT_POLICY.autoCreditMinCents;
+export const AUTO_CREDIT_MAX_CENTS = DEFAULT_PAYMENT_POLICY.autoCreditMaxCents;
 
-export function topupAmountNeedsReview(amountCents) {
-  if (amountCents == null) return true;
-  const amount = BigInt(amountCents);
-  return amount < AUTO_CREDIT_MIN_CENTS || amount > AUTO_CREDIT_MAX_CENTS;
+export function topupAmountNeedsReview(amountCents, policy = DEFAULT_PAYMENT_POLICY) {
+  return paymentPolicyNeedsReview(amountCents, policy);
 }
 
 async function findVoucher(client, hashes) {
@@ -63,6 +67,16 @@ function paymentAttemptError(outcome, providerCode) {
   return { errorClass: 'PROVIDER_RESULT', errorCode: providerCode ?? outcome };
 }
 
+function amountWarningCode(amountCents, policy) {
+  if (amountCents == null) return null;
+  const amount = BigInt(amountCents);
+  if (amount < policy.autoCreditMinCents) return 'AMOUNT_BELOW_CONFIGURED_LIMIT';
+  if (policy.autoCreditMaxCents != null && amount > policy.autoCreditMaxCents) {
+    return 'AMOUNT_OVER_CONFIGURED_LIMIT';
+  }
+  return null;
+}
+
 async function assertTopupSettlementAvailable(client) {
   const rows = (await client.query(`SELECT gate,enabled FROM feature_gates
     WHERE gate IN ('TOPUP_ACCEPTING','AUTO_CREDIT_ENABLED')`)).rows;
@@ -85,57 +99,55 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
   const hashes = allVoucherHmacs(normalized.code, env.VOUCHER_HMAC_KEYS_JSON);
   try {
     return await withTransaction({ ...options, isolation: 'SERIALIZABLE', maxAttempts: 5, deadlineMs: 10_000 }, async (client) => {
-    await assertTopupSettlementAvailable(client);
-    const locked = (await client.query(`SELECT 1 FROM topup_daily_locks
-      WHERE discord_user_id=$1 AND expires_at>clock_timestamp()`, [discordUserId])).rowCount > 0;
-    if (locked) throw new QuestshopError('TOPUP_DAILY_LIMIT', 'เติมเงินครบเพดานของวันนี้แล้ว กรุณาลองใหม่หลังเที่ยงคืน');
-    const existing = await findVoucher(client, hashes);
-    if (existing) return { topup: assertVoucherOwner(existing, discordUserId), idempotent: true };
-    await assertNoPendingTopup(client, discordUserId);
-    const receiver = (await client.query(`
-      SELECT * FROM receiver_versions WHERE state = 'ACTIVE' FOR SHARE
-    `)).rows[0];
-    if (!receiver) throw new QuestshopError('RECEIVER_UNAVAILABLE', 'ยังไม่ได้ตั้งค่าบัญชีรับซอง');
-    const promotion = (await client.query(`SELECT * FROM promotions
-      WHERE state='ACTIVE' AND (
-        manual_controlled=true OR (starts_at<=clock_timestamp() AND ends_at>clock_timestamp())
-      ) ORDER BY version DESC LIMIT 1`)).rows[0] ?? null;
-    const topupId = uuidv7();
-    const encrypted = encryptSecret(
-      JSON.stringify({ code: normalized.code, url: normalized.url }),
-      env.DATA_ENCRYPTION_KEYS_JSON,
-      `topup:${topupId}:${context.guildId}`,
-    );
-    const currentHash = hashes.find((item) => item.version === env.VOUCHER_HMAC_KEYS_JSON.current);
-    await client.query(`INSERT INTO wallets(discord_user_id) VALUES($1)
-      ON CONFLICT(discord_user_id) DO NOTHING`, [discordUserId]);
-    let topup = (await client.query(`
-      INSERT INTO topups(
-        id, discord_user_id, status, voucher_hmac_version, voucher_hmac,
-        receiver_version_id, receiver_phone_last4, promotion_id, prelaunch, trace_id
-      ) VALUES ($1,$2,'RECEIVED',$3,$4,$5,$6,$7,$8,$9) RETURNING *
-    `, [
-      topupId, discordUserId, currentHash.version, currentHash.digest,
-      receiver.id, receiver.phone_last4, promotion?.id ?? null, env.PRELAUNCH, context.traceId,
-    ])).rows[0];
-    await client.query(`
-      INSERT INTO topup_sensitive_payloads(topup_id, key_version, nonce, ciphertext, auth_tag)
-      VALUES ($1,$2,$3,$4,$5)
-    `, [topupId, encrypted.keyVersion, encrypted.nonce, encrypted.ciphertext, encrypted.authTag]);
-    for (const next of ['VALIDATING', 'PAYMENT_QUEUED']) {
-      const previous = topup.status;
-      const updated = (await client.query(`
-        UPDATE topups SET status = $2, state_version = state_version + 1,
-          updated_at = transaction_timestamp() WHERE id = $1 AND state_version = $3 RETURNING *
-      `, [topupId, next, topup.state_version])).rows[0];
-      if (!updated) throw new QuestshopError('TOPUP_STALE', 'Top-up changed concurrently');
-      await recordTransition(client, {
-        aggregateType: 'TOPUP', aggregateId: topupId, fromState: previous,
-        toState: next, stateVersion: updated.state_version, context,
-      });
-      topup = updated;
-    }
-    return { topup, idempotent: false };
+      await assertTopupSettlementAvailable(client);
+      const existing = await findVoucher(client, hashes);
+      if (existing) return { topup: assertVoucherOwner(existing, discordUserId), idempotent: true };
+      await assertDailyTopupAdmissionInTransaction(client, discordUserId, context);
+      await assertNoPendingTopup(client, discordUserId);
+      const receiver = (await client.query(`
+        SELECT * FROM receiver_versions WHERE state = 'ACTIVE' FOR SHARE
+      `)).rows[0];
+      if (!receiver) throw new QuestshopError('RECEIVER_UNAVAILABLE', 'ยังไม่ได้ตั้งค่าบัญชีรับซอง');
+      const promotion = (await client.query(`SELECT * FROM promotions
+        WHERE state='ACTIVE' AND (
+          manual_controlled=true OR (starts_at<=clock_timestamp() AND ends_at>clock_timestamp())
+        ) ORDER BY version DESC LIMIT 1`)).rows[0] ?? null;
+      const topupId = uuidv7();
+      const encrypted = encryptSecret(
+        JSON.stringify({ code: normalized.code, url: normalized.url }),
+        env.DATA_ENCRYPTION_KEYS_JSON,
+        `topup:${topupId}:${context.guildId}`,
+      );
+      const currentHash = hashes.find((item) => item.version === env.VOUCHER_HMAC_KEYS_JSON.current);
+      await client.query(`INSERT INTO wallets(discord_user_id) VALUES($1)
+        ON CONFLICT(discord_user_id) DO NOTHING`, [discordUserId]);
+      let topup = (await client.query(`
+        INSERT INTO topups(
+          id, discord_user_id, status, voucher_hmac_version, voucher_hmac,
+          receiver_version_id, receiver_phone_last4, promotion_id, prelaunch, trace_id
+        ) VALUES ($1,$2,'RECEIVED',$3,$4,$5,$6,$7,$8,$9) RETURNING *
+      `, [
+        topupId, discordUserId, currentHash.version, currentHash.digest,
+        receiver.id, receiver.phone_last4, promotion?.id ?? null, env.PRELAUNCH, context.traceId,
+      ])).rows[0];
+      await client.query(`
+        INSERT INTO topup_sensitive_payloads(topup_id, key_version, nonce, ciphertext, auth_tag)
+        VALUES ($1,$2,$3,$4,$5)
+      `, [topupId, encrypted.keyVersion, encrypted.nonce, encrypted.ciphertext, encrypted.authTag]);
+      for (const next of ['VALIDATING', 'PAYMENT_QUEUED']) {
+        const previous = topup.status;
+        const updated = (await client.query(`
+          UPDATE topups SET status = $2, state_version = state_version + 1,
+            updated_at = transaction_timestamp() WHERE id = $1 AND state_version = $3 RETURNING *
+        `, [topupId, next, topup.state_version])).rows[0];
+        if (!updated) throw new QuestshopError('TOPUP_STALE', 'Top-up changed concurrently');
+        await recordTransition(client, {
+          aggregateType: 'TOPUP', aggregateId: topupId, fromState: previous,
+          toState: next, stateVersion: updated.state_version, context,
+        });
+        topup = updated;
+      }
+      return { topup, idempotent: false };
     });
   } catch (error) {
     if (error.code !== '23505' && !isRetryableTransactionError(error)) throw error;
@@ -208,7 +220,7 @@ export async function markPaymentPossiblySent({ attemptId }, options = {}) {
   ));
 }
 
-export async function recordProviderResult({ topup, attemptId, result }, context, options = {}) {
+export async function recordProviderResult({ topup, attemptId, result, policy = null }, context, options = {}) {
   return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
     const locked = (await client.query(`
       SELECT * FROM topups WHERE id = $1 AND lease_owner=$2 AND fencing_token=$3
@@ -220,6 +232,8 @@ export async function recordProviderResult({ topup, attemptId, result }, context
       throw new QuestshopError('TOPUP_TRANSITION_INVALID', `${locked.status} cannot become ${next}`);
     }
     const attemptError = paymentAttemptError(next, result.providerCode);
+    const effectivePolicy = policy ?? await loadPaymentPolicy(client);
+    const warningCode = amountWarningCode(result.amountCents, effectivePolicy);
     await client.query(`
       UPDATE payment_attempts SET dispatch_state = $2, provider_status_code = $3,
         provider_http_status = $4, provider_evidence = $5,
@@ -230,8 +244,7 @@ export async function recordProviderResult({ topup, attemptId, result }, context
       UPDATE topups SET status = $2, state_version = state_version + 1,
         provider_transaction_id = $3, amount_cents = $4::bigint, currency = $5,
         sender_name = $6, sender_phone = $7, failure_code = $8,
-        warning_code = CASE WHEN $4::bigint > 100000::bigint THEN 'AMOUNT_OVER_CONFIGURED_LIMIT'
-          WHEN $4::bigint < 1000::bigint THEN 'AMOUNT_BELOW_CONFIGURED_LIMIT' ELSE warning_code END,
+        warning_code = COALESCE($11, warning_code),
         redeemed_at = CASE WHEN $2 = 'REDEEMED' THEN transaction_timestamp() ELSE redeemed_at END,
         available_at = CASE WHEN $2 = 'RETRY_WAIT' THEN clock_timestamp() + make_interval(
           secs => floor(random() * LEAST(60::double precision,
@@ -241,7 +254,7 @@ export async function recordProviderResult({ topup, attemptId, result }, context
       WHERE id = $1 AND state_version = $9 RETURNING *
     `, [topup.id, next, result.providerTransactionId ?? null, result.amountCents ?? null,
       result.currency ?? null, result.senderName ?? null, result.senderPhone ?? null,
-      result.providerCode ?? null, locked.state_version, topup.attempt_count])).rows[0];
+      result.providerCode ?? null, locked.state_version, topup.attempt_count, warningCode])).rows[0];
     if (!updated) throw new QuestshopError('TOPUP_STALE', 'Top-up changed concurrently');
     await recordTransition(client, { aggregateType: 'TOPUP', aggregateId: topup.id,
       fromState: locked.status, toState: next, stateVersion: updated.state_version, context });
