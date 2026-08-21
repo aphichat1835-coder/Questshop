@@ -3,11 +3,13 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { isRetryableTransactionError, withTransaction } from '../../db/transaction.js';
 import { allVoucherHmacs, encryptSecret } from '../../adapters/crypto/keyring.js';
 import { normalizeVoucherUrl } from '../../adapters/truemoney/voucher.js';
-import { QuestshopError, FencingLostError } from '../../shared/errors.js';
+import { AuthorizationError, QuestshopError, FencingLostError } from '../../shared/errors.js';
 import { recordTransition } from '../shared/transition.js';
 import { openReview } from '../reviews/service.js';
 import { TOPUP_TRANSITIONS } from './states.js';
 import { enqueueProjection } from '../outbox/service.js';
+
+const ACTIVE_TOPUP_STATES = ['RECEIVED', 'VALIDATING', 'PAYMENT_QUEUED', 'PROCESSING', 'RETRY_WAIT'];
 
 async function findVoucher(client, hashes) {
   for (const candidate of hashes) {
@@ -17,6 +19,13 @@ async function findVoucher(client, hashes) {
     if (row) return row;
   }
   return null;
+}
+
+function assertVoucherOwner(existing, discordUserId) {
+  if (existing.discord_user_id !== discordUserId) {
+    throw new AuthorizationError('ซองนี้ถูกส่งเข้าระบบแล้ว');
+  }
+  return existing;
 }
 
 async function findCommittedVoucher(pool, hashes) {
@@ -39,16 +48,35 @@ function paymentAttemptState(outcome) {
   return 'FAILED';
 }
 
+async function assertTopupSettlementAvailable(client) {
+  const rows = (await client.query(`SELECT gate,enabled FROM feature_gates
+    WHERE gate IN ('TOPUP_ACCEPTING','AUTO_CREDIT_ENABLED')`)).rows;
+  const gates = new Map(rows.map((row) => [row.gate, row.enabled === true]));
+  if (!gates.get('TOPUP_ACCEPTING') || !gates.get('AUTO_CREDIT_ENABLED')) {
+    throw new QuestshopError('TOPUP_CLOSED', 'ระบบเติมเงินปิดชั่วคราว กรุณาลองใหม่ภายหลัง');
+  }
+}
+
+async function assertNoPendingTopup(client, discordUserId) {
+  const pending = Number((await client.query(`SELECT count(*)::integer AS count FROM topups
+    WHERE discord_user_id=$1 AND status = ANY($2::text[])`, [discordUserId, ACTIVE_TOPUP_STATES])).rows[0].count);
+  if (pending > 0) {
+    throw new QuestshopError('RATE_LIMITED', 'มีรายการเติมเงินกำลังตรวจสอบอยู่ กรุณารอรายการเดิมให้เสร็จก่อน');
+  }
+}
+
 export async function submitVoucher({ discordUserId, voucherUrl, env }, context, options = {}) {
   const normalized = normalizeVoucherUrl(voucherUrl);
   const hashes = allVoucherHmacs(normalized.code, env.VOUCHER_HMAC_KEYS_JSON);
   try {
     return await withTransaction({ ...options, isolation: 'SERIALIZABLE', maxAttempts: 5, deadlineMs: 10_000 }, async (client) => {
+    await assertTopupSettlementAvailable(client);
     const locked = (await client.query(`SELECT 1 FROM topup_daily_locks
       WHERE discord_user_id=$1 AND expires_at>clock_timestamp()`, [discordUserId])).rowCount > 0;
     if (locked) throw new QuestshopError('TOPUP_DAILY_LIMIT', 'เติมเงินครบเพดานของวันนี้แล้ว กรุณาลองใหม่หลังเที่ยงคืน');
     const existing = await findVoucher(client, hashes);
-    if (existing) return { topup: existing, idempotent: true };
+    if (existing) return { topup: assertVoucherOwner(existing, discordUserId), idempotent: true };
+    await assertNoPendingTopup(client, discordUserId);
     const receiver = (await client.query(`
       SELECT * FROM receiver_versions WHERE state = 'ACTIVE' FOR SHARE
     `)).rows[0];
@@ -64,6 +92,8 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
       `topup:${topupId}:${context.guildId}`,
     );
     const currentHash = hashes.find((item) => item.version === env.VOUCHER_HMAC_KEYS_JSON.current);
+    await client.query(`INSERT INTO wallets(discord_user_id) VALUES($1)
+      ON CONFLICT(discord_user_id) DO NOTHING`, [discordUserId]);
     let topup = (await client.query(`
       INSERT INTO topups(
         id, discord_user_id, status, voucher_hmac_version, voucher_hmac,
@@ -99,7 +129,7 @@ export async function submitVoucher({ discordUserId, voucherUrl, env }, context,
     if (error.code !== '23505' && !isRetryableTransactionError(error)) throw error;
     const existing = await findCommittedVoucher(options.pool, hashes);
     if (!existing) throw error;
-    return { topup: existing, idempotent: true };
+    return { topup: assertVoucherOwner(existing, discordUserId), idempotent: true };
   }
 }
 
