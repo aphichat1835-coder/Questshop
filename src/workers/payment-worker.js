@@ -4,13 +4,17 @@ import { redeemVoucher } from '../adapters/truemoney/voucher.js';
 import { createContext } from '../shared/correlation.js';
 import {
   acquirePaymentJob, createPaymentAttempt, markPaymentPossiblySent, moveRedeemedTopupToReview,
-  recordProviderResult, renewPaymentLease, topupAmountNeedsReview,
+  recordProviderResult, renewPaymentLease,
 } from '../domain/payments/service.js';
+import {
+  loadPaymentPolicy, reconcileCurrentDailyTopupLocks, reconcileDailyTopupLock, topupAmountNeedsReview,
+} from '../domain/payments/policy.js';
 import { creditRedeemedTopup } from '../domain/wallet/service.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
 import { getRuntimePool } from '../db/pools.js';
 
 let nextSettlementAuditAt = 0;
+let nextDailyLockReconcileAt = 0;
 
 async function auditPaymentSettlement({ holder, env, pool }) {
   if (Date.now() < nextSettlementAuditAt) return;
@@ -30,13 +34,23 @@ async function auditPaymentSettlement({ holder, env, pool }) {
   context, { pool });
 }
 
-async function creditPendingRedemption({ holder, env, pool }) {
+async function reconcilePaymentPolicyState({ holder, env, pool }) {
+  if (Date.now() < nextDailyLockReconcileAt) return;
+  nextDailyLockReconcileAt = Date.now() + 60_000;
+  const context = createContext({ actorType: 'SYSTEM', actorId: holder, guildId: env.DISCORD_GUILD_ID,
+    idempotencyKey: `payment-policy-reconcile:${Math.floor(Date.now() / 60_000)}` });
+  await reconcileCurrentDailyTopupLocks(context, { pool });
+}
+
+async function creditPendingRedemption({ holder, env, pool, policy }) {
   const topup = (await pool.query(`SELECT * FROM topups WHERE status = 'REDEEMED'
     ORDER BY redeemed_at LIMIT 1`)).rows[0];
   if (!topup) return false;
   const context = createContext({ traceId: topup.trace_id, actorType: 'SYSTEM', actorId: holder,
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `credit-recovery:${topup.id}` });
-  if (topupAmountNeedsReview(topup.amount_cents)) {
+  await reconcileDailyTopupLock({ discordUserId: topup.discord_user_id,
+    redeemedAt: topup.redeemed_at, policy }, context, { pool });
+  if (topupAmountNeedsReview(topup.amount_cents, policy)) {
     await moveRedeemedTopupToReview({ topupId: topup.id, reason: 'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE' },
       context, { pool });
     return true;
@@ -141,14 +155,15 @@ async function recordProviderFailure({ topup, attempt, error, context, breaker, 
   return updated;
 }
 
-async function recordProviderSuccess({ topup, attempt, result, context, pool }) {
+async function recordProviderSuccess({ topup, attempt, result, context, policy, pool }) {
   try {
-    return await recordProviderResult({ topup, attemptId: attempt.id, result }, context, { pool });
+    return await recordProviderResult({ topup, attemptId: attempt.id, result, policy }, context, { pool });
   } catch (error) {
     if (error?.code !== '23505' || result.outcome !== 'REDEEMED') throw error;
     return recordProviderResult({
       topup,
       attemptId: attempt.id,
+      policy,
       result: {
         outcome: 'AMBIGUOUS',
         providerCode: 'PROVIDER_TRANSACTION_ID_CONFLICT',
@@ -164,7 +179,7 @@ async function recordProviderSuccess({ topup, attempt, result, context, pool }) 
   }
 }
 
-async function processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, pool }) {
+async function processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, policy, pool }) {
   const context = createContext({ traceId: topup.trace_id, actorType: 'SYSTEM', actorId: holder,
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `payment:${topup.id}:${topup.attempt_count}` });
   const attempt = await createPaymentAttempt({ topup }, context, { pool });
@@ -181,8 +196,12 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
       return;
     }
 
-    const updated = await recordProviderSuccess({ topup, attempt, result, context, pool });
-    if (updated.status === 'REDEEMED' && topupAmountNeedsReview(updated.amount_cents)) {
+    const updated = await recordProviderSuccess({ topup, attempt, result, context, policy, pool });
+    if (updated.status === 'REDEEMED') {
+      await reconcileDailyTopupLock({ discordUserId: updated.discord_user_id,
+        redeemedAt: updated.redeemed_at, policy }, context, { pool });
+    }
+    if (updated.status === 'REDEEMED' && topupAmountNeedsReview(updated.amount_cents, policy)) {
       await moveRedeemedTopupToReview({ topupId: topup.id, reason: 'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE' },
         context, { pool });
     } else if (updated.status === 'REDEEMED' && (autoCredit || recoveryProbe)) {
@@ -196,7 +215,9 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
 
 export async function processPayment({ holder, env, signal, autoCredit = false, pool = getRuntimePool() }) {
   await auditPaymentSettlement({ holder, env, pool });
-  if (autoCredit && await creditPendingRedemption({ holder, env, pool })) return true;
+  await reconcilePaymentPolicyState({ holder, env, pool });
+  const policy = await loadPaymentPolicy(pool);
+  if (autoCredit && await creditPendingRedemption({ holder, env, pool, policy })) return true;
   const breaker = (await pool.query("SELECT state FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
   if (breaker?.state === 'OPEN') return false;
   if (!autoCredit && breaker?.state !== 'HALF_OPEN') {
@@ -205,6 +226,6 @@ export async function processPayment({ holder, env, signal, autoCredit = false, 
   }
   const topup = await acquirePaymentJob({ holder }, { pool });
   if (!topup) return false;
-  await processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, pool });
+  await processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, policy, pool });
   return true;
 }
