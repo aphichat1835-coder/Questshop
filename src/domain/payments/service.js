@@ -10,6 +10,14 @@ import { TOPUP_TRANSITIONS } from './states.js';
 import { enqueueProjection } from '../outbox/service.js';
 
 const ACTIVE_TOPUP_STATES = ['RECEIVED', 'VALIDATING', 'PAYMENT_QUEUED', 'PROCESSING', 'RETRY_WAIT'];
+export const AUTO_CREDIT_MIN_CENTS = 1_000n;
+export const AUTO_CREDIT_MAX_CENTS = 100_000n;
+
+export function topupAmountNeedsReview(amountCents) {
+  if (amountCents == null) return true;
+  const amount = BigInt(amountCents);
+  return amount < AUTO_CREDIT_MIN_CENTS || amount > AUTO_CREDIT_MAX_CENTS;
+}
 
 async function findVoucher(client, hashes) {
   for (const candidate of hashes) {
@@ -46,6 +54,13 @@ function paymentAttemptState(outcome) {
   if (outcome === 'REDEEMED') return 'VERIFIED';
   if (outcome === 'AMBIGUOUS') return 'AMBIGUOUS';
   return 'FAILED';
+}
+
+function paymentAttemptError(outcome, providerCode) {
+  if (outcome === 'REDEEMED') return { errorClass: null, errorCode: null };
+  if (outcome === 'AMBIGUOUS') return { errorClass: 'AMBIGUOUS', errorCode: providerCode ?? outcome };
+  if (outcome === 'RETRY_WAIT') return { errorClass: 'RETRYABLE_PROVIDER', errorCode: providerCode ?? outcome };
+  return { errorClass: 'PROVIDER_RESULT', errorCode: providerCode ?? outcome };
 }
 
 async function assertTopupSettlementAvailable(client) {
@@ -137,9 +152,13 @@ export async function acquirePaymentJob({ holder, ttlSeconds = 30 }, options = {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const result = await client.query(`
       WITH candidate AS (
-        SELECT id FROM topups
-        WHERE status = 'PAYMENT_QUEUED' AND available_at <= clock_timestamp()
-        ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
+        SELECT t.id FROM topups t
+        WHERE t.status = 'PAYMENT_QUEUED' AND t.available_at <= clock_timestamp()
+          AND NOT EXISTS (
+            SELECT 1 FROM topup_daily_locks l
+            WHERE l.discord_user_id=t.discord_user_id AND l.expires_at>clock_timestamp()
+          )
+        ORDER BY t.created_at FOR UPDATE SKIP LOCKED LIMIT 1
       )
       UPDATE topups t SET
         status = 'PROCESSING', state_version = state_version + 1,
@@ -160,13 +179,15 @@ export async function acquirePaymentJob({ holder, ttlSeconds = 30 }, options = {
 }
 
 export async function createPaymentAttempt({ topup, parentAttemptId = null }, context, options = {}) {
-  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => (
-    (await client.query(`
+  return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
+    const parent = parentAttemptId ?? (await client.query(`SELECT id FROM payment_attempts
+      WHERE topup_id=$1 ORDER BY attempt_number DESC LIMIT 1`, [topup.id])).rows[0]?.id ?? null;
+    return (await client.query(`
       INSERT INTO payment_attempts(
         id, topup_id, attempt_number, parent_attempt_id, dispatch_state, trace_id
       ) VALUES ($1,$2,$3,$4,'INTENT_RECORDED',$5) RETURNING *
-    `, [uuidv7(), topup.id, topup.attempt_count, parentAttemptId, context.traceId])).rows[0]
-  ));
+    `, [uuidv7(), topup.id, topup.attempt_count, parent, context.traceId])).rows[0];
+  });
 }
 
 export async function renewPaymentLease(topup, ttlSeconds = 30, options = {}) {
@@ -203,14 +224,16 @@ export async function recordProviderResult({ topup, attemptId, result }, context
     if (!(TOPUP_TRANSITIONS[locked.status] ?? []).includes(next)) {
       throw new QuestshopError('TOPUP_TRANSITION_INVALID', `${locked.status} cannot become ${next}`);
     }
+    const attemptError = paymentAttemptError(next, result.providerCode);
     await client.query(`
       UPDATE payment_attempts SET dispatch_state = $2, provider_status_code = $3,
         provider_http_status = $4, provider_evidence = $5,
-        completed_at = clock_timestamp() WHERE id = $1
+        error_class=$6,error_code=$7,completed_at = clock_timestamp() WHERE id = $1
     `, [
       attemptId, paymentAttemptState(next),
       result.providerCode ?? null, result.httpStatus ?? null,
       { receiverConfirmation: result.receiverConfirmation ?? null },
+      attemptError.errorClass, attemptError.errorCode,
     ]);
     let updated = (await client.query(`
       UPDATE topups SET status = $2, state_version = state_version + 1,
@@ -262,5 +285,52 @@ export async function recordProviderResult({ topup, attemptId, result }, context
       aggregateId: topup.id, aggregateVersion: updated.state_version,
       surfaceKey: 'LOG_PAYMENTS', context });
     return updated;
+  });
+}
+
+async function moveRedeemedTopupToReviewInTransaction(client, { topupId, reason }, context) {
+  const locked = (await client.query('SELECT * FROM topups WHERE id=$1 FOR UPDATE', [topupId])).rows[0];
+  if (!locked) throw new QuestshopError('TOPUP_NOT_FOUND', 'ไม่พบรายการเติมเงิน');
+  if (locked.status === 'MANUAL_REVIEW') {
+    const review = await openReview(client, { subjectType: 'TOPUP', subjectId: topupId,
+      reason, financial: true, ownerOnly: true, context });
+    return { topup: locked, review, idempotent: true };
+  }
+  if (locked.status !== 'REDEEMED') {
+    throw new QuestshopError('STALE_STATE', 'สถานะรายการเติมเงินเปลี่ยนไปแล้ว');
+  }
+  const updated = (await client.query(`UPDATE topups SET status='MANUAL_REVIEW',
+    state_version=state_version+1,failure_code=$2,lease_owner=NULL,lease_expires_at=NULL,
+    updated_at=clock_timestamp() WHERE id=$1 AND status='REDEEMED' AND state_version=$3 RETURNING *`,
+  [topupId, reason, locked.state_version])).rows[0];
+  if (!updated) throw new QuestshopError('STALE_STATE', 'สถานะรายการเติมเงินเปลี่ยนไปแล้ว');
+  await recordTransition(client, { aggregateType: 'TOPUP', aggregateId: topupId,
+    fromState: 'REDEEMED', toState: 'MANUAL_REVIEW', stateVersion: updated.state_version,
+    reasonCode: reason, context });
+  const review = await openReview(client, { subjectType: 'TOPUP', subjectId: topupId,
+    reason, financial: true, ownerOnly: true, context });
+  await enqueueProjection(client, { projectionType: 'PAYMENT_LOG', aggregateType: 'TOPUP',
+    aggregateId: topupId, aggregateVersion: updated.state_version,
+    surfaceKey: 'LOG_PAYMENTS', context });
+  return { topup: updated, review, idempotent: false };
+}
+
+export async function moveRedeemedTopupToReview(input, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, (client) => (
+    moveRedeemedTopupToReviewInTransaction(client, input, context)
+  ));
+}
+
+export async function escalateStuckRedeemedTopups({ olderThanSeconds = 120, limit = 20 } = {}, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const rows = (await client.query(`SELECT id FROM topups WHERE status='REDEEMED'
+      AND redeemed_at < clock_timestamp()-make_interval(secs=>$1)
+      ORDER BY redeemed_at FOR UPDATE SKIP LOCKED LIMIT $2`, [olderThanSeconds, limit])).rows;
+    const escalated = [];
+    for (const row of rows) {
+      escalated.push(await moveRedeemedTopupToReviewInTransaction(client,
+        { topupId: row.id, reason: 'REDEEMED_SETTLEMENT_STUCK' }, context));
+    }
+    return escalated;
   });
 }
