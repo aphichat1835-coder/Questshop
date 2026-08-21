@@ -12,9 +12,9 @@ export async function loadCustomerTopup({ topupId, discordUserId }, { pool = get
   const topup = (await pool.query(`SELECT t.*,
       ledger.available_before_cents AS available_before,
       ledger.available_after_cents AS available_after,
-      w.available_cents AS wallet_available_cents
+      COALESCE(w.available_cents, 0) AS wallet_available_cents
     FROM topups t
-    JOIN wallets w ON w.discord_user_id=t.discord_user_id
+    LEFT JOIN wallets w ON w.discord_user_id=t.discord_user_id
     LEFT JOIN LATERAL (
       SELECT x.available_before_cents,x.available_after_cents FROM wallet_transactions x
       WHERE x.reference_type='TOPUP' AND x.reference_id=t.id::text
