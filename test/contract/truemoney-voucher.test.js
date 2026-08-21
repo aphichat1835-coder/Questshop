@@ -17,18 +17,24 @@ function providerSuccess({ amount = '12.50', transactionId = 'provider-123' } = 
   };
 }
 
-function successfulRequest(payload) {
+function successfulRequest(payload, { statusCode = 200, responseEvent = 'end' } = {}) {
   return (_options, callback) => {
     const request = new EventEmitter();
     request.destroy = (error) => setImmediate(() => request.emit('error', error));
     request.end = () => {
       request.emit('finish');
       const response = new EventEmitter();
-      response.statusCode = 200;
+      response.statusCode = statusCode;
       callback(response);
       setImmediate(() => {
-        response.emit('data', Buffer.from(JSON.stringify(payload)));
-        response.emit('end');
+        if (responseEvent === 'end') {
+          response.emit('data', Buffer.from(JSON.stringify(payload)));
+          response.emit('end');
+        } else if (responseEvent === 'aborted') {
+          response.emit('aborted');
+        } else {
+          response.emit('error', new Error('response stream failed'));
+        }
       });
     };
     return request;
@@ -77,6 +83,34 @@ test('incompatible provider schema is rejected before any financial result is re
   incompatible.data.my_ticket.amount_baht = 12.5;
   await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
     requestFactory: successfulRequest(incompatible) }), (error) => error.code === 'PROVIDER_SCHEMA_INCOMPATIBLE');
+});
+
+test('SUCCESS requires a successful HTTP status and consistent single-recipient evidence', async () => {
+  await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+    requestFactory: successfulRequest(providerSuccess(), { statusCode: 500 }) }),
+  (error) => error.code === 'PROVIDER_HTTP_INCONSISTENT' && error.category === 'AMBIGUOUS');
+
+  const contradictory = providerSuccess();
+  contradictory.data.voucher = { member: 2, available: 1 };
+  await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+    requestFactory: successfulRequest(contradictory) }),
+  (error) => error.code === 'PROVIDER_CONFIRMATION_INCOMPLETE' && error.category === 'PROVIDER_SCHEMA');
+});
+
+test('SUCCESS rejects zero amounts and unsafe numeric transaction ids', async () => {
+  await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+    requestFactory: successfulRequest(providerSuccess({ amount: '0.00' })) }),
+  (error) => error.code === 'PROVIDER_AMOUNT_INVALID');
+
+  await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+    requestFactory: successfulRequest(providerSuccess({ transactionId: Number.MAX_SAFE_INTEGER + 10 })) }),
+  (error) => error.code === 'PROVIDER_TRANSACTION_ID_UNSAFE' && error.category === 'PROVIDER_SCHEMA');
+});
+
+test('response stream abort after dispatch is always ambiguous', async () => {
+  await assert.rejects(() => redeemVoucher({ code: voucherCode, receiverPhone: '0912345678',
+    requestFactory: successfulRequest(providerSuccess(), { responseEvent: 'aborted' }) }),
+  (error) => error.code === 'PROVIDER_RESULT_AMBIGUOUS' && error.category === 'AMBIGUOUS');
 });
 
 test('transport error after request.finish is ambiguous, whereas a proven unsent request is retryable', async () => {
