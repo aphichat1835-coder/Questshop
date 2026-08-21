@@ -12,6 +12,7 @@ import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
 import { TOPUP_TRANSITIONS } from '../payments/states.js';
 import { TEST_TRANSITIONS } from '../catalog/states.js';
 import { createMonitorTestBatch, hasCurrentTestPass } from '../catalog/test-gate.js';
+import { appendLedger } from '../wallet/ledger.js';
 import {
   captureReservationInTransaction,
   creditRedeemedTopupInTransaction,
@@ -30,10 +31,10 @@ export async function openReview(client, {
   const result = await client.query(`
     INSERT INTO manual_reviews(
       id, subject_type, subject_id, state, financial, owner_only,
-      opened_reason, trace_id
-    ) VALUES ($1, $2, $3, 'OPEN', $4, $5, $6, $7)
+      opened_reason, trace_id, remind_at
+    ) VALUES ($1, $2, $3, 'OPEN', $4, $5, $6, $7, transaction_timestamp() + interval '1 hour')
     ON CONFLICT (subject_type, subject_id) WHERE state <> 'RESOLVED'
-    DO UPDATE SET remind_at = LEAST(manual_reviews.remind_at, transaction_timestamp() + interval '24 hours')
+    DO UPDATE SET remind_at = LEAST(manual_reviews.remind_at, transaction_timestamp() + interval '1 hour')
     RETURNING *
   `, [id, subjectType, String(subjectId), financial, ownerOnly, reason, context.traceId]);
   const review = result.rows[0];
@@ -178,10 +179,76 @@ const ORDER_RELEASE_DECISIONS = Object.freeze({
   FAIL: 'FAILED_RELEASED',
 });
 
+async function applyReversalReviewDecision(client, review, topup, decision, input, context) {
+  if (decision === 'REJECT') {
+    return { topupId: topup.id, status: 'REVERSAL_CANCELLED', topupStatus: topup.status };
+  }
+  if (decision !== 'CREDIT') throw new TypeError('invalid reversal review decision');
+  const confirmedPrincipal = BigInt(input.amountCents ?? 0);
+  const storedPrincipal = BigInt(topup.amount_cents ?? 0);
+  const confirmedProviderId = input.providerTransactionId?.trim() ?? '';
+  if (confirmedPrincipal !== storedPrincipal || confirmedProviderId !== String(topup.provider_transaction_id ?? '')) {
+    throw new QuestshopError('STALE_STATE', 'ยอดหรือเลขธุรกรรมไม่ตรงกับรายการที่ต้อง Reverse กรุณาตรวจสอบใหม่');
+  }
+  const bonus = BigInt(topup.bonus_cents ?? 0);
+  const total = storedPrincipal + bonus;
+  const wallet = (await client.query('SELECT * FROM wallets WHERE discord_user_id=$1 FOR UPDATE',
+    [topup.discord_user_id])).rows[0];
+  if (!wallet || BigInt(wallet.available_cents) < total) {
+    throw new QuestshopError('INSUFFICIENT_BALANCE', 'เครดิตพร้อมใช้ยังไม่พอสำหรับ Reverse รายการนี้');
+  }
+  const balances = {
+    availableBefore: BigInt(wallet.available_cents),
+    reservedBefore: BigInt(wallet.reserved_cents),
+    availableAfter: BigInt(wallet.available_cents) - total,
+    reservedAfter: BigInt(wallet.reserved_cents),
+  };
+  const updatedWallet = (await client.query(`UPDATE wallets SET available_cents=$2,reserved_cents=$3,
+    state_version=state_version+1,updated_at=transaction_timestamp()
+    WHERE discord_user_id=$1 AND state_version=$4 RETURNING *`,
+  [wallet.discord_user_id, balances.availableAfter, balances.reservedAfter, wallet.state_version])).rows[0];
+  if (!updatedWallet) throw new StaleStateError('wallet', wallet.discord_user_id);
+  const ledger = await appendLedger(client, {
+    discordUserId: topup.discord_user_id,
+    transactionGroupId: uuidv7(),
+    transactionType: 'TOPUP_REVERSAL',
+    deltaAvailableCents: -total,
+    deltaReservedCents: 0n,
+    balances,
+    principalCents: storedPrincipal,
+    bonusCents: bonus,
+    referenceType: 'TOPUP',
+    referenceId: topup.id,
+    idempotencyKey: `topup:${topup.id}:reversal`,
+    reason: input.reason,
+    context,
+  });
+  assertTransition(TOPUP_TRANSITIONS, topup.status, 'REVERSED');
+  const updated = (await client.query(`UPDATE topups SET status='REVERSED',state_version=state_version+1,
+    updated_at=transaction_timestamp() WHERE id=$1 AND status='CREDITED' AND state_version=$2 RETURNING *`,
+  [topup.id, topup.state_version])).rows[0];
+  if (!updated) throw new StaleStateError('topup', topup.id);
+  await recordTransition(client, { aggregateType: 'TOPUP', aggregateId: topup.id,
+    fromState: 'CREDITED', toState: 'REVERSED', stateVersion: updated.state_version,
+    reasonCode: 'OWNER_CONFIRMED_REVERSAL', context });
+  await appendAdminAudit(client, { action: 'TOPUP_REVERSED', targetType: 'TOPUP', targetId: topup.id,
+    actorId: context.actorId, before: { status: topup.status, availableCents: wallet.available_cents },
+    after: { status: updated.status, reversalCents: String(total), transactionId: ledger.id },
+    reason: input.reason, context });
+  await enqueueProjection(client, { projectionType: 'PAYMENT_STATUS_LOG', aggregateType: 'TOPUP',
+    aggregateId: topup.id, aggregateVersion: updated.state_version, surfaceKey: 'LOG_PAYMENTS', context });
+  return { topupId: topup.id, status: updated.status, transactionId: ledger.id };
+}
+
 async function applyTopupDecision(client, review, decision, input, context) {
   const topup = (await client.query('SELECT * FROM topups WHERE id=$1 FOR UPDATE',
     [review.subject_id])).rows[0];
-  if (topup?.status !== 'MANUAL_REVIEW') throw new StaleStateError('topup', review.subject_id);
+  if (!topup) throw new StaleStateError('topup', review.subject_id);
+  if (review.opened_reason === 'REVERSAL_INSUFFICIENT_AVAILABLE') {
+    if (topup.status !== 'CREDITED') throw new StaleStateError('topup', review.subject_id);
+    return applyReversalReviewDecision(client, review, topup, decision, input, context);
+  }
+  if (topup.status !== 'MANUAL_REVIEW') throw new StaleStateError('topup', review.subject_id);
   if (decision === 'REJECT') {
     assertTransition(TOPUP_TRANSITIONS, topup.status, 'REJECTED');
     const updated = (await client.query(`UPDATE topups SET status='REJECTED',state_version=state_version+1,
@@ -205,7 +272,8 @@ async function applyTopupDecision(client, review, decision, input, context) {
   let redeemed;
   try {
     redeemed = (await client.query(`UPDATE topups SET status='REDEEMED',state_version=state_version+1,
-      amount_cents=$2,currency='THB',provider_transaction_id=$3,redeemed_at=transaction_timestamp(),
+      amount_cents=$2,currency='THB',provider_transaction_id=$3,
+      redeemed_at=COALESCE(redeemed_at,transaction_timestamp()),
       failure_code=NULL,updated_at=transaction_timestamp()
       WHERE id=$1 AND status='MANUAL_REVIEW' RETURNING *`,
     [topup.id, amount, input.providerTransactionId.trim()])).rows[0];
@@ -399,11 +467,19 @@ async function prepareOrConfirmTopupCredit({ reviewId, reason, amountCents, prov
       WHERE review_id=$1 AND evidence_type='CREDIT_CONFIRMATION_PREPARED' AND actor_id=$2
         AND created_at>=clock_timestamp()-interval '5 minutes'
       ORDER BY created_at DESC LIMIT 1`, [reviewId, context.actorId])).rows[0];
-    if (evidence?.payload?.fingerprint === fingerprint) return { confirmed: true, review };
+    if (evidence?.payload?.fingerprint === fingerprint
+      && evidence.payload.preparedByIdempotencyKey !== context.idempotencyKey) {
+      return { confirmed: true, review };
+    }
+    if (evidence?.payload?.fingerprint === fingerprint
+      && evidence.payload.preparedByIdempotencyKey === context.idempotencyKey) {
+      return { confirmed: false, review };
+    }
     await client.query(`INSERT INTO review_evidence(id,review_id,evidence_type,payload,actor_type,actor_id,trace_id)
       VALUES($1,$2,'CREDIT_CONFIRMATION_PREPARED',$3,$4,$5,$6)`, [uuidv7(), reviewId,
       redact({ fingerprint, amountCents: String(amountCents), providerTransactionId: providerTransactionId.trim(),
-        reason: reason.trim(), expiresInSeconds: 300 }), context.actorType, context.actorId, context.traceId]);
+        reason: reason.trim(), expiresInSeconds: 300, preparedByIdempotencyKey: context.idempotencyKey }),
+      context.actorType, context.actorId, context.traceId]);
     await appendAdminAudit(client, { action: 'TOPUP_MANUAL_CREDIT_CONFIRMATION_PREPARED',
       targetType: 'TOPUP', targetId: review.subject_id, actorId: context.actorId,
       before: { reviewState: review.state }, after: { amountCents: String(amountCents),
@@ -421,7 +497,7 @@ export async function resolveSubjectReview({ reviewId, decision, reason, isOwner
       providerTransactionId, expectedVersion, isOwner }, context, options);
     if (!confirmation.confirmed) {
       return { review: confirmation.review, applied: {
-        status: 'รอยืนยันซ้ำ — ตรวจสอบยอดและเลขธุรกรรม แล้วกดเพิ่มเครดิตอีกครั้ง',
+        status: 'รอยืนยันซ้ำ — ตรวจสอบยอดและเลขธุรกรรม แล้วกดดำเนินการอีกครั้ง',
         confirmationRequired: true,
       } };
     }
