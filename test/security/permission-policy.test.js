@@ -13,13 +13,14 @@ test('runtime has no generic Permission Drift detector or repair route', async (
   assert.doesNotMatch(sources, /perm_repair/);
 });
 
-test('startup requires Administrator and LOG_PAYMENTS has a narrow privacy guard without generic repair', async () => {
+test('startup requires Administrator while LOG_PAYMENTS human visibility stays Owner-managed', async () => {
   const startup = await readFile(new URL('../../src/bootstrap/startup.js', import.meta.url), 'utf8');
   const setup = await readFile(new URL('../../src/discord/surfaces/setup.js', import.meta.url), 'utf8');
   const outbox = await readFile(new URL('../../src/workers/outbox-worker.js', import.meta.url), 'utf8');
   assert.match(startup, /Administrator/);
-  assert.match(setup, /assertSensitiveSurfacePrivacy/);
-  assert.match(setup, /LOG_PAYMENTS/);
+  assert.match(setup, /Owner-managed Discord permission policy/);
+  assert.doesNotMatch(setup, /PermissionFlagsBits/);
+  assert.doesNotMatch(setup, /ต้องซ่อนจาก @everyone|เปิดให้ยศ .* มองเห็น/);
   assert.doesNotMatch(outbox, /checkPermissionDrift|repairPermissionDrift|PERMISSION_DRIFT/);
   assert.doesNotMatch(setup, /SURFACE_PERMISSION_MISSING|checkPermissionDrift|repairPermissionDrift/);
 });
