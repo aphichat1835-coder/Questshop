@@ -269,13 +269,30 @@ async function queueMaintenanceNotifications(database, context) {
       projectionType: 'SYSTEM_INCIDENT', aggregateType: 'INCIDENT', aggregateId: incident.id,
       aggregateVersion: incident.state_version, surfaceKey: 'LOG_SYSTEM', context,
     });
-  const dueReviews = await database.query(`UPDATE manual_reviews SET remind_at=clock_timestamp()+interval '24 hours'
+  const dueReviews = await database.query(`UPDATE manual_reviews SET
+      owner_only=owner_only OR clock_timestamp()>=created_at+interval '24 hours',
+      state_version=state_version+CASE WHEN owner_only=false
+        AND clock_timestamp()>=created_at+interval '24 hours' THEN 1 ELSE 0 END,
+      remind_at=CASE
+        WHEN clock_timestamp()<created_at+interval '6 hours' THEN created_at+interval '6 hours'
+        WHEN clock_timestamp()<created_at+interval '24 hours' THEN created_at+interval '24 hours'
+        ELSE clock_timestamp()+interval '24 hours' END
       WHERE state<>'RESOLVED' AND remind_at<=clock_timestamp()
-      RETURNING *,floor(extract(epoch FROM remind_at))::bigint AS reminder_version`);
-  for (const review of dueReviews.rows) await enqueueProjection(database, {
+      RETURNING *,
+        CASE WHEN clock_timestamp()<created_at+interval '6 hours' THEN '1H'
+          WHEN clock_timestamp()<created_at+interval '24 hours' THEN '6H'
+          ELSE '24H_OWNER' END AS reminder_stage,
+        floor(extract(epoch FROM clock_timestamp()))::bigint AS reminder_version`);
+  for (const review of dueReviews.rows) {
+    await database.query(`INSERT INTO review_evidence(id,review_id,evidence_type,payload,actor_type,actor_id,trace_id)
+      VALUES($1,$2,'REMINDER_SENT',$3,'SYSTEM','maintenance-worker',$4)`,
+    [uuidv7(), review.id, { stage: review.reminder_stage,
+      ownerEscalated: review.reminder_stage === '24H_OWNER' }, context.traceId]);
+    await enqueueProjection(database, {
       projectionType: 'MANUAL_REVIEW', aggregateType: 'MANUAL_REVIEW', aggregateId: review.id,
       aggregateVersion: review.reminder_version, surfaceKey: 'ADMIN_PANEL', context,
     });
+  }
 }
 
 async function runTransactionalMaintenance(pool, context) {
