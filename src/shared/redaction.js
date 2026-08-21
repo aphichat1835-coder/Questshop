@@ -5,6 +5,7 @@ const SECRET_KEYS = new Set([
 const MFA_DISCORD_TOKEN = /\bmfa\.[A-Za-z0-9_-]{20,}\b/g;
 const DISCORD_TOKEN = /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b/g;
 const DATABASE_URL = /postgres(?:ql)?:\/\/[^\s]+/gi;
+const TRUEMONEY_VOUCHER_URL = /https:\/\/gift\.truemoney\.com\/campaign\/?\?v=[A-Za-z0-9]{16,128}/gi;
 const SENSITIVE_ASSIGNMENTS = [
   /(\b(?:token|cookie|password|secret|credential|session)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
   /(\bauthorization\s*[=:]\s*)(?:"[^"]*"|'[^']*'|Bearer\s+[^\s,;]+|[^\s,;]+)/gi,
@@ -18,7 +19,8 @@ export function redactText(value) {
   let text = String(value)
     .replace(MFA_DISCORD_TOKEN, '[REDACTED_DISCORD_TOKEN]')
     .replace(DISCORD_TOKEN, '[REDACTED_DISCORD_TOKEN]')
-    .replace(DATABASE_URL, '[REDACTED_DATABASE_URL]');
+    .replace(DATABASE_URL, '[REDACTED_DATABASE_URL]')
+    .replace(TRUEMONEY_VOUCHER_URL, '[REDACTED_TRUEMONEY_VOUCHER]');
   for (const assignment of SENSITIVE_ASSIGNMENTS) text = text.replace(assignment, '$1[REDACTED]');
   return text;
 }
