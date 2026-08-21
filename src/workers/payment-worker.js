@@ -3,7 +3,8 @@ import { decryptSecret } from '../adapters/crypto/keyring.js';
 import { redeemVoucher } from '../adapters/truemoney/voucher.js';
 import { createContext } from '../shared/correlation.js';
 import {
-  acquirePaymentJob, createPaymentAttempt, markPaymentPossiblySent, recordProviderResult, renewPaymentLease,
+  acquirePaymentJob, createPaymentAttempt, markPaymentPossiblySent, moveRedeemedTopupToReview,
+  recordProviderResult, renewPaymentLease, topupAmountNeedsReview,
 } from '../domain/payments/service.js';
 import { creditRedeemedTopup } from '../domain/wallet/service.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
@@ -35,6 +36,11 @@ async function creditPendingRedemption({ holder, env, pool }) {
   if (!topup) return false;
   const context = createContext({ traceId: topup.trace_id, actorType: 'SYSTEM', actorId: holder,
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `credit-recovery:${topup.id}` });
+  if (topupAmountNeedsReview(topup.amount_cents)) {
+    await moveRedeemedTopupToReview({ topupId: topup.id, reason: 'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE' },
+      context, { pool });
+    return true;
+  }
   try {
     await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
   } catch (error) {
@@ -176,7 +182,10 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
     }
 
     const updated = await recordProviderSuccess({ topup, attempt, result, context, pool });
-    if (updated.status === 'REDEEMED' && (autoCredit || recoveryProbe)) {
+    if (updated.status === 'REDEEMED' && topupAmountNeedsReview(updated.amount_cents)) {
+      await moveRedeemedTopupToReview({ topupId: topup.id, reason: 'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE' },
+        context, { pool });
+    } else if (updated.status === 'REDEEMED' && (autoCredit || recoveryProbe)) {
       await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
     }
     await closeSuccessfulProbe(pool, breaker, context);
