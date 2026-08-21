@@ -331,6 +331,11 @@ export async function refundCapturedOrderItemInTransaction(client, {
     projectionType: 'REFUND_LOG', aggregateType: 'REFUND', aggregateId: refundId,
     aggregateVersion: 1, surfaceKey: 'LOG_PAYMENTS', context,
   });
+  await enqueueProjection(client, {
+    projectionType: 'QUEST_HISTORY', aggregateType: 'ORDER_ITEM', aggregateId: orderItemId,
+    aggregateVersion: Number(reservation.item_version) * 1000 + 999,
+    surfaceKey: 'QUEST_HISTORY', context,
+  });
   return { ...refund, available_cents: updatedWallet.available_cents,
     reserved_cents: updatedWallet.reserved_cents };
 }
@@ -390,9 +395,9 @@ export async function creditRedeemedTopupInTransaction(client, { topupId }, cont
       });
     }
     let wallet = await lockWallet(client, topup.discord_user_id);
-    const bounds = await bangkokDayBounds(client, topup.credited_at ?? null);
-    // Do not convert the Bangkok boundary through Node/UTC: 00:00 in Bangkok
-    // is the preceding UTC date. PostgreSQL is the sole source of this cycle.
+    const bounds = await bangkokDayBounds(client, topup.redeemed_at ?? null);
+    // Provider redemption time is the authoritative Bangkok accounting day.
+    // Manual Review may credit later, but promotion/day evidence must not drift across midnight.
     const day = bounds.bangkok_day;
     const promotion = await resolvePromotionBonus(client, {
       promotionId: topup.promotion_id,
@@ -444,24 +449,6 @@ export async function creditRedeemedTopupInTransaction(client, { topupId }, cont
     await client.query(`INSERT INTO operation_metrics(id,operation,outcome,duration_ms,trace_id)
       VALUES($1,'TOPUP_CREDIT','SUCCESS',GREATEST(0,floor(extract(epoch FROM transaction_timestamp()-$2::timestamptz)*1000))::integer,$3)`,
     [uuidv7(), topup.created_at, context.traceId]);
-    const daily = (await client.query(`
-      SELECT COALESCE(sum(amount_cents), 0)::bigint AS total
-      FROM topups WHERE discord_user_id = $1 AND status = 'CREDITED'
-        AND credited_at >= $2 AND credited_at < $3
-    `, [topup.discord_user_id, bounds.starts_at, bounds.ends_at])).rows[0];
-    if (BigInt(daily.total) >= 300_000n) {
-      await client.query(`UPDATE topups SET warning_code='DAILY_TOPUP_LIMIT_EXCEEDED',
-        updated_at=transaction_timestamp() WHERE id=$1`, [topupId]);
-      const lock = (await client.query(`INSERT INTO topup_daily_locks(
-        discord_user_id,expires_at,trace_id
-      ) VALUES($1,$2,$3)
-      ON CONFLICT(discord_user_id) DO UPDATE SET
-        expires_at=EXCLUDED.expires_at,trace_id=EXCLUDED.trace_id,updated_at=clock_timestamp()
-      RETURNING *`, [topup.discord_user_id, bounds.ends_at, context.traceId])).rows[0];
-      await appendAdminAudit(client, { action: 'TOPUP_DAILY_LOCK_CREATED',
-        targetType: 'DISCORD_USER', targetId: topup.discord_user_id, actorId: 'SYSTEM',
-        after: { expiresAt: lock.expires_at }, reason: 'DAILY_TOPUP_LIMIT', context });
-    }
     await enqueueProjection(client, {
       projectionType: await durablePaymentLogType(client, topupId), aggregateType: 'TOPUP', aggregateId: topupId,
       aggregateVersion: updated.state_version, surfaceKey: 'LOG_PAYMENTS', context,
