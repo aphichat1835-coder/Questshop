@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { PermissionFlagsBits } from 'discord.js';
 import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
@@ -98,6 +99,36 @@ export function questAutoSurfaceMatches(message, expectedBody) {
     && Boolean(actual.image?.url);
 }
 
+export function assertSensitiveSurfacePrivacy(channel, surfaceKey) {
+  if (surfaceKey !== 'LOG_PAYMENTS') return true;
+  const guild = channel?.guild;
+  const everyone = guild?.roles?.everyone;
+  if (!guild || !everyone) {
+    throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ไม่สามารถตรวจสอบสิทธิ์ห้องบันทึกการชำระเงินได้');
+  }
+  if (channel.permissionsFor(everyone)?.has?.(PermissionFlagsBits.ViewChannel)) {
+    throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ห้อง LOG_PAYMENTS ต้องซ่อนจาก @everyone');
+  }
+  for (const role of guild.roles.cache?.values?.() ?? []) {
+    if (role.id === everyone.id || role.permissions?.has?.(PermissionFlagsBits.Administrator)) continue;
+    if (channel.permissionsFor(role)?.has?.(PermissionFlagsBits.ViewChannel)) {
+      throw new QuestshopError('SURFACE_CHANNEL_INVALID',
+        `ห้อง LOG_PAYMENTS เปิดให้ยศ ${role.name ?? role.id} มองเห็น ซึ่งไม่ใช่ Administrator`);
+    }
+  }
+  const botId = channel.client?.user?.id;
+  const ownerId = channel.client?.questshop?.env?.OWNER_ID;
+  for (const overwrite of channel.permissionOverwrites?.cache?.values?.() ?? []) {
+    if (guild.roles.cache?.has?.(overwrite.id)) continue;
+    if (overwrite.id === botId || overwrite.id === ownerId) continue;
+    if (overwrite.allow?.has?.(PermissionFlagsBits.ViewChannel)) {
+      throw new QuestshopError('SURFACE_CHANNEL_INVALID',
+        'ห้อง LOG_PAYMENTS มีสิทธิ์รายบุคคลที่เปิดดูข้อมูลการชำระเงินให้ผู้ใช้อื่น');
+    }
+  }
+  return true;
+}
+
 async function findSurfaceMarker(channel, surfaceKey) {
   const botUserId = channel.client?.user?.id;
   if (surfaceKey === 'QUEST_AUTO') {
@@ -151,6 +182,7 @@ async function setupSurfaceLocked({ interaction, surfaceKey, config }, context, 
   if (!channel?.isTextBased() || channel.isDMBased()) {
     throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ต้องเลือกห้องข้อความในเซิร์ฟเวอร์');
   }
+  assertSensitiveSurfacePrivacy(channel, surfaceKey);
   const existing = (await options.pool.query('SELECT * FROM surfaces WHERE surface_key = $1', [surfaceKey])).rows[0];
   let message = null;
   if (existing?.channel_id === channel.id && existing.message_id) {
@@ -259,6 +291,7 @@ async function reconcileOneSurface({ guild, pool, surface, config, context }) {
   if (!channel?.isTextBased() || channel.isDMBased()) {
     throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'Surface channel is unavailable');
   }
+  assertSensitiveSurfacePrivacy(channel, surface.surface_key);
   let message = surface.message_id ? await fetchSurfaceMessageFresh(channel, surface.message_id) : null;
   message ??= await findSurfaceMarker(channel, surface.surface_key);
   const questAutoChanged = message && surface.surface_key === 'QUEST_AUTO'
