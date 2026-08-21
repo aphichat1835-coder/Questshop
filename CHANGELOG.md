@@ -12,7 +12,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - `DATABASE_DIRECT_URL` = Migrator role; `DATABASE_POOL_URL` = Runtime role; both production URLs use
   `sslmode=verify-full`.
 - `BACKUP_MODE=AIVEN_MANAGED` is the default provider boundary for Aiven.
-- `LOG_PAYMENTS` may render a full voucher link by Owner policy without runtime human-visibility/privacy checks.
+- `LOG_PAYMENTS` may render a full voucher link by Owner policy only on a channel that is hidden from `@everyone`,
+  non-Administrator roles and arbitrary member overwrites; privacy drift quarantines the durable surface.
 - No Automatic Claim; successful Quest work ends at `READY_TO_CLAIM` with customer-side claim URL.
 - Release state remains **implemented-but-unverified** until live UAT passes on one exact Git SHA.
 
@@ -43,6 +44,14 @@ There is no production release/tag evidence yet; current work remains under `[Un
   video thumbnails, while excluding playable video URLs.
 - Regression coverage proving current metadata-revision authority: partial payloads may inherit prior presentation
   metadata, while a later complete payload can remove an old image/reward without stale resurrection.
+- TrueMoney settlement containment: automatic redemption stops when automatic credit settlement is disabled, financial
+  invariant failures close top-up intake immediately, and circuit recovery restores intake only after a successful probe.
+- Durable payment recovery for `REDEEMED` rows, including Owner-only escalation for stuck settlement, payment-queue and
+  redeemed-stuck incidents, and idempotent credit recovery without another provider call.
+- Payment-attempt forensic lineage using `parent_attempt_id`, normalized `error_class` / `error_code`, and regression
+  coverage for retry ancestry.
+- Payment-specific channel privacy enforcement for `LOG_PAYMENTS`; a later permission drift disables that surface so
+  financial Outbox delivery cannot continue through the unsafe durable anchor.
 
 ### Changed
 
@@ -78,12 +87,21 @@ There is no production release/tag evidence yet; current work remains under `[Un
   preserve the authoritative pointer and incident evidence.
 - Runtime/PostgreSQL role synchronization and TLS CA handling remain fail-closed and do not use the old
   `NODE_EXTRA_CA_CERTS` workaround.
+- TrueMoney submit now creates the customer Wallet up front, hides durable top-up identity from other users, permits only
+  one pending top-up per customer and re-checks the Bangkok daily lock before a queued voucher can be claimed.
+- TrueMoney success now requires successful HTTP status, positive amount, consistent single-recipient evidence and a
+  safe transaction identifier. Response aborts and inconsistent transport/provider evidence remain ambiguous.
+- Automatic credit accepts the established 10–1,000 baht range; successful redemptions outside that range move to
+  Owner-only Manual Review rather than being credited automatically.
+- Owner manual credit now requires a matching second confirmation within five minutes, and duplicate provider transaction
+  identifiers return a business-safe conflict instead of a generic database failure.
+- Runtime payment readiness fails closed when payment gates are enabled without an active TrueMoney receiver.
 
 ### Removed
 
 - Automatic Quest reward claim / claim retry paths.
-- Runtime Permission Drift detector and automatic Discord permission repair.
-- Human-visibility/privacy preflight around backoffice setup and Payment Log delivery, per explicit Owner policy.
+- Runtime-wide Permission Drift detector and automatic Discord permission repair; only the narrow `LOG_PAYMENTS`
+  confidentiality invariant is enforced.
 - Legacy generic branding overrides for the fixed Quest Auto title/description.
 - Legacy Base64/re-encoded Quest Auto demo derivative and standalone MP4 storefront presentation.
 - The legacy duplicated Quest-new renderer that could still format `ตรวจพบ` / `อัปเดต` independently of Outbox delivery.
@@ -92,8 +110,10 @@ There is no production release/tag evidence yet; current work remains under `[Un
 
 - Quest Auto media bytes fail closed on size/GIF-signature/hash mismatch before upload.
 - Money remains integer satang; Wallet/Ledger settlement paths retain serializable/idempotent/fencing protections.
-- Logger/Discord boundaries retain secret redaction and deny-by-default mentions.
-- Full TrueMoney voucher-link rendering remains the narrow `LOG_PAYMENTS` exception only.
+- Logger/Discord boundaries retain secret redaction and deny-by-default mentions; TrueMoney voucher URLs are redacted
+  from structured application logs.
+- Full TrueMoney voucher-link rendering remains the narrow `LOG_PAYMENTS` exception and is constrained to a private
+  Administrator/Owner operational channel.
 - Quest reward parsing ignores explicitly non-Orb reward quantities instead of mislabelling them as Discord Orbs.
 
 ### Automated evidence
