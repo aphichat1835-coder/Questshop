@@ -50,7 +50,39 @@ export function normalizeVoucherUrl(input) {
 }
 
 function singleRecipientConfirmed(data) {
-  return data?.voucher?.member === 1 || data?.voucher?.available === 1;
+  const member = data?.voucher?.member;
+  const available = data?.voucher?.available;
+  if (member == null && available == null) return false;
+  if (member != null && member !== 1) return false;
+  if (available != null && available !== 1) return false;
+  return member === 1 || available === 1;
+}
+
+function successfulHttpStatus(status) {
+  return Number.isInteger(status) && status >= 200 && status < 300;
+}
+
+function providerSchemaError(code, message, options = {}) {
+  return new QuestshopError(code, message, { category: 'PROVIDER_SCHEMA', ...options });
+}
+
+function ambiguousProviderError(code, message, options = {}) {
+  return new QuestshopError(code, message, { category: 'AMBIGUOUS', ...options });
+}
+
+function normalizeProviderTransactionId(value) {
+  if (value == null) return null;
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw providerSchemaError('PROVIDER_TRANSACTION_ID_UNSAFE', 'TrueMoney returned an unsafe numeric transaction id');
+    }
+    return String(value);
+  }
+  const normalized = String(value).trim();
+  if (!normalized || normalized.length > 200) {
+    throw providerSchemaError('PROVIDER_TRANSACTION_ID_INVALID', 'TrueMoney returned an invalid transaction id');
+  }
+  return normalized;
 }
 
 function mapProviderFailure(parsed, httpStatus) {
@@ -100,6 +132,14 @@ export async function redeemVoucher({
     }, (response) => {
       const chunks = [];
       let length = 0;
+      const failResponseStream = (cause) => {
+        if (settled) return;
+        settled = true;
+        reject(ambiguousProviderError('PROVIDER_RESULT_AMBIGUOUS',
+          'TrueMoney response ended before a trustworthy result was available', { cause }));
+      };
+      response.once('aborted', () => failResponseStream(new Error('provider response aborted')));
+      response.once('error', failResponseStream);
       response.on('data', (chunk) => {
         length += chunk.length;
         if (length > MAX_RESPONSE_BYTES) {
@@ -113,43 +153,57 @@ export async function redeemVoucher({
         settled = true;
         try { await possiblySentPromise; }
         catch (cause) {
-          reject(new QuestshopError('PAYMENT_INTENT_CHECKPOINT_FAILED',
-            'ไม่สามารถยืนยัน Payment intent checkpoint', { category: 'AMBIGUOUS', cause }));
+          reject(ambiguousProviderError('PAYMENT_INTENT_CHECKPOINT_FAILED',
+            'ไม่สามารถยืนยัน Payment intent checkpoint', { cause }));
           return;
         }
+        const httpOk = successfulHttpStatus(response.statusCode);
         let raw;
         try {
           raw = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         } catch (cause) {
-          reject(new QuestshopError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney response is not valid JSON', {
-            category: 'PROVIDER_SCHEMA', cause,
-          }));
+          reject(httpOk
+            ? providerSchemaError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney response is not valid JSON', { cause })
+            : ambiguousProviderError('PROVIDER_HTTP_AMBIGUOUS',
+              `TrueMoney returned HTTP ${response.statusCode ?? 'unknown'} with an unreadable body`, { cause }));
           return;
         }
         const parsed = responseSchema.safeParse(raw);
         if (!parsed.success) {
-          reject(new QuestshopError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney response schema changed', {
-            category: 'PROVIDER_SCHEMA', details: parsed.error.issues,
-          }));
+          reject(httpOk
+            ? providerSchemaError('PROVIDER_SCHEMA_INCOMPATIBLE', 'TrueMoney response schema changed', {
+              details: parsed.error.issues,
+            })
+            : ambiguousProviderError('PROVIDER_HTTP_AMBIGUOUS',
+              `TrueMoney returned HTTP ${response.statusCode ?? 'unknown'} with an incompatible body`));
           return;
         }
         if (parsed.data.status.code !== 'SUCCESS') {
           resolve(mapProviderFailure(parsed.data, response.statusCode));
           return;
         }
+        if (!httpOk) {
+          reject(ambiguousProviderError('PROVIDER_HTTP_INCONSISTENT',
+            `TrueMoney reported SUCCESS with HTTP ${response.statusCode ?? 'unknown'}`));
+          return;
+        }
         if (!parsed.data.data?.my_ticket || !singleRecipientConfirmed(parsed.data.data)) {
-          reject(new QuestshopError('PROVIDER_CONFIRMATION_INCOMPLETE', 'Amount or single-recipient confirmation is missing', {
-            category: 'PROVIDER_SCHEMA',
-          }));
+          reject(providerSchemaError('PROVIDER_CONFIRMATION_INCOMPLETE',
+            'Amount or single-recipient confirmation is missing or contradictory'));
           return;
         }
         let amountCents;
+        let providerTransactionId;
         try {
           amountCents = parseBahtToCents(parsed.data.data.my_ticket.amount_baht);
+          if (amountCents <= 0) throw new TypeError('amount must be positive');
+          providerTransactionId = normalizeProviderTransactionId(parsed.data.data.my_ticket.transaction_id);
         } catch (cause) {
-          reject(new QuestshopError('PROVIDER_AMOUNT_INVALID', 'TrueMoney returned an invalid amount', {
-            category: 'PROVIDER_SCHEMA', cause,
-          }));
+          if (cause instanceof QuestshopError) {
+            reject(cause);
+            return;
+          }
+          reject(providerSchemaError('PROVIDER_AMOUNT_INVALID', 'TrueMoney returned an invalid amount', { cause }));
           return;
         }
         resolve({
@@ -161,9 +215,7 @@ export async function redeemVoucher({
           providerCode: 'SUCCESS',
           httpStatus: response.statusCode,
           receiverConfirmation: 'REQUEST_BOUND_SUCCESS',
-          providerTransactionId: parsed.data.data.my_ticket.transaction_id == null
-            ? null
-            : String(parsed.data.data.my_ticket.transaction_id),
+          providerTransactionId,
         });
       });
     });
