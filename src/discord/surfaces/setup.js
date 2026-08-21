@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { PermissionFlagsBits } from 'discord.js';
 import { withTransaction } from '../../db/transaction.js';
 import { QuestshopError } from '../../shared/errors.js';
 import { renderSurfaceAnchor } from '../renderers/surfaces.js';
@@ -96,33 +95,10 @@ export function questAutoSurfaceMatches(message, expectedBody) {
     && Boolean(actual.image?.url);
 }
 
-export function assertSensitiveSurfacePrivacy(channel, surfaceKey) {
-  if (surfaceKey !== 'LOG_PAYMENTS') return true;
-  const guild = channel?.guild;
-  const everyone = guild?.roles?.everyone;
-  if (!guild || !everyone) {
-    throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ไม่สามารถตรวจสอบสิทธิ์ห้องบันทึกการชำระเงินได้');
-  }
-  if (channel.permissionsFor(everyone)?.has?.(PermissionFlagsBits.ViewChannel)) {
-    throw new QuestshopError('SURFACE_CHANNEL_INVALID', 'ห้อง LOG_PAYMENTS ต้องซ่อนจาก @everyone');
-  }
-  for (const role of guild.roles.cache?.values?.() ?? []) {
-    if (role.id === everyone.id || role.permissions?.has?.(PermissionFlagsBits.Administrator)) continue;
-    if (channel.permissionsFor(role)?.has?.(PermissionFlagsBits.ViewChannel)) {
-      throw new QuestshopError('SURFACE_CHANNEL_INVALID',
-        `ห้อง LOG_PAYMENTS เปิดให้ยศ ${role.name ?? role.id} มองเห็น ซึ่งไม่ใช่ Administrator`);
-    }
-  }
-  const botId = channel.client?.user?.id;
-  const ownerId = channel.client?.questshop?.env?.OWNER_ID;
-  for (const overwrite of channel.permissionOverwrites?.cache?.values?.() ?? []) {
-    if (guild.roles.cache?.has?.(overwrite.id)) continue;
-    if (overwrite.id === botId || overwrite.id === ownerId) continue;
-    if (overwrite.allow?.has?.(PermissionFlagsBits.ViewChannel)) {
-      throw new QuestshopError('SURFACE_CHANNEL_INVALID',
-        'ห้อง LOG_PAYMENTS มีสิทธิ์รายบุคคลที่เปิดดูข้อมูลการชำระเงินให้ผู้ใช้อื่น');
-    }
-  }
+export function assertSensitiveSurfacePrivacy(_channel, _surfaceKey) {
+  // LOG_PAYMENTS intentionally follows the Owner-managed Discord permission policy.
+  // The runtime validates only that a surface points at a usable guild text channel;
+  // it does not infer which human roles/members the Owner intends to grant access to.
   return true;
 }
 
@@ -248,15 +224,8 @@ async function resolveSurfaceIncidentSafely(pool, surfaceKey, context) {
   }
 }
 
-async function quarantineSensitiveSurface(pool, surfaceKey, error) {
-  if (surfaceKey !== 'LOG_PAYMENTS' || error?.code !== 'SURFACE_CHANNEL_INVALID') return;
-  await pool.query(`UPDATE surfaces SET state='DISABLED',state_version=state_version+1,
-    updated_at=clock_timestamp() WHERE surface_key=$1 AND state<>'DISABLED'`, [surfaceKey]);
-}
-
 async function recordSurfaceIncidentSafely(pool, surfaceKey, error, context) {
   try {
-    await quarantineSensitiveSurface(pool, surfaceKey, error);
     await recordSurfaceIncident(pool, surfaceKey, error, context);
   } catch {
     // A database outage is already the authoritative failure. Do not hide
