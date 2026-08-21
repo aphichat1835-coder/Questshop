@@ -9,13 +9,39 @@ import { creditRedeemedTopup } from '../domain/wallet/service.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
 import { getRuntimePool } from '../db/pools.js';
 
+let nextSettlementAuditAt = 0;
+
+async function auditPaymentSettlement({ holder, env, pool }) {
+  if (Date.now() < nextSettlementAuditAt) return;
+  nextSettlementAuditAt = Date.now() + 60_000;
+  const snapshot = (await pool.query(`SELECT
+    count(*) FILTER (WHERE status='REDEEMED' AND redeemed_at<clock_timestamp()-interval '2 minutes')::integer AS redeemed_stuck,
+    count(*) FILTER (WHERE status IN ('PAYMENT_QUEUED','RETRY_WAIT')
+      AND updated_at<clock_timestamp()-interval '5 minutes')::integer AS queue_stuck
+    FROM topups`)).rows[0];
+  const context = createContext({ actorType: 'SYSTEM', actorId: holder, guildId: env.DISCORD_GUILD_ID,
+    idempotencyKey: `payment-settlement-audit:${Math.floor(Date.now() / 60_000)}` });
+  await reconcileIncident({ code: 'TOPUP_REDEEMED_STUCK', scope: 'TRUEMONEY',
+    active: snapshot.redeemed_stuck > 0, severity: 'CRITICAL', evidence: { count: snapshot.redeemed_stuck } },
+  context, { pool });
+  await reconcileIncident({ code: 'PAYMENT_QUEUE_STUCK', scope: 'TRUEMONEY',
+    active: snapshot.queue_stuck > 0, severity: 'ERROR', evidence: { count: snapshot.queue_stuck } },
+  context, { pool });
+}
+
 async function creditPendingRedemption({ holder, env, pool }) {
   const topup = (await pool.query(`SELECT * FROM topups WHERE status = 'REDEEMED'
     ORDER BY redeemed_at LIMIT 1`)).rows[0];
   if (!topup) return false;
   const context = createContext({ traceId: topup.trace_id, actorType: 'SYSTEM', actorId: holder,
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `credit-recovery:${topup.id}` });
-  await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
+  try {
+    await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
+  } catch (error) {
+    await reconcileIncident({ code: 'TOPUP_REDEEMED_STUCK', scope: 'TRUEMONEY', active: true,
+      severity: 'CRITICAL', evidence: { topupId: topup.id, errorCode: error.code ?? error.name } }, context, { pool });
+    throw error;
+  }
   return true;
 }
 
@@ -151,9 +177,6 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
 
     const updated = await recordProviderSuccess({ topup, attempt, result, context, pool });
     if (updated.status === 'REDEEMED' && (autoCredit || recoveryProbe)) {
-      // Once the provider result is durably REDEEMED, credit settlement is a
-      // separate idempotent phase. If it fails, leave REDEEMED for recovery;
-      // never rewrite a real provider success as FAILED.
       await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
     }
     await closeSuccessfulProbe(pool, breaker, context);
@@ -163,14 +186,10 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
 }
 
 export async function processPayment({ holder, env, signal, autoCredit = false, pool = getRuntimePool() }) {
+  await auditPaymentSettlement({ holder, env, pool });
   if (autoCredit && await creditPendingRedemption({ holder, env, pool })) return true;
   const breaker = (await pool.query("SELECT state FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
   if (breaker?.state === 'OPEN') return false;
-  // Financial containment: never redeem a new real voucher while automatic
-  // settlement is disabled. Stop new top-up intake as well so customers do not
-  // queue vouchers behind a settlement gate that cannot safely finish them.
-  // The only exception is the explicit HALF_OPEN recovery probe, which is
-  // credited immediately if it redeems successfully.
   if (!autoCredit && breaker?.state !== 'HALF_OPEN') {
     await stopTopupIntakeWhenSettlementDisabled(pool);
     return false;
