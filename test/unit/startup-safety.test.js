@@ -21,6 +21,26 @@ test('runtime startup rejects changed key material before role validation or ing
   assert.equal(health.checks.keyrings, undefined);
 });
 
+test('runtime database pool errors degrade readiness instead of becoming an unhandled event', async () => {
+  let observer;
+  const health = { checks: {}, ready: true, status: 'HEALTHY' };
+  const pool = { query: async () => ({ rows: [] }) };
+  await openRuntimeDatabase({ NODE_ENV: 'test' }, health, {
+    getRuntimePool: () => pool,
+    observePoolErrors: (_pool, callback) => { observer = callback; return () => {}; },
+    validateSchemaCompatibility: async () => {},
+    validateMigrationChecksums: async () => {},
+    validateKeyringCoverage: async () => {},
+    validateKeyringSentinels: async () => {},
+    validateRuntimeRole: async () => ({ violations: [] }),
+  });
+  const outage = new Error('idle client lost');
+  observer(outage);
+  assert.equal(health.checks.database, 'DEGRADED');
+  assert.equal(health.status, 'DEGRADED');
+  assert.equal(health.lastError, outage);
+});
+
 test('Discord readiness uses clientReady and does not wait when already ready', async () => {
   const client = new EventEmitter();
   client.isReady = () => false;

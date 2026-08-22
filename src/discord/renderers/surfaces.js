@@ -4,23 +4,47 @@ import {
 import { customId } from '../components/custom-id.js';
 import { adminCategoryOptions } from './admin.js';
 import { DISCORD_LIMITS, truncateDiscordText } from '../payload.js';
+import { DEFAULT_QUEST_PRICE_CENTS } from '../../domain/pricing/categories.js';
+import { QUEST_AUTO_MEDIA_ATTACHMENT_URL } from '../surfaces/quest-auto-media.js';
 
 const COLORS = Object.freeze({ primary: 0x5865f2, success: 0x23a55a, warning: 0xf0b232, danger: 0xf23f43 });
 
-function safeHttpsUrl(value) {
-  try {
-    const url = new URL(String(value));
-    return url.protocol === 'https:' && url.toString().length <= 512 ? url.toString() : null;
-  } catch { return null; }
+function compactBaht(cents) {
+  const amount = BigInt(cents);
+  const whole = amount / 100n;
+  const fraction = amount % 100n;
+  if (fraction === 0n) return whole.toLocaleString('th-TH');
+  return `${whole.toLocaleString('th-TH')}.${String(fraction).padStart(2, '0').replace(/0$/, '')}`;
+}
+
+export function questAutoPriceRangeLabel(priceRange = undefined) {
+  const normalized = priceRange === undefined
+    ? { minCents: DEFAULT_QUEST_PRICE_CENTS, maxCents: DEFAULT_QUEST_PRICE_CENTS }
+    : priceRange;
+  if (normalized?.minCents == null || normalized?.maxCents == null) return null;
+  const minimum = BigInt(normalized.minCents);
+  const maximum = BigInt(normalized.maxCents);
+  return minimum === maximum
+    ? compactBaht(minimum)
+    : `${compactBaht(minimum)}-${compactBaht(maximum)}`;
 }
 
 export function renderQuestAuto(config = {}) {
+  const priceLabel = questAutoPriceRangeLabel(config.priceRange);
+  const defaultDescription = [
+    'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ',
+    priceLabel
+      ? `**ค่าบริการ ${priceLabel} บาท / เควสสำเร็จ**`
+      : '**ค่าบริการยังไม่พร้อม / เควสสำเร็จ**',
+    'ใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ',
+    'เลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ',
+  ].join('\n');
   const embed = new EmbedBuilder().setColor(COLORS.primary)
-    .setTitle(truncateDiscordText(config.title ?? 'Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
-    .setDescription(truncateDiscordText(config.description ?? 'ทำ Quest เพื่อสะสม **Discord Orbs** ด้วยระบบอัตโนมัติ\n**ค่าบริการ 5 บาท / เควสสำเร็จ**\nใช้ **Discord Token** เพื่อให้ระบบเข้าไปทำ Quest ให้โดยอัตโนมัติ\nเลือก Quest ที่ต้องการ แล้วติดตามสถานะได้จนสำเร็จ', DISCORD_LIMITS.embedDescription));
-  const mediaUrl = safeHttpsUrl(config.mediaUrl);
-  if (mediaUrl) embed.setImage(mediaUrl);
+    .setTitle(truncateDiscordText('Discord Quest • Auto', DISCORD_LIMITS.embedTitle))
+    .setDescription(truncateDiscordText(defaultDescription, DISCORD_LIMITS.embedDescription))
+    .setImage(QUEST_AUTO_MEDIA_ATTACHMENT_URL);
   return {
+    content: null,
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(customId('start')).setLabel('เริ่มทำเควส').setEmoji('🎮').setStyle(ButtonStyle.Primary),

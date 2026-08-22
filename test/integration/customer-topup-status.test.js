@@ -47,3 +47,28 @@ test('customer top-up status is ownership-bound and returns a credited result wi
   await assert.rejects(() => loadCustomerTopup({ topupId, discordUserId: 'other' }, { pool }),
     (error) => error.code === 'NOT_AUTHORIZED');
 });
+
+test('customer can read a pending top-up before a wallet row exists', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const receiverId = '019fc886-ffcd-70e3-bd14-fb61772e8411';
+  const topupId = '019fc886-ffcd-70e3-bd14-fb61772e8412';
+  const traceId = '019fc886-ffcd-70e3-bd14-fb61772e8413';
+  const keyring = { current: 1, keys: { 1: Buffer.alloc(32, 9).toString('base64') } };
+  const phone = encryptSecret('0899991111', keyring, `receiver:${receiverId}:guild`);
+  await pool.query(`INSERT INTO receiver_versions(id,version,encrypted_phone,encryption_key_version,
+    nonce,auth_tag,phone_last4,state,actor_id,trace_id)
+    VALUES($1,2,$2,1,$3,$4,'1111','INACTIVE','owner',$5)`, [
+    receiverId, phone.ciphertext, phone.nonce, phone.authTag, traceId,
+  ]);
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,trace_id)
+    VALUES($1,'new-customer','PAYMENT_QUEUED',1,$2,$3,'1111',$4)`, [
+    topupId, Buffer.from('pending-voucher'), receiverId, traceId,
+  ]);
+
+  const loaded = await loadCustomerTopup({ topupId, discordUserId: 'new-customer' }, { pool });
+  assert.equal(loaded.status, 'PAYMENT_QUEUED');
+  assert.equal(loaded.wallet_available_cents, '0');
+  const wallet = await pool.query("SELECT 1 FROM wallets WHERE discord_user_id='new-customer'");
+  assert.equal(wallet.rowCount, 0);
+});

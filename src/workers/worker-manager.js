@@ -17,6 +17,9 @@ import { evaluateAlerts } from './alert-worker.js';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { usesApplicationBackup } from '../config/env.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
+import { reconcileSurfaceAnchors } from '../discord/surfaces/setup.js';
+import { APPLICATION_EVENTS, applicationEvents } from '../shared/application-events.js';
+import { safeError } from '../shared/redaction.js';
 
 async function gate(pool, name) {
   return (await pool.query('SELECT enabled FROM feature_gates WHERE gate = $1', [name])).rows[0]?.enabled === true;
@@ -27,8 +30,51 @@ function configuredRunnerConcurrency(client, env) {
     Number(client.questshop.config.values?.runnerConcurrency ?? env.RUNNER_CONCURRENCY)));
 }
 
+export function installQuestPriceSurfaceRefresh({
+  client,
+  pool,
+  env,
+  signal,
+  logger,
+  reconcile = reconcileSurfaceAnchors,
+}) {
+  let pending = Promise.resolve();
+  let sequence = 0;
+  const onQuestPriceChanged = (event = {}) => {
+    if (signal?.aborted) return;
+    const traceId = event.traceId ?? uuidv7();
+    sequence += 1;
+    const refreshSequence = sequence;
+    pending = pending.then(async () => {
+      if (signal?.aborted) return;
+      const context = createContext({
+        traceId,
+        actorType: 'SYSTEM',
+        actorId: 'price-surface-refresh',
+        guildId: env.DISCORD_GUILD_ID,
+        idempotencyKey: `quest-price-surface-refresh:${traceId}:${refreshSequence}`,
+      });
+      const results = await reconcile({ client, pool, env, config: client.questshop?.config }, context);
+      const storefront = results.find((result) => result.surfaceKey === 'QUEST_AUTO');
+      if (storefront?.reconciled === false) {
+        logger?.warn?.({ traceId, reason: storefront.reason },
+          'Quest Auto price refresh deferred to maintenance');
+      }
+    }).catch((error) => {
+      logger?.warn?.({ error: safeError(error), traceId },
+        'Quest Auto price refresh deferred to maintenance');
+    });
+  };
+  applicationEvents.on(APPLICATION_EVENTS.QUEST_CATEGORY_PRICE_CHANGED, onQuestPriceChanged);
+  return {
+    flush: () => pending,
+    dispose: () => applicationEvents.off(APPLICATION_EVENTS.QUEST_CATEGORY_PRICE_CHANGED, onQuestPriceChanged),
+  };
+}
+
 export function startWorkers({ client, pool, env, signal, health, logger, startDeferred = true }) {
   const tasks = [];
+  const priceSurfaceRefresh = installQuestPriceSurfaceRefresh({ client, pool, env, signal, logger });
   const eventLoopMonitor = monitorEventLoopDelay({ resolution: 20 });
   eventLoopMonitor.enable();
   const recordIteration = async ({ name, error, durationMs }) => {
@@ -130,7 +176,9 @@ export function startWorkers({ client, pool, env, signal, health, logger, startD
   };
   if (startDeferred) startDeferredWorkers();
   return { tasks, startDeferred: startDeferredWorkers, stop: async () => {
+    priceSurfaceRefresh.dispose();
     const results = await Promise.allSettled(tasks);
+    await priceSurfaceRefresh.flush();
     eventLoopMonitor.disable();
     return results;
   } };

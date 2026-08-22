@@ -4,6 +4,30 @@ import { recordTransition } from '../shared/transition.js';
 
 const ACTIVE_BATCH_STATES = new Set(['QUEUED', 'RUNNING']);
 
+export async function questDeadlinePassed(client, quest) {
+  if (!quest?.expires_at) return false;
+  return (await client.query('SELECT $1::timestamptz<=clock_timestamp() AS expired',
+    [quest.expires_at])).rows[0]?.expired === true;
+}
+
+async function closeExpiredBatch(client, batch, context) {
+  if (!batch || !ACTIVE_BATCH_STATES.has(batch.state)) return batch ?? null;
+  const failed = (await client.query(`UPDATE quest_test_batches SET state='FAILED',
+    state_version=state_version+1,latest_error=$2,completed_at=clock_timestamp(),updated_at=clock_timestamp()
+    WHERE id=$1 AND state=$3 AND state_version=$4 RETURNING *`, [
+    batch.id,
+    { code: 'TEST_QUEST_EXPIRED', message: 'Quest หมดอายุแล้ว จึงยกเลิก Monitor test โดยไม่สลับ Token ต่อ' },
+    batch.state,
+    batch.state_version,
+  ])).rows[0] ?? batch;
+  if (failed.state !== batch.state) await recordTransition(client, {
+    aggregateType: 'QUEST_TEST_BATCH', aggregateId: failed.id, fromState: batch.state,
+    toState: 'FAILED', stateVersion: failed.state_version,
+    reasonCode: 'TEST_QUEST_EXPIRED', context,
+  });
+  return failed;
+}
+
 export async function hasCurrentTestPass(client, quest) {
   if (quest.public_test_gate_override
     && quest.public_test_gate_override_contract_hash === quest.current_contract_hash) return true;
@@ -83,6 +107,9 @@ async function failBatch(client, batch, quest, error, context) {
 }
 
 export async function createMonitorTestBatch(client, { quest, context, requestedBy = 'SYSTEM', force = false }) {
+  if (await questDeadlinePassed(client, quest)) {
+    return { batch: null, queued: null, reused: false, skipped: 'QUEST_EXPIRED' };
+  }
   const existing = (await client.query(`SELECT * FROM quest_test_batches
     WHERE quest_id=$1 AND contract_hash IS NOT DISTINCT FROM $2
     ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, [quest.quest_id, quest.current_contract_hash])).rows[0];
@@ -112,6 +139,10 @@ export async function advanceMonitorTestBatch(client, { run, quest, error, conte
   if (!run.batch_id) return null;
   const batch = (await client.query('SELECT * FROM quest_test_batches WHERE id=$1 FOR UPDATE', [run.batch_id])).rows[0];
   if (!batch || !ACTIVE_BATCH_STATES.has(batch.state)) return null;
+  if (await questDeadlinePassed(client, quest)) {
+    const expired = await closeExpiredBatch(client, batch, context);
+    return { batch: expired, queued: null, alert: null, expired: true };
+  }
   const monitorOrder = batch.monitor_order ?? [];
   const currentIndex = Math.max(0, monitorOrder.indexOf(run.target_monitor_id ?? run.monitor_id));
   const sameMonitor = Number(run.attempt_in_monitor ?? 1) < Number(batch.max_attempts_per_monitor);
@@ -197,6 +228,12 @@ export async function retryFailedTestAlert(client, { alertId, context }) {
   const alert = (await client.query(`SELECT * FROM quest_test_failure_alerts WHERE id=$1 FOR UPDATE`, [alertId])).rows[0];
   if (alert?.state !== 'OPEN') return { alert, batch: null, idempotent: true };
   const quest = (await client.query('SELECT * FROM quests WHERE quest_id=$1 FOR UPDATE', [alert.quest_id])).rows[0];
+  if (await questDeadlinePassed(client, quest)) {
+    const resolved = (await client.query(`UPDATE quest_test_failure_alerts SET state='RESOLVED',
+      state_version=state_version+1,updated_at=clock_timestamp()
+      WHERE id=$1 AND state_version=$2 RETURNING *`, [alert.id, alert.state_version])).rows[0] ?? alert;
+    return { alert: resolved, batch: null, queued: null, idempotent: true, expired: true };
+  }
   const retrying = (await client.query(`UPDATE quest_test_failure_alerts SET state='RETRYING',
     state_version=state_version+1,trace_id=$2,updated_at=clock_timestamp()
     WHERE id=$1 AND state_version=$3 RETURNING *`, [alert.id, context.traceId, alert.state_version])).rows[0];

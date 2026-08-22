@@ -3,20 +3,96 @@ import { decryptSecret } from '../adapters/crypto/keyring.js';
 import { redeemVoucher } from '../adapters/truemoney/voucher.js';
 import { createContext } from '../shared/correlation.js';
 import {
-  acquirePaymentJob, createPaymentAttempt, markPaymentPossiblySent, recordProviderResult, renewPaymentLease,
+  acquirePaymentJob, createPaymentAttempt, markPaymentPossiblySent, moveRedeemedTopupToReview,
+  recordProviderResult, renewPaymentLease,
 } from '../domain/payments/service.js';
+import {
+  loadPaymentPolicy, reconcileCurrentDailyTopupLocks, reconcileDailyTopupLock,
+  lockTopupIntakeUntilBangkokDayEnds, topupAmountExceedsAutoCreditMaximum, topupAmountNeedsReview,
+} from '../domain/payments/policy.js';
 import { creditRedeemedTopup } from '../domain/wallet/service.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
 import { getRuntimePool } from '../db/pools.js';
 
-async function creditPendingRedemption({ holder, env, pool }) {
+let nextSettlementAuditAt = 0;
+let nextDailyLockReconcileAt = 0;
+
+async function auditPaymentSettlement({ holder, env, pool }) {
+  if (Date.now() < nextSettlementAuditAt) return;
+  nextSettlementAuditAt = Date.now() + 60_000;
+  const snapshot = (await pool.query(`SELECT
+    count(*) FILTER (WHERE status='REDEEMED' AND redeemed_at<clock_timestamp()-interval '2 minutes')::integer AS redeemed_stuck,
+    count(*) FILTER (WHERE status IN ('PAYMENT_QUEUED','RETRY_WAIT')
+      AND updated_at<clock_timestamp()-interval '5 minutes')::integer AS queue_stuck
+    FROM topups`)).rows[0];
+  const context = createContext({ actorType: 'SYSTEM', actorId: holder, guildId: env.DISCORD_GUILD_ID,
+    idempotencyKey: `payment-settlement-audit:${Math.floor(Date.now() / 60_000)}` });
+  await reconcileIncident({ code: 'TOPUP_REDEEMED_STUCK', scope: 'TRUEMONEY',
+    active: snapshot.redeemed_stuck > 0, severity: 'CRITICAL', evidence: { count: snapshot.redeemed_stuck } },
+  context, { pool });
+  await reconcileIncident({ code: 'PAYMENT_QUEUE_STUCK', scope: 'TRUEMONEY',
+    active: snapshot.queue_stuck > 0, severity: 'ERROR', evidence: { count: snapshot.queue_stuck } },
+  context, { pool });
+}
+
+async function reconcilePaymentPolicyState({ holder, env, pool }) {
+  if (Date.now() < nextDailyLockReconcileAt) return;
+  nextDailyLockReconcileAt = Date.now() + 60_000;
+  const context = createContext({ actorType: 'SYSTEM', actorId: holder, guildId: env.DISCORD_GUILD_ID,
+    idempotencyKey: `payment-policy-reconcile:${Math.floor(Date.now() / 60_000)}` });
+  await reconcileCurrentDailyTopupLocks(context, { pool });
+}
+
+async function creditPendingRedemption({ holder, env, pool, policy }) {
   const topup = (await pool.query(`SELECT * FROM topups WHERE status = 'REDEEMED'
     ORDER BY redeemed_at LIMIT 1`)).rows[0];
   if (!topup) return false;
   const context = createContext({ traceId: topup.trace_id, actorType: 'SYSTEM', actorId: holder,
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `credit-recovery:${topup.id}` });
-  await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
+  await reconcileDailyTopupLock({ discordUserId: topup.discord_user_id,
+    redeemedAt: topup.redeemed_at, policy }, context, { pool });
+  await lockOverLimitTopupIntake({ topup, policy, context, pool });
+  if (topupAmountNeedsReview(topup.amount_cents, policy)) {
+    await moveRedeemedTopupToReview({ topupId: topup.id, reason: 'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE' },
+      context, { pool });
+    return true;
+  }
+  try {
+    await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
+    await recordOverLimitTopupWarning({ topup, policy, context, pool });
+  } catch (error) {
+    await reconcileIncident({ code: 'TOPUP_REDEEMED_STUCK', scope: 'TRUEMONEY', active: true,
+      severity: 'CRITICAL', evidence: { topupId: topup.id, errorCode: error.code ?? error.name } }, context, { pool });
+    throw error;
+  }
   return true;
+}
+
+async function recordOverLimitTopupWarning({ topup, policy, context, pool }) {
+  if (!topupAmountExceedsAutoCreditMaximum(topup.amount_cents, policy)) return;
+  await reconcileIncident({ code: 'TOPUP_AMOUNT_OVER_AUTOCREDIT_LIMIT', scope: 'TRUEMONEY', active: true,
+    severity: 'WARNING', evidence: {
+      topupId: topup.id,
+      discordUserId: topup.discord_user_id,
+      amountCents: String(topup.amount_cents),
+      configuredMaximumCents: String(policy.autoCreditMaxCents),
+      creditedInFull: true,
+    } }, context, { pool });
+}
+
+async function lockOverLimitTopupIntake({ topup, policy, context, pool }) {
+  if (!topupAmountExceedsAutoCreditMaximum(topup.amount_cents, policy)) return;
+  await lockTopupIntakeUntilBangkokDayEnds({
+    discordUserId: topup.discord_user_id,
+    redeemedAt: topup.redeemed_at,
+    reason: 'TOPUP_AMOUNT_OVER_AUTOCREDIT_LIMIT',
+  }, context, { pool });
+}
+
+async function stopTopupIntakeWhenSettlementDisabled(pool) {
+  await pool.query(`UPDATE feature_gates SET enabled=false,reason='AUTO_CREDIT_DISABLED',
+    version=version+1,actor_type='SYSTEM',actor_id='payment-worker',updated_at=clock_timestamp()
+    WHERE gate='TOPUP_ACCEPTING' AND enabled=true`);
 }
 
 function startLeaseHeartbeat(topup, pool, parentSignal) {
@@ -58,10 +134,17 @@ function normalizeProviderResult(result, topup) {
 
 async function closeSuccessfulProbe(pool, breaker, context) {
   if (breaker?.state !== 'HALF_OPEN') return;
-  await pool.query(`UPDATE circuit_breakers SET state='CLOSED',reason='PROBE_SCHEMA_VALID',
+  const closed = await pool.query(`UPDATE circuit_breakers SET state='CLOSED',reason='PROBE_SCHEMA_VALID',
     failure_count=0,next_probe_at=NULL,state_version=state_version+1,trace_id=$2,
-    updated_at=clock_timestamp() WHERE breaker_key=$1 AND state='HALF_OPEN'`,
+    updated_at=clock_timestamp() WHERE breaker_key=$1 AND state='HALF_OPEN' RETURNING breaker_key`,
   ['TRUEMONEY_DIRECT', context.traceId]);
+  if (!closed.rowCount) return;
+  await pool.query(`UPDATE feature_gates SET enabled=true,reason='TRUEMONEY_SCHEMA_PROBE_RECOVERED',
+    version=version+1,actor_type='SYSTEM',actor_id='payment-worker',trace_id=$1,
+    updated_at=clock_timestamp() WHERE gate IN ('AUTO_CREDIT_ENABLED','TOPUP_ACCEPTING')
+      AND enabled=false AND reason='TRUEMONEY_SCHEMA_CIRCUIT_OPEN'`, [context.traceId]);
+  await reconcileIncident({ code: 'PROVIDER_SCHEMA_CHANGED', scope: 'TRUEMONEY_DIRECT', active: false,
+    severity: 'CRITICAL', evidence: { recoveredBy: 'HALF_OPEN_PROBE' } }, context, { pool });
 }
 
 async function openCircuit(pool, error, context, breaker) {
@@ -75,8 +158,8 @@ async function openCircuit(pool, error, context, breaker) {
   ['TRUEMONEY_DIRECT', error.code ?? error.name, context.traceId]);
   if (!schemaFailure) return;
   await pool.query(`UPDATE feature_gates SET enabled=false,reason='TRUEMONEY_SCHEMA_CIRCUIT_OPEN',
-    version=version+1,actor_type='SYSTEM',actor_id='payment-worker',trace_id=$1,
-    updated_at=clock_timestamp() WHERE gate='AUTO_CREDIT_ENABLED'`, [context.traceId]);
+    version=version+CASE WHEN enabled THEN 1 ELSE 0 END,actor_type='SYSTEM',actor_id='payment-worker',trace_id=$1,
+    updated_at=clock_timestamp() WHERE gate IN ('AUTO_CREDIT_ENABLED','TOPUP_ACCEPTING')`, [context.traceId]);
   await reconcileIncident({ code: 'PROVIDER_SCHEMA_CHANGED', scope: 'TRUEMONEY_DIRECT', active: true,
     severity: 'CRITICAL', evidence: { errorCode: error.code ?? error.name } }, context, { pool });
 }
@@ -89,35 +172,86 @@ function failureResult(error, topup) {
     providerCode: error.code ?? error.name };
 }
 
-async function processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, pool }) {
+async function recordProviderFailure({ topup, attempt, error, context, breaker, pool }) {
+  const updated = await recordProviderResult({ topup, attemptId: attempt.id, result: failureResult(error, topup) },
+    context, { pool });
+  await openCircuit(pool, error, context, breaker);
+  return updated;
+}
+
+async function recordProviderSuccess({ topup, attempt, result, context, policy, pool }) {
+  try {
+    return await recordProviderResult({ topup, attemptId: attempt.id, result, policy }, context, { pool });
+  } catch (error) {
+    if (error?.code !== '23505' || result.outcome !== 'REDEEMED') throw error;
+    return recordProviderResult({
+      topup,
+      attemptId: attempt.id,
+      policy,
+      result: {
+        outcome: 'AMBIGUOUS',
+        providerCode: 'PROVIDER_TRANSACTION_ID_CONFLICT',
+        httpStatus: result.httpStatus ?? null,
+        amountCents: result.amountCents ?? null,
+        currency: result.currency ?? null,
+        senderName: result.senderName ?? null,
+        senderPhone: result.senderPhone ?? null,
+        receiverConfirmation: result.receiverConfirmation ?? null,
+        providerTransactionId: null,
+      },
+    }, context, { pool });
+  }
+}
+
+async function processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, policy, pool }) {
   const context = createContext({ traceId: topup.trace_id, actorType: 'SYSTEM', actorId: holder,
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `payment:${topup.id}:${topup.attempt_count}` });
   const attempt = await createPaymentAttempt({ topup }, context, { pool });
   const heartbeat = startLeaseHeartbeat(topup, pool, signal);
+  const recoveryProbe = breaker?.state === 'HALF_OPEN';
   try {
-    const { code, phone } = await decryptPaymentSecrets(pool, topup, env);
-    const result = normalizeProviderResult(await redeemVoucher({ code, receiverPhone: phone, signal: heartbeat.signal,
-      onPossiblySent: () => markPaymentPossiblySent({ attemptId: attempt.id }, { pool }) }), topup);
-    const updated = await recordProviderResult({ topup, attemptId: attempt.id, result }, context, { pool });
+    let result;
+    try {
+      const { code, phone } = await decryptPaymentSecrets(pool, topup, env);
+      result = normalizeProviderResult(await redeemVoucher({ code, receiverPhone: phone, signal: heartbeat.signal,
+        onPossiblySent: () => markPaymentPossiblySent({ attemptId: attempt.id }, { pool }) }), topup);
+    } catch (error) {
+      await recordProviderFailure({ topup, attempt, error, context, breaker, pool });
+      return;
+    }
+
+    const updated = await recordProviderSuccess({ topup, attempt, result, context, policy, pool });
+    if (updated.status === 'REDEEMED') {
+      await reconcileDailyTopupLock({ discordUserId: updated.discord_user_id,
+        redeemedAt: updated.redeemed_at, policy }, context, { pool });
+      await lockOverLimitTopupIntake({ topup: updated, policy, context, pool });
+    }
+    if (updated.status === 'REDEEMED' && topupAmountNeedsReview(updated.amount_cents, policy)) {
+      await moveRedeemedTopupToReview({ topupId: topup.id, reason: 'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE' },
+        context, { pool });
+    } else if (updated.status === 'REDEEMED' && (autoCredit || recoveryProbe)) {
+      await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
+      await recordOverLimitTopupWarning({ topup: updated, policy, context, pool });
+    }
     await closeSuccessfulProbe(pool, breaker, context);
-    if (updated.status === 'REDEEMED' && autoCredit) await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
-  } catch (error) {
-    // The provider outcome is authoritative financial state. Incident and gate
-    // updates are operational side effects and must never prevent it from
-    // becoming durable (especially while an identical incident is already open).
-    await recordProviderResult({ topup, attemptId: attempt.id, result: failureResult(error, topup) }, context, { pool });
-    await openCircuit(pool, error, context, breaker);
   } finally {
     await heartbeat.stop();
   }
 }
 
 export async function processPayment({ holder, env, signal, autoCredit = false, pool = getRuntimePool() }) {
-  if (autoCredit && await creditPendingRedemption({ holder, env, pool })) return true;
+  await auditPaymentSettlement({ holder, env, pool });
+  await reconcilePaymentPolicyState({ holder, env, pool });
+  const policy = await loadPaymentPolicy(pool);
+  if (autoCredit && await creditPendingRedemption({ holder, env, pool, policy })) return true;
   const breaker = (await pool.query("SELECT state FROM circuit_breakers WHERE breaker_key='TRUEMONEY_DIRECT'")).rows[0];
   if (breaker?.state === 'OPEN') return false;
+  if (!autoCredit && breaker?.state !== 'HALF_OPEN') {
+    await stopTopupIntakeWhenSettlementDisabled(pool);
+    return false;
+  }
   const topup = await acquirePaymentJob({ holder }, { pool });
   if (!topup) return false;
-  await processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, pool });
+  await processClaimedPayment({ topup, breaker, holder, env, signal, autoCredit, policy, pool });
   return true;
 }

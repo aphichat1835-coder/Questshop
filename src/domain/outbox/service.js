@@ -17,6 +17,14 @@ function outboxContext(event, actorId) {
   };
 }
 
+async function expiredQuestAnnouncement(client, { projectionType, aggregateType, aggregateId }) {
+  if (projectionType !== 'QUEST_NEW' || aggregateType !== 'QUEST') return false;
+  const quest = (await client.query(`SELECT sale_state='EXPIRED'
+      OR (expires_at IS NOT NULL AND expires_at<=clock_timestamp()) AS expired
+    FROM quests WHERE quest_id=$1`, [String(aggregateId)])).rows[0];
+  return quest?.expired === true;
+}
+
 export async function enqueueProjection(client, {
   projectionType,
   aggregateType,
@@ -27,6 +35,12 @@ export async function enqueueProjection(client, {
   notBefore = null,
   context,
 }) {
+  // Public Quest announcements are deny-by-expiry at the durable enqueue
+  // boundary as well as discovery. This catches maintenance/Admin/future call
+  // sites and prevents historical Discord Quest rows from ever becoming a
+  // first-time QUEST_NEW delivery after their deadline has passed.
+  if (await expiredQuestAnnouncement(client, { projectionType, aggregateType, aggregateId })) return null;
+
   const projectionId = uuidv7();
   const projection = (await client.query(`
     INSERT INTO message_projections(
@@ -113,6 +127,7 @@ export async function recordDelivery({
   fencingToken,
   messageId = null,
   pingSent = false,
+  suppressQuestAnnouncement = false,
 }, options = {}) {
   return withTransaction({ ...options, isolation: 'READ COMMITTED' }, async (client) => {
     const event = (await client.query(`SELECT * FROM outbox_events
@@ -153,10 +168,11 @@ export async function recordDelivery({
     const context = outboxContext(event, holder);
     await recordTransition(client, { aggregateType: 'OUTBOX_EVENT', aggregateId: event.id,
       fromState: 'LEASED', toState: 'DELIVERED', stateVersion: delivered.state_version,
-      reasonCode: 'OUTBOX_DELIVERED', context });
-    await client.query(`INSERT INTO delivery_attempts(id,outbox_id,attempt_number,outcome)
-      VALUES($1,$2,$3,'DELIVERED') ON CONFLICT(outbox_id,attempt_number) DO NOTHING`,
-    [uuidv7(), event.id, event.attempt_count]);
+      reasonCode: suppressQuestAnnouncement ? 'QUEST_ANNOUNCEMENT_EXPIRED' : 'OUTBOX_DELIVERED', context });
+    await client.query(`INSERT INTO delivery_attempts(id,outbox_id,attempt_number,outcome,evidence)
+      VALUES($1,$2,$3,'DELIVERED',$4) ON CONFLICT(outbox_id,attempt_number) DO NOTHING`,
+    [uuidv7(), event.id, event.attempt_count,
+      suppressQuestAnnouncement ? { suppressed: 'QUEST_EXPIRED' } : {}]);
     await client.query(`INSERT INTO operation_metrics(id,operation,outcome,duration_ms,trace_id)
       VALUES($1,'OUTBOX_DELIVERY','SUCCESS',GREATEST(0,floor(extract(epoch FROM clock_timestamp()-$2::timestamptz)*1000))::integer,$3)`,
     [uuidv7(), event.created_at, event.trace_id]);
@@ -165,7 +181,7 @@ export async function recordDelivery({
         await client.query(`UPDATE topup_sensitive_payloads SET log_delivered_at=clock_timestamp()
           WHERE topup_id=$1`, [projection.aggregate_id]);
       }
-      if (projection?.projection_type === 'QUEST_NEW') {
+      if (projection?.projection_type === 'QUEST_NEW' && !suppressQuestAnnouncement) {
         await client.query(`UPDATE quests SET announcement_state='ANNOUNCED',
           announcement_version=announcement_version+CASE WHEN announcement_state='NOT_ANNOUNCED' THEN 1 ELSE 0 END,
           updated_at=clock_timestamp() WHERE quest_id=$1`, [projection.aggregate_id]);

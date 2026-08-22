@@ -4,7 +4,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { Events } from 'discord.js';
 import { loadRuntimeEnvironment } from '../config/env.js';
 import { loadRuntimeConfig } from '../config/runtime-config.js';
-import { closePools, getRuntimePool } from '../db/pools.js';
+import { closePools, getRuntimePool, observePoolErrors } from '../db/pools.js';
 import { validateMigrationChecksums, validateSchemaCompatibility } from '../db/migrations.js';
 import { acquireLease, renewLease } from '../db/leases.js';
 import { FencingLostError } from '../shared/errors.js';
@@ -23,6 +23,19 @@ import { reconcileIncident } from '../domain/incidents/service.js';
 
 export async function openRuntimeDatabase(env, health, dependencies = {}) {
   const pool = (dependencies.getRuntimePool ?? getRuntimePool)(env);
+  const observeErrors = dependencies.observePoolErrors ?? observePoolErrors;
+  // The pool itself owns the event listener. Startup only projects it into
+  // readiness; it must never try to repair grants or restart work from an
+  // asynchronous idle-client error.
+  try {
+    observeErrors(pool, (error) => {
+      health.checks.database = 'DEGRADED';
+      health.status = health.ready ? 'DEGRADED' : health.status;
+      health.lastError = error;
+    });
+  } catch (error) {
+    if (dependencies.observePoolErrors) throw error;
+  }
   await pool.query('SELECT 1');
   await (dependencies.validateSchemaCompatibility ?? validateSchemaCompatibility)(pool);
   await (dependencies.validateMigrationChecksums ?? validateMigrationChecksums)(pool);
@@ -36,6 +49,26 @@ export async function openRuntimeDatabase(env, health, dependencies = {}) {
   health.checks.runtimeRole = roleContract.violations.length ? 'DEGRADED' : 'OK';
   health.checks.database = 'OK';
   return pool;
+}
+
+export async function validatePaymentReadiness(pool, health) {
+  const [gateResult, receiverResult] = await Promise.all([
+    pool.query(`SELECT gate,enabled FROM feature_gates
+      WHERE gate IN ('TOPUP_ACCEPTING','AUTO_CREDIT_ENABLED')`),
+    pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1"),
+  ]);
+  const gates = new Map(gateResult.rows.map((row) => [row.gate, row.enabled === true]));
+  const paymentEnabled = gates.get('TOPUP_ACCEPTING') || gates.get('AUTO_CREDIT_ENABLED');
+  const hasReceiver = receiverResult.rowCount > 0;
+  if (paymentEnabled && !hasReceiver) {
+    health.checks.payments = 'MISSING_RECEIVER';
+    // A new store intentionally has no receiver yet. Keep the backoffice
+    // available so the Owner can add one; submitVoucher still refuses intake
+    // without a snapshot, and worker processing cannot redeem a new voucher.
+    return { paymentEnabled, hasReceiver, ready: false };
+  }
+  health.checks.payments = hasReceiver ? 'OK' : 'DISABLED';
+  return { paymentEnabled, hasReceiver, ready: hasReceiver || !paymentEnabled };
 }
 
 async function acquireRuntimeOwnership(pool, env, health) {
@@ -157,7 +190,9 @@ async function markRuntimeReady({ env, health, logger, pool }) {
     .rows[0]?.enabled === true;
   health.checks.bootstrap = 'READY';
   health.ready = true;
-  health.status = storeOpen ? 'HEALTHY' : 'MAINTENANCE';
+  health.status = health.checks.payments === 'MISSING_RECEIVER'
+    ? 'DEGRADED'
+    : storeOpen ? 'HEALTHY' : 'MAINTENANCE';
   logger.info({ guildId: env.DISCORD_GUILD_ID }, 'Questshop ready');
 }
 
@@ -216,6 +251,7 @@ export async function startup({ health = createHealthState(), server: existingSe
     const { holder, runtimeLease } = await acquireRuntimeOwnership(pool, env, health);
     assertStarting();
     const config = await loadRuntimeConfig(pool);
+    await validatePaymentReadiness(pool, health);
     health.checks.bootstrap = 'RECOVERING';
     runtime = { env, logger, health, server, pool, client: null, config, workers: null, abortController,
       heartbeat: null, runtimeLease, runtimeHolder: holder, acceptingInteractions: false, shutdownPromise: null };

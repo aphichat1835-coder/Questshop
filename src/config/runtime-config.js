@@ -1,5 +1,12 @@
 import { getRuntimePool } from '../db/pools.js';
 import { DEFAULT_FEATURE_GATES } from './feature-gates.js';
+import { paymentPolicyFromConfigValues } from '../domain/payments/policy.js';
+
+const PAYMENT_POLICY_KEYS = Object.freeze([
+  'topupAutoCreditMinCents',
+  'topupAutoCreditMaxCents',
+  'topupDailyLimitCents',
+]);
 
 export function sanitizeRuntimeConfigValues(payload = {}) {
   const values = { ...payload };
@@ -7,6 +14,22 @@ export function sanitizeRuntimeConfigValues(payload = {}) {
   // permission at each interaction boundary. Retire the old role-based
   // setting from every config snapshot the application reads or writes.
   delete values.adminRoleId;
+
+  // Payment limits are runtime policy rather than source-code constants. Only
+  // normalize keys that were explicitly persisted so old snapshots continue
+  // to inherit safe defaults. `null` intentionally disables the upper/daily cap.
+  if (PAYMENT_POLICY_KEYS.some((key) => Object.hasOwn(values, key))) {
+    const policy = paymentPolicyFromConfigValues(values);
+    if (Object.hasOwn(values, 'topupAutoCreditMinCents')) {
+      values.topupAutoCreditMinCents = policy.autoCreditMinCents.toString();
+    }
+    if (Object.hasOwn(values, 'topupAutoCreditMaxCents')) {
+      values.topupAutoCreditMaxCents = policy.autoCreditMaxCents?.toString() ?? null;
+    }
+    if (Object.hasOwn(values, 'topupDailyLimitCents')) {
+      values.topupDailyLimitCents = policy.dailyRedeemedLimitCents?.toString() ?? null;
+    }
+  }
   return values;
 }
 

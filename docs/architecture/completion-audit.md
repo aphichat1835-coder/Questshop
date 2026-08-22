@@ -1,172 +1,180 @@
-# Completion audit — Questshop plans
+# Completion audit — Questshop
 
-This is an evidence ledger for the two authoritative plans:
+This document is the source/test evidence ledger. It does not replace live Discord, TrueMoney, Quest, Aiven or Owner UAT.
+Current completion label is **implemented-but-unverified**.
 
-- `แผน Questshop ฉบับ Final Decision-Complete`
-- `Technical Blueprint: Questshop Production`
+## Owner decisions currently in force
 
-## Later Owner policy decision — Monitor test gate
+1. One production Discord Guild, all-in-one Node.js runtime, PostgreSQL 16+ durable source of truth.
+2. Money uses integer satang; Confirm reserves per Item; verified success captures; definite failure releases;
+   ambiguous results remain Reserved for Manual Review.
+3. No Automatic Claim. Completed Quest work ends at `READY_TO_CLAIM` with customer-side claim URL.
+4. Monitor accounts always Scan + Test. Monitor-discovered Quest stays private until one test passes or audited Admin
+   **ส่งเลย**; customer-discovered Quest may be admitted only for that authenticated Quest account and public output
+   must not identify the customer.
+5. Admin authorization is `OWNER_ID` or current Discord `Administrator` permission at each interaction.
+6. Owner manages backoffice channel privacy. Runtime does not perform human-visibility/privacy preflight or permission
+   drift auto-repair. `LOG_PAYMENTS` may contain a full voucher link.
+7. Production DB Runtime/Migrator roles remain separate and TLS uses `sslmode=verify-full`.
+8. Aiven-managed backup is the default provider boundary; Questshop does not claim a local restore drill in this mode.
 
-The Owner superseded the earlier “test is not a gate” rule with this operational policy:
+## Later Owner storefront decision — Quest Auto
 
-1. A Quest first discovered by a Monitor stays private and closed for public sale.
-2. The system tries a Monitor up to three times, then moves to the next active Monitor; the
-   first verified pass stops the batch and permits `quest-new` publication and public sale.
-3. If every available Monitor fails, it creates a detailed `LOG_QUEST_OPERATIONS` alert with
-   **ส่งเลย** (audited Admin override, never a forged `TEST_PASSED`) and **ลองทดสอบอีกครั้ง**.
-4. A supported Quest newly discovered from a customer checkout is announced in `quest-new` after its
-   first analysis and may be admitted only for that authenticated Quest account. It is logged with the
-   customer and account identity, never a raw Token, and it does not open general public sale.
+`QUEST_AUTO` is one durable Discord storefront message with fixed title **Discord Quest • Auto**, approved Thai copy,
+buttons **เริ่มทำเควส** / **เติมเงิน**, dynamic price summary and one exact Owner-approved GIF rendered inside the embed.
+The customer-facing Quest Auto embed does not display the technical `Questshop Surface • QUEST_AUTO` footer.
 
-Implementation: migration `0017_monitor_test_sale_gate.sql`, `domain/catalog/test-gate.js`, catalog,
-checkout, test worker, admin override and Discord projection/router changes. Automated evidence:
-`test/integration/monitor-test-gate.test.js` and `checkout-lazy.test.js`.
+### Price contract
 
-## Later implementation decision — Execution-contract pinning
+Source: `src/domain/pricing/resolver.js`, `src/domain/admin/config-service.js`, `src/workers/worker-manager.js`,
+`src/discord/renderers/surfaces.js`, `src/discord/surfaces/setup.js`.
 
-Monitor test evidence is valid only for the exact normalized Quest execution contract: Quest ID, application,
-event/progress key, target, executor, contract/engine/executor/verification versions.  The SHA-256 fingerprint is
-stored with every metadata revision, test batch/run, checkout option, Order Item and Runner Job.  Any difference
-invalidates an earlier pass and an earlier Admin override; it cannot silently reopen sale or run an old quote.
+- All four supported active `TYPE` task prices must exist before the storefront claims a configured price.
+- Equal prices collapse to one value such as `5 บาท`.
+- Differing GAME/VIDEO values render a min-max range such as `5-7 บาท`.
+- Incomplete supported configuration renders `ค่าบริการยังไม่พร้อม`.
+- Surface reconciliation compares the current Discord presentation against the expected price text even if runtime
+  config version did not change.
+- A successful Admin category-price transaction emits `QUEST_CATEGORY_PRICE_CHANGED` only after commit. The running
+  worker manager immediately queues the normal durable surface reconciliation, so the existing `QUEST_AUTO` message is
+  edited in the background without waiting for the next Maintenance interval.
+- Maintenance still reconciles approximately every 60 seconds as a repair fallback if an immediate Discord refresh
+  fails or is missed during runtime shutdown/restart.
 
-The test worker uses PostgreSQL time to defer until the Quest start or enrollment block ends and rejects a test
-when expiry admission is no longer safe.  If a worker dies after a durable mutation intent, its replacement first
-fetches fresh Quest state; only a proven progress mutation can recover a pass, otherwise at most one child
-controlled-retry intent is allowed.  This is source/test evidence only; live Monitor and Quest UAT remains required.
+Automated evidence:
 
-Implementation: migration `0024_quest_contract_pinning.sql`, `quest-engine/schema/contract.js`, catalog/checkout/
-runner/test-worker services and `test/unit/quest-contract-pinning.test.js`.
+- `test/integration/pricing-promotion-contract.test.js`
+- `test/unit/price-surface-refresh.test.js`
+- `test/unit/quest-auto-surface.test.js`
+- `test/unit/surface-anchor.test.js`
+- `test/integration/outbox-dlq.test.js`
 
-## Later Owner usability decision — Monitor Token panel
+### Media contract
 
-Every Monitor is created with both `SCAN` and `TEST`; the Admin flow no longer asks the Owner to
-choose capabilities or type an artificial reason.  The Owner-only Monitor panel provides a
-read-only **เช็คระบบ Token** action and an individual-account check.  A check decrypts the stored
-credential, confirms its Discord identity matches the stored Account ID, and reads the Quest list;
-it never enrolls, starts, progresses or claims a Quest.  `READY`, `DEGRADED` and `INVALID` health
-are stored durably.  An invalid/decryption-failed Token is quarantined, and neither plaintext Token
-nor secret material is rendered or written to audit data.
+Source asset:
 
-Implementation: migration `0018_monitor_health.sql`, `domain/admin/monitor-service.js`, the
-Monitor route handlers in `discord/interactions/router.js`, and
-`test/integration/admin-operations.test.js`.
+```text
+src/discord/assets/quest-auto-demo.gif
+Size     9,190,692 bytes
+SHA-256  c3af9ca54edfdc310e70c2fed9519fb2d587f77be7fddfec5dd3a275d2973ea1
+```
 
-## Later Owner usability decision — First-run configuration
+Runtime verifies exact size, GIF signature and SHA-256 before upload. The message attachment is referenced by the Rich
+Embed as `attachment://quest-auto-demo.gif`, so the customer sees the animation inside the embed instead of a standalone
+MP4/video block. A stale or legacy attachment is cleared and replaced on the same durable anchor. An already-correct
+`quest-auto-demo.gif` attachment is preserved to avoid duplicate upload.
 
-The Owner enters six required external values the application cannot safely invent: Discord Bot/Application/
-Guild/Owner identity and PostgreSQL Runtime/Direct URLs. A private PostgreSQL CA is optional. `npm run setup` creates the
-Status token and independent Data/Voucher keys once, normalizes the CA, writes `.env` atomically with
-mode `0600`, and defaults to Aiven-managed backup. Re-running setup preserves
-the durable secrets and rejects conflicting process-level keys rather than silently rotating encrypted data.
-Runtime loads only its scoped values and does not require the Migration URL; stateless deployments must use
-separate runtime and deployment secret bundles from durable secret storage.
+Quest Auto recovery prefers the stable surface nonce so the technical footer can remain hidden. Legacy footer lookup is
+retained only as a migration fallback for older storefront messages.
 
-Implementation: `src/config/setup-environment.js`, `src/config/load-local-environment.js`,
-`scripts/setup.js`, the root package scripts, and `test/unit/setup-environment.test.js`.
+The reconciliation contract compares the complete customer-visible structure: empty message content, one Embed with the
+approved title/copy/color and no legacy fields, one Action Row containing only the **เริ่มทำเควส** / **เติมเงิน** button
+contracts, and the expected GIF attachment/image. Opaque component UUIDs may rotate; their routes and visible semantics
+must remain exact. Drift edits the existing anchor instead of creating a second storefront.
 
-## Owner-supplied live-bootstrap evidence — SHA `e45c80e`
+Important future-change rule: Discord-side drift detection identifies the expected GIF by filename. If the GIF bytes
+intentionally change later, version/change the filename or add an explicit attachment migration.
 
-The Owner reported a live Aiven/inwcloud bootstrap attempt for source SHA `e45c80e`. It found that a `pg` connection
-URL carrying `sslmode=verify-full` could override the explicit Aiven CA object, requiring a temporary
-`NODE_EXTRA_CA_CERTS` workaround, and that Runtime object grants required manual repair. This is diagnostic evidence,
-not a Functional UAT pass. The following source revision adds URL sanitization, migration-time object privilege
-synchronization and effective-grant validation; it still requires a separate live retest before the workaround or
-manual grants can be considered removed.
+Live boundary: real Discord desktop/mobile GIF rendering inside the embed, removal of the old visible technical footer,
+visible price refresh immediately after Admin confirmation plus Maintenance fallback repair, restart/setup repair and no
+duplicate panel must still be verified on one exact Git SHA.
 
-The later source revision additionally makes privilege synchronization deterministic for future objects: it revokes
-old Runtime default ACLs before applying the minimum table/sequence/function defaults. PostgreSQL 16 tests now use
-separate Admin/Migrator/Runtime roles, force a synchronization rollback, and prove that an `applied: 0` retry repairs
-the stale defaults. This is still automated evidence only. A live Aiven retest must independently show no
-`NODE_EXTRA_CA_CERTS`, no `/tmp/aiven-ca.pem`, no manual `GRANT`, and a passing `privilegeSynchronization: PASS`.
+## Quest announcement contract
 
-The Final Decision-Complete plan wins if the documents differ.  This record is a source and
-automated-test audit; release evidence must record `git rev-parse HEAD` at the time each command
-or live check runs.  It does **not** replace the live evidence required for a production release.
+Source: `src/quest-engine/schema/normalizer.js`, `src/domain/catalog/service.js`,
+`src/domain/catalog/test-gate.js`, `src/domain/outbox/service.js`, `src/workers/outbox-worker.js`,
+`src/discord/renderers/quest-new.js`, `src/discord/renderers/projections.js`.
 
-## Evidence used
+- Customer-facing Quest announcements display Quest **start** (`starts_at`) and **expiry** (`expires_at`) times. They do
+  not expose the scanner detection time or the mutable PostgreSQL `updated_at` value as customer copy.
+- A customer-discovered Quest remains private even when that customer's authenticated account may buy it. The durable
+  `CUSTOMER_QUEST_DISCOVERY` backoffice projection presents **ส่งประกาศ** and **ทดสอบก่อน** to an Administrator;
+  only the former creates public `QUEST_NEW` through an audited test-gate override. Its checkout-session foreign key is
+  cleared, not cascaded, during retention so the operational decision evidence remains available.
+- A Quest whose `expires_at` is already past remains valid catalog/history evidence but is terminal for active delivery:
+  Monitor discovery marks it `EXPIRED` before creating a test batch, does not consume a Monitor Token, and does not
+  enqueue `QUEST_NEW`.
+- `QUEST_NEW` enqueue independently rejects an already-expired Quest. A first-time announcement that was queued while
+  valid but expires during Outbox retry/backoff is suppressed before Discord channel fetch/send and is not marked
+  `ANNOUNCED`. This is the final race-condition guard against historical notification floods.
+- If a Monitor test batch becomes stale at the Quest deadline, the batch closes without switching to another Monitor or
+  creating a misleading exhausted-monitor alert. Admin retry checks that deadline before any requeue and resolves an
+  expired review without creating a new test run.
+- Discord Orb rewards are read from virtual-currency reward entries (`type = 4`, `orb_quantity`). `ALL` reward sets sum
+  their Orb entries. `TIERED` reward sets with different values are represented as a range instead of pretending one
+  exact amount applies to every tier. Non-Orb `quantity` values are never re-labelled as Orbs.
+- The selected task's static video thumbnail is considered before legacy top-level video metadata. Video file URLs are
+  never embedded as the Quest artwork.
+- Large artwork prefers Quest `hero`, then `quest_bar_hero`, then a still video thumbnail, then `game_tile`.
+- The small thumbnail prefers game tile/logotype/theme variants, application icon, reward artwork, then a still video
+  thumbnail. Identical large/small URLs are not duplicated in one embed.
+- Complete newly observed metadata is authoritative. Older presentation metadata may be inherited only while processing
+  a partial Quest payload. The renderer reads thumbnail/reward presentation metadata from the exact
+  `current_metadata_revision`, so a removed image cannot silently reappear from an older revision.
+- `QUEST_NEW` has one rendering implementation: the generic projection registry and Outbox delivery both route to
+  `renderQuestNewProjection()`.
 
-| Evidence | Result |
-|---|---|
-| Package target Node `22.22.0`, local runtime Node `24.14.0`, PostgreSQL `16`, syntax/lint plus sequential PostgreSQL test run | CI/Docker pin Node 22.22.0. CI fails rather than silently skipping PostgreSQL contracts when `TEST_DATABASE_URL` is absent and emits LCOV evidence for the exact workflow SHA. |
-| `npm audit --audit-level=high` | Passed: 0 vulnerabilities reported |
-| Patch whitespace | Local `git diff --check` passed; the PR workflow also validates the explicit Base-to-Head diff range. |
-| Git tracked files | Neither legacy reference project is tracked; both are ignored locally |
+Automated evidence:
 
-The test database was a disposable local PostgreSQL container.  It is evidence for the database
-contracts, not evidence for a managed production service.
+- `test/unit/quest-normalizer.test.js`
+- `test/unit/quest-new-renderer.test.js`
+- `test/integration/expired-quest-filter.test.js`
+- catalog/Monitor integration tests exercising durable metadata revisions and discovery reconciliation.
 
-## Final Decision-Complete plan
+Live boundary: at least one real current Discord Quest must confirm Orb value, start/expiry timestamps and available
+static Quest artwork on desktop/mobile. A first-run Monitor scan with historical Quest rows must notify only Quest that
+are still live; an announcement queued before expiry must not first appear after the deadline. If a real tiered Quest is
+available, verify the displayed range against its payload. Missing assets must remain missing rather than being invented.
 
-### Later Owner infrastructure decision — Aiven-managed database backup
+## Requirement matrix
 
-Production runs the Node.js bot on inwcloud and PostgreSQL on Aiven Free. Aiven owns database backup and
-disaster-recovery behavior; Questshop must not invoke `pg_dump`, `pg_restore`, S3 backup upload, or claim that it
-performed a restore drill. `BACKUP_MODE=AIVEN_MANAGED` is the setup default. A pending production migration records
-an append-only `DEPLOYMENT_BACKUP_POLICY` audit tied to the Git SHA with `NOT_APP_VERIFIED`, then proceeds.
-Backup-stale/restore-drill alerts and the local backup worker are disabled only in this mode. Since a provider backup
-can contain ciphertext from an earlier snapshot that Questshop cannot inspect, Data/Voucher key retirement remains
-blocked; retain old key versions rather than pretending they are safe to remove.
+| Area | Primary implementation | Automated evidence | Live boundary |
+|---|---|---|---|
+| Runtime / source identity | config, bootstrap, `GIT_SHA`, Node 22 | env/source-version/startup tests | exact inwcloud checkout + restart |
+| PostgreSQL TLS / roles | pools, migrations, role sync/validator | PostgreSQL 16 role/TLS tests | Aiven role + CA verification |
+| Wallet / Ledger | wallet services, reservations, append-only tables | concurrency/settlement/refund tests | Owner compensation sign-off |
+| TrueMoney | adapter, payment worker/service | canonical URL/schema/ambiguity/crash tests | real low-value + ambiguous UAT |
+| Pricing / promotions | pricing resolver, Admin config service | category + promotion integration tests | Owner Admin pricing UAT |
+| Quest Auto storefront | renderer, surface setup/reconcile, exact GIF | price/media/surface tests | in-embed animation + visible refresh |
+| Quest new announcement | normalizer, catalog metadata, expiry/outbox guards, Quest renderer | Orb/media/current-revision/expired-filter tests | real Quest reward/time/artwork + historical-scan UAT |
+| Catalog / Monitor | catalog, discovery/test workers | Monitor gate, expiry stop, contract-pinning tests | live metadata drift + Monitor UAT |
+| Checkout | checkout domain + router | session/quote/account-lock tests | mobile Discord UAT |
+| Runner | runner service, executors, leases/fencing | crash/retry/atomic settlement tests | live supported Quest execution |
+| Outbox / Discord delivery | outbox services/workers, transport | expiry suppression, 403/404/429, coalescing, DLQ tests | real Discord failure/expiry UAT |
+| Admin / Review | Admin router + domain services | authorization/session/review tests | Owner/Admin workflow UAT |
+| Health / alerts | health server, worker manager, alerts | status/auth/SLO tests | external alert delivery |
+| Aiven backup policy | env/deployment policy | Aiven-managed skip/audit tests | Aiven Console recovery evidence |
+| Deployment / rollback | Docker, CI, deploy scripts | coverage/load/audit/Docker | same-SHA deploy + rollback rehearsal |
+| UAT / release | prelaunch scripts/docs | source gates only | all rows in UAT evidence template |
 
-Implementation: `src/config/env.js`, deployment migrations, worker manager/alerts,
-`scripts/verify-key-retirement.js`, and Aiven-policy regression tests. Backup has no Admin-panel category; the
-provider remains the operational owner. Live Aiven Console verification remains required and is not replaced by
-source tests.
+## Automated evidence status
 
-| Plan section | Source/test evidence | Status and remaining boundary |
-|---|---|---|
-| 1. Scope and runtime | `package.json`, `src/config/env.js`, `src/bootstrap/*`, `Dockerfile` | Source-confirmed. Actual inwcloud memory/deploy evidence remains. |
-| 2. `quest-auto`, `quest-new`, history and setup commands | `src/discord/{commands,interactions,renderers,surfaces}`, `test/security/interactions.test.js`, `test/integration/outbox-dlq.test.js` | Source-confirmed. Real Guild/mobile interaction and persistent-component UAT remain. |
-| 3. Admin, daily top-up protection and four log surfaces | `src/domain/admin`, `topup_daily_locks`, `src/discord/renderers/projections.js` | Source-confirmed. Manual user block/unblock controls are retired; the automatic daily top-up lock remains. Owner/Discord Administrator authorization and Guild UI UAT remain. |
-| 4. Fixed state machines | domain `states.js`, `migrations/0001_initial.sql`, `test/unit/states.test.js` | Source-confirmed. Production trace sampling remains. |
-| 5. Error classes, retry and backoff budgets | payment, runner, outbox services/workers and their crash/fault tests | Source-confirmed for simulated errors. Provider and Discord error behaviour remains live evidence. |
-| 6. Fair queue, lease, lock and fencing | `src/domain/runner/service.js`, `src/db/leases.js`, concurrency/crash tests | Source-confirmed. Runtime contention at production load remains. |
-| 7. Manual review | `src/domain/reviews`, Admin router, atomic review and Quest-test retry/reseed tests | Source-confirmed. A Quest test review can requeue an eligible retained Monitor attempt or seed a fresh batch; Owner workflow UAT remains. |
-| 8. Discovery, monitor and expiry | catalog services, monitor worker, expiry service, event-driven catalog-retest test | Source-confirmed. Live Quest metadata/contract drift remains; no time-based retest is scheduled. |
-| 9. TrueMoney Direct and receiver versions | `src/adapters/truemoney`, payments, receiver service and voucher/crash tests | Source-confirmed with pinned fixtures. A real low-value success, ambiguous result and schema-drift test remain mandatory. |
-| 10. Wallet, price and promotion | wallet/ledger/pricing/promotion domains and settlement tests | Source-confirmed. Owner financial pre-launch compensation sign-off remains. |
-| 11. Interaction security and Discord rate limits | opaque component IDs, server sessions, outbox and security tests | Source-confirmed. Actual Discord REST/Gateway behaviour remains. |
-| 12. Correlation and PostgreSQL time | correlation, transition, transaction, PostgreSQL time modules and durable interaction-session traces | Source-confirmed. Managed database clock/role observation remains. |
-| 13. PostgreSQL production contract | pools, transaction wrapper, migrations, `postgresql-roles.md` | Source-confirmed. Deployment sanitizes libpq SSL URL overrides while preserving verified CA, synchronizes Migrator-owned object privileges even with `applied: 0`, and validates effective Runtime grants. Managed PostgreSQL TLS/role retest remains live evidence. |
-| 14. Startup, shutdown and health | bootstrap, shutdown, health server and worker manager | Source-confirmed. `/statusz` uses fixed-size digest comparison for its Bearer token and never returns operational detail to unauthorized requests. Deployment/restart drill remains. |
-| 15. Surface setup permissions | `src/bootstrap/startup.js`, `src/discord/surfaces/setup.js`, outbox worker and surface policy tests | Startup requires Bot Administrator once. Surface setup and payment-log delivery do not inspect human channel visibility; Runtime Permission Drift detector/repair remains removed. Owner accepts responsibility for private-channel configuration. |
-| 16. Engine/config versioning | versions, config service, runner pinning and compatibility test | Source-confirmed. N/N-1 deployment drain remains. |
-| 17. Retention and secrets | keyring, retention/key workers, migrations and coverage tests | Source-confirmed. Confirmed checkout sessions (including their selected Quest data) are pruned after seven days; checkout credentials are deleted at confirmation and cascade on session deletion. Expiry and cleanup use `FOR UPDATE SKIP LOCKED` bounded to 500 sessions per batch. Live key rotation plus restore test remains. |
-| 18. Backup and restore | Aiven-managed backup policy, optional compatibility adapter and deployment docs | Source-confirmed for `AIVEN_MANAGED`: Questshop does not run local database backup/restore operations and exposes no backup panel. Aiven Console recovery evidence remains an Owner/live boundary. |
-| 19. Deployment, rollback and pre-launch | Docker, CI workflow, pre-launch scripts/docs, an Owner/Admin-only router guard and append-only SHA-bound release evidence | Source-confirmed. Same-SHA deploy, rollback and Owner closeout remain. |
-| 20. SLO, alerts and capacity | alert worker, health/status, load test script and tests | Source-confirmed. CI creates a disposable `questshop_loadtest` database and enforces the 200-user/100-order capacity gate. External alert delivery and monthly SLO evidence remain. |
-| 21. Runbooks | `docs/runbooks/README.md` | Source-confirmed. Execution during drills/incidents remains. |
-| 22. Development sequence and feature gates | feature-gate config, incident workers and pre-launch document | Source-confirmed. Normal capabilities start enabled; gates are internal scoped incident brakes, not an Admin open/close checklist. |
-| 23. Definition of Done and acceptance | definition-of-done, traceability and automated tests | Not complete until every remaining live boundary above passes on the same SHA. |
+Every candidate source SHA must pass the same repository gate before its automated evidence is current:
 
-## Technical Blueprint plan
+- `npm run check`
+- `npm run lint`
+- PostgreSQL-backed `npm run test:coverage`
+- LCOV artifact upload
+- fake-adapter `npm run load:test`
+- `npm audit --audit-level=high`
+- Docker build
 
-| Blueprint group | Source/test evidence | Status and remaining boundary |
-|---|---|---|
-| 1. Architecture, dependencies and code layout | root `package.json`; `src/`, `migrations/`, `scripts/`, `docs/`, `test/` | Source-confirmed. `setup:init`, `setup:verify` and `deploy` scripts keep first-run validation separate from deployment actions. Actual host resource profile remains. |
-| 2. Domain contracts and PostgreSQL schema | domain services, migration checksum runner, migration integration test | Source-confirmed. Production migration execution remains. |
-| 3. Financial, checkout, runner and outbox logic | payment/wallet/checkout/runner/outbox services plus concurrency/crash tests | Source-confirmed for all simulated acceptance paths. Live external mutation paths remain. |
-| 4. Discord UX, Admin, security and operations | router, renderers, surfaces, health and operations workers | Source-confirmed. Real client layout, setup permissions and acknowledgement latency remain. |
-| 5. Development gates and proof plan | CI, Dockerfile, test suites, load test, UAT and runbooks | Automated local gate is passed. Production gates are still intentionally closed until Owner UAT. |
+The exact passing Git SHA and workflow run belong in release/UAT evidence. A previous green SHA never substitutes for the
+candidate being deployed. These results prove source contracts only; they do not prove provider/live behavior.
 
 ## Explicit non-claims
 
-The following cannot be represented truthfully as completed without credentials and a controlled live
-environment.  They are not source-code defects and must not be bypassed by replacing real adapters with
-fixtures:
+Do not represent these as completed without controlled live evidence:
 
-1. A production Discord bot login, guild command registration, channel permission setup, mobile UX and
-   restart recovery.
-2. A real TrueMoney direct redemption, including the ambiguous-after-send path and Owner-only decision.
-3. A real Quest account run for each supported task type.  This must also be reviewed against Discord's
-   current terms before use; the code deliberately contains no automatic-claim API.
-4. Managed PostgreSQL TLS verification, least-privilege roles, production migration and a temporary-DB
-   restore drill from a real encrypted S3-compatible backup.
-5. Same-SHA Owner pre-launch closeout, gate-by-gate opening, rollback rehearsal, alert delivery and
-   time-based SLO evidence.
+1. production Discord login/registration, mobile layout, GIF-in-embed animation and live persistent-surface recovery;
+2. real Quest announcement Orb/start/expiry/artwork fidelity, including first-run historical-Quest filtering, against a
+   current live Quest payload;
+3. real TrueMoney redemption and post-send ambiguous resolution;
+4. real supported Video/Desktop Quest execution;
+5. managed PostgreSQL TLS/least-privilege provisioning and recovery operation;
+6. same-SHA Owner closeout, rollback rehearsal and alert delivery.
 
 ## Release state
 
-The correct completion label at this revision is **`implemented-but-unverified`**.  It becomes `done`
-only when the pre-launch checklist in [`../uat/prelaunch.md`](../uat/prelaunch.md) and every live boundary
-in this document are recorded successfully for this exact Git SHA.  Do not call it production-ready before
-then.
+`done` requires every applicable automated and live boundary to pass on the same Git SHA.
+Until then the correct label is **implemented-but-unverified**, never production-ready.

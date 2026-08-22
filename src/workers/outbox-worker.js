@@ -1,6 +1,7 @@
 import { acquireDelivery, recordDelivery, renewDeliveryLease } from '../domain/outbox/service.js';
 import { withTransaction } from '../db/transaction.js';
 import { renderProjection } from '../discord/renderers/projections.js';
+import { renderQuestNewProjection } from '../discord/renderers/quest-new.js';
 import { FencingLostError } from '../shared/errors.js';
 import { recordTransition } from '../domain/shared/transition.js';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -165,6 +166,14 @@ async function loadActiveSurface(pool, projection) {
   return surface;
 }
 
+async function suppressExpiredQuestAnnouncement(pool, projection) {
+  if (projection?.projection_type !== 'QUEST_NEW' || projection.message_id) return false;
+  const quest = (await pool.query(`SELECT sale_state='EXPIRED'
+      OR (expires_at IS NOT NULL AND expires_at<=clock_timestamp()) AS expired
+    FROM quests WHERE quest_id=$1`, [projection.aggregate_id])).rows[0];
+  return quest?.expired === true;
+}
+
 async function resolveChannel(client, projection, surface) {
   const channel = projection.surface_key.startsWith('DM:')
     ? await (await client.users.fetch(projection.surface_key.slice(3))).createDM()
@@ -209,7 +218,12 @@ export async function publishProjection(channel, projection, body) {
   }
 }
 
-export async function processOutbox({ holder, client, pool, env, renderProjectionFunction = renderProjection }) {
+export async function renderProjectionForDelivery(pool, projection, dependencies = {}) {
+  if (projection.projection_type === 'QUEST_NEW') return renderQuestNewProjection(pool, projection);
+  return renderProjection(pool, projection, dependencies);
+}
+
+export async function processOutbox({ holder, client, pool, env, renderProjectionFunction = renderProjectionForDelivery }) {
   const event = await acquireDelivery({ holder }, { pool });
   if (!event) return false;
   const heartbeat = startDeliveryHeartbeat(event, pool);
@@ -219,6 +233,17 @@ export async function processOutbox({ holder, client, pool, env, renderProjectio
       : null;
     if (!projection) {
       await recordDelivery({ outboxId: event.id, holder, fencingToken: event.fencing_token }, { pool });
+      return true;
+    }
+    // A Quest can expire after it was queued but before Discord delivery
+    // (for example during Retry-After/backoff). Never create the first public
+    // message after the deadline; close the durable outbox event without
+    // marking the Quest as announced so a later authoritative extension can
+    // still publish normally.
+    if (await suppressExpiredQuestAnnouncement(pool, projection)) {
+      heartbeat.assertOwned();
+      await recordDelivery({ outboxId: event.id, holder, fencingToken: event.fencing_token,
+        suppressQuestAnnouncement: true }, { pool });
       return true;
     }
     if (!(await claimOrderDmAttempt(pool, event, projection))) {

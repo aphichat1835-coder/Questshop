@@ -263,34 +263,61 @@ async function maintainMonitorsAndDailyTopupLocks(database, context) {
       after: { expiredAt: lock.expires_at }, reason: 'daily top-up cycle ended', context });
 }
 
-async function queueMaintenanceNotifications(database, context) {
+export async function queueMaintenanceNotifications(database, context) {
   const incidents = await database.query(`SELECT * FROM incidents WHERE state<>'RESOLVED'`);
   for (const incident of incidents.rows) await enqueueProjection(database, {
       projectionType: 'SYSTEM_INCIDENT', aggregateType: 'INCIDENT', aggregateId: incident.id,
       aggregateVersion: incident.state_version, surfaceKey: 'LOG_SYSTEM', context,
     });
-  const dueReviews = await database.query(`UPDATE manual_reviews SET remind_at=clock_timestamp()+interval '24 hours'
+  const dueReviews = await database.query(`UPDATE manual_reviews SET
+      remind_at=CASE
+        WHEN clock_timestamp()<created_at+interval '6 hours' THEN created_at+interval '6 hours'
+        WHEN clock_timestamp()<created_at+interval '24 hours' THEN created_at+interval '24 hours'
+        ELSE clock_timestamp()+interval '24 hours' END
       WHERE state<>'RESOLVED' AND remind_at<=clock_timestamp()
-      RETURNING *,floor(extract(epoch FROM remind_at))::bigint AS reminder_version`);
-  for (const review of dueReviews.rows) await enqueueProjection(database, {
+      RETURNING *,
+        CASE WHEN clock_timestamp()<created_at+interval '6 hours' THEN '1H'
+          WHEN clock_timestamp()<created_at+interval '24 hours' THEN '6H'
+          ELSE '24H_OWNER' END AS reminder_stage,
+        floor(extract(epoch FROM clock_timestamp()))::bigint AS reminder_version`);
+  for (const review of dueReviews.rows) {
+    await database.query(`INSERT INTO review_evidence(id,review_id,evidence_type,payload,actor_type,actor_id,trace_id)
+      VALUES($1,$2,'REMINDER_SENT',$3,'SYSTEM','maintenance-worker',$4)`,
+    [uuidv7(), review.id, { stage: review.reminder_stage,
+      ownerEscalated: review.reminder_stage === '24H_OWNER' }, context.traceId]);
+    await enqueueProjection(database, {
       projectionType: 'MANUAL_REVIEW', aggregateType: 'MANUAL_REVIEW', aggregateId: review.id,
       aggregateVersion: review.reminder_version, surfaceKey: 'ADMIN_PANEL', context,
     });
+  }
+}
+
+async function runTransactionalMaintenanceSection(pool, context, work) {
+  return withTransaction({ pool, isolation: 'SERIALIZABLE' }, work);
 }
 
 async function runTransactionalMaintenance(pool, context) {
-  return withTransaction({ pool, isolation: 'SERIALIZABLE' }, async (database) => {
-    await recoverExpiredLeases(database, context);
-    await recoverCrashedRunnerJobs(database, context);
-    await requeueDueRunnerJobsInTransaction(database, context, { includeExpired: true });
-    await recoverCrashedQuestTests(database, context);
-    await expireQueuedQuestTests(database, context);
-    await reconcilePassedMonitorTestBatches(database, context);
-    await reconcileFailedMonitorTestBatches(database, context);
-    await recoverCrashedPayments(database, context);
-    await maintainMonitorsAndDailyTopupLocks(database, context);
-    await queueMaintenanceNotifications(database, context);
-  });
+  // Recovery used to put every independent repair in one serializable
+  // transaction. A harmless stale row could then roll back payment recovery,
+  // reminders, leases and monitor cleanup together. Keep related runner work
+  // atomic, but commit each durable maintenance concern separately.
+  const sections = [
+    async (database) => {
+      await recoverExpiredLeases(database, context);
+      await recoverCrashedRunnerJobs(database, context);
+      await requeueDueRunnerJobsInTransaction(database, context, { includeExpired: true });
+    },
+    async (database) => {
+      await recoverCrashedQuestTests(database, context);
+      await expireQueuedQuestTests(database, context);
+      await reconcilePassedMonitorTestBatches(database, context);
+      await reconcileFailedMonitorTestBatches(database, context);
+    },
+    async (database) => recoverCrashedPayments(database, context),
+    async (database) => maintainMonitorsAndDailyTopupLocks(database, context),
+    async (database) => queueMaintenanceNotifications(database, context),
+  ];
+  for (const section of sections) await runTransactionalMaintenanceSection(pool, context, section);
 }
 
 async function releaseExpiredOrderItems(pool, context) {

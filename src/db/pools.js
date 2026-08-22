@@ -1,9 +1,12 @@
 import pg from 'pg';
 import { loadEnvironment, loadRuntimeEnvironment } from '../config/env.js';
+import { createLogger } from '../shared/logger.js';
 
 const { Pool } = pg;
 let runtimePool;
 let directPool;
+const poolErrorObservers = new WeakMap();
+const poolLogger = createLogger({ component: 'postgres-pool' });
 
 const PG_SSL_URL_PARAMETERS = Object.freeze([
   'ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert', 'uselibpqcompat',
@@ -42,21 +45,44 @@ export function postgresPoolOptions(env, connectionString) {
   };
 }
 
+function guardPoolErrors(pool, role) {
+  const state = { observers: new Set(), role };
+  poolErrorObservers.set(pool, state);
+  // node-postgres emits this for an idle client. Without a listener Node can
+  // terminate the process before Health has a chance to mark the DB degraded.
+  pool.on('error', (error) => {
+    poolLogger.error({ error, databaseRole: state.role }, 'postgres pool client error');
+    for (const observer of state.observers) {
+      try { observer(error); } catch (observerError) {
+        poolLogger.error({ error: observerError, databaseRole: state.role }, 'postgres pool error observer failed');
+      }
+    }
+  });
+  return pool;
+}
+
+export function observePoolErrors(pool, observer) {
+  const state = poolErrorObservers.get(pool);
+  if (!state) throw new TypeError('pool is not managed by Questshop');
+  state.observers.add(observer);
+  return () => state.observers.delete(observer);
+}
+
 export function getRuntimePool(env = loadRuntimeEnvironment()) {
-  runtimePool ??= new Pool({
+  runtimePool ??= guardPoolErrors(new Pool({
     ...postgresPoolOptions(env, env.DATABASE_POOL_URL),
     max: 8,
     application_name: 'questshop-runtime',
-  });
+  }), 'runtime');
   return runtimePool;
 }
 
 export function getDirectPool(env = loadEnvironment()) {
-  directPool ??= new Pool({
+  directPool ??= guardPoolErrors(new Pool({
     ...postgresPoolOptions(env, env.DATABASE_DIRECT_URL),
     max: 1,
     application_name: 'questshop-migrator',
-  });
+  }), 'migrator');
   return directPool;
 }
 

@@ -766,7 +766,10 @@ async function prepareRunnerExecution(job, env, signal, options) {
   const apiFactory = options.questApiFactory ?? createQuestApiClient;
   const api = apiFactory({ token, profile: profileFromEnv(env),
     coordinator: options.coordinator ?? getPersistentDiscordRateLimitCoordinator(options.pool) });
-  const [profile, quests] = await Promise.all([api.fetchCurrentUser(signal), api.fetchQuests(signal)]);
+  const [profile, quests] = await Promise.all([
+    api.fetchCurrentUser(signal),
+    api.fetchQuests(signal, { includeExpired: true }),
+  ]);
   if (String(profile.id) !== data.account_id) throw new QuestshopError('RUNNER_ACCOUNT_MISMATCH', 'Token account changed');
   const quest = quests.find((item) => item.id === data.quest_id);
   if (!quest) throw new QuestshopError('QUEST_MISSING', 'Quest disappeared from account');
@@ -855,8 +858,13 @@ async function executeAndSettleRunner({ state, attempt, data, api, quest: initia
   state.runningJob = await transitionRunning(state.runningJob, context, options);
   let quest = initialQuest;
   const fetchFreshQuest = async () => {
-    const fresh = (await api.fetchQuests(signal)).find((item) => item.id === quest.id);
-    if (!fresh) throw new QuestshopError('QUEST_MISSING', 'Quest disappeared during execution');
+    const fresh = (await api.fetchQuests(signal, { includeExpired: true })).find((item) => item.id === quest.id);
+    if (!fresh) {
+      throw new QuestshopError('COMPLETION_PROVENANCE_MISSING',
+        'Quest disappeared during execution before Discord confirmed the completion state', {
+          category: 'AMBIGUOUS',
+        });
+    }
     return fresh;
   };
   const mutate = async (kind, payload, perform) => {

@@ -3,6 +3,7 @@ import { v7 as uuidv7 } from 'uuid';
 import { RUNNER_VERSION_COMPATIBILITY, isRunnerVersionCompatible } from '../config/versions.js';
 import { usesApplicationBackup } from '../config/env.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
+import { escalateStuckRedeemedTopups } from '../domain/payments/service.js';
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -18,6 +19,13 @@ async function memoryLimitBytes() {
     } catch { /* try the next cgroup layout */ }
   }
   return null;
+}
+
+function alertContext(code = 'cycle') {
+  return {
+    traceId: uuidv7(), causationId: null, actorType: 'SYSTEM', actorId: 'alert-worker',
+    guildId: 'SYSTEM', idempotencyKey: `alert:${code}:${Math.floor(Date.now() / 60_000)}`,
+  };
 }
 
 async function setIncident(client, { code, scope, active, severity, evidence }) {
@@ -54,7 +62,7 @@ async function collectAlertSnapshot(pool, { applicationBackupEnabled }) {
         AND completed_at>=clock_timestamp()-interval '35 days'`),
     ]
     : [noApplicationBackupQuery, noApplicationBackupQuery, noApplicationBackupQuery, noApplicationBackupQuery];
-  const [financial, queue, scheduler, outbox, errors, backup, restore, backupCorruption, restoreFailure,
+  const [financial, payment, queue, scheduler, outbox, errors, backup, restore, backupCorruption, restoreFailure,
     counts, gates, activeVersions, slo] = await Promise.all([
     pool.query(`SELECT (SELECT count(*)::integer FROM wallets WHERE available_cents<0 OR reserved_cents<0) AS negative,
       (SELECT count(*)::integer FROM wallets w LEFT JOIN LATERAL (SELECT available_after_cents,reserved_after_cents
@@ -67,6 +75,11 @@ async function collectAlertSnapshot(pool, { applicationBackupEnabled }) {
       (SELECT count(*)::integer FROM (SELECT reference_id FROM wallet_transactions
         WHERE reference_type='TOPUP' AND transaction_type='TOPUP_CREDIT'
         GROUP BY reference_id HAVING count(*)>1) duplicate_credits) AS duplicate_credit`),
+    pool.query(`SELECT
+      count(*) FILTER (WHERE status='REDEEMED' AND redeemed_at<clock_timestamp()-interval '2 minutes')::integer AS redeemed_stuck,
+      count(*) FILTER (WHERE status IN ('PAYMENT_QUEUED','RETRY_WAIT')
+        AND updated_at<clock_timestamp()-interval '5 minutes')::integer AS queue_stuck
+      FROM topups`),
     pool.query(`SELECT count(*)::integer AS stuck FROM runner_jobs WHERE state NOT IN ('COMPLETED','FAILED')
       AND updated_at<clock_timestamp()-interval '5 minutes'`),
     pool.query(`SELECT COALESCE(max(EXTRACT(EPOCH FROM clock_timestamp()-available_at)*1000),0)::bigint AS lag_ms,
@@ -108,8 +121,8 @@ async function collectAlertSnapshot(pool, { applicationBackupEnabled }) {
       count(*) FILTER (WHERE operation='INTERACTION_ACK' AND created_at>=clock_timestamp()-interval '5 minutes')::integer AS interaction_count
       FROM operation_metrics`),
   ]);
-  return { invariant: financial.rows[0], queue: queue.rows[0], scheduler: scheduler.rows[0], outbox: outbox.rows[0], errors: errors.rows[0],
-    applicationBackupEnabled,
+  return { invariant: financial.rows[0], payment: payment.rows[0], queue: queue.rows[0], scheduler: scheduler.rows[0],
+    outbox: outbox.rows[0], errors: errors.rows[0], applicationBackupEnabled,
     backupAgeMs: backup.rows[0]?.age_ms == null ? null : Number(backup.rows[0].age_ms),
     restoreAgeMs: restore.rows[0]?.age_ms == null ? null : Number(restore.rows[0].age_ms),
     backupCorruption: Number(backupCorruption.rows[0]?.count ?? 0), restoreFailure: Number(restoreFailure.rows[0]?.count ?? 0),
@@ -147,7 +160,7 @@ async function applyFinancialAlerts(pool, invariant) {
   const financialBroken = invariant.negative > 0 || invariant.mismatch > 0 || invariant.duplicate_credit > 0;
   if (financialBroken) await pool.query(`UPDATE feature_gates SET enabled=false,reason='FINANCIAL_INVARIANT',
     version=version+CASE WHEN enabled THEN 1 ELSE 0 END,updated_at=clock_timestamp()
-    WHERE gate IN ('AUTO_CREDIT_ENABLED','ORDER_ACCEPTING') AND enabled=true`);
+    WHERE gate IN ('AUTO_CREDIT_ENABLED','ORDER_ACCEPTING','TOPUP_ACCEPTING') AND enabled=true`);
   await setIncident(pool, { code: 'FINANCIAL_INVARIANT', scope: 'WALLET_LEDGER', active: financialBroken,
     severity: 'CRITICAL', evidence: invariant });
   await setIncident(pool, { code: 'PAYMENT_AMBIGUOUS', scope: 'TRUEMONEY', active: invariant.ambiguous > 0,
@@ -157,6 +170,19 @@ async function applyFinancialAlerts(pool, invariant) {
   await setIncident(pool, { code: 'DUPLICATE_CREDIT', scope: 'WALLET_LEDGER', active: invariant.duplicate_credit > 0,
     severity: 'CRITICAL', evidence: { count: invariant.duplicate_credit } });
   return financialBroken;
+}
+
+async function applyPaymentAlerts(pool, payment, escalatedCount) {
+  const redeemedStuck = Number(payment.redeemed_stuck ?? 0) + Number(escalatedCount ?? 0);
+  const queueStuck = Number(payment.queue_stuck ?? 0);
+  if (queueStuck > 0) await pool.query(`UPDATE feature_gates SET enabled=false,reason='PAYMENT_QUEUE_STUCK',
+    version=version+CASE WHEN enabled THEN 1 ELSE 0 END,updated_at=clock_timestamp()
+    WHERE gate='TOPUP_ACCEPTING' AND enabled=true`);
+  await setIncident(pool, { code: 'TOPUP_REDEEMED_STUCK', scope: 'TRUEMONEY', active: redeemedStuck > 0,
+    severity: 'CRITICAL', evidence: { count: redeemedStuck, escalated: Number(escalatedCount ?? 0) } });
+  await setIncident(pool, { code: 'PAYMENT_QUEUE_STUCK', scope: 'TRUEMONEY', active: queueStuck > 0,
+    severity: 'ERROR', evidence: { count: queueStuck } });
+  return { redeemedStuck, queueStuck };
 }
 
 async function applyOperationalAlerts(pool, snapshot, health, runtime) {
@@ -213,21 +239,25 @@ async function applyOperationalAlerts(pool, snapshot, health, runtime) {
     severity: 'WARNING', evidence: { p95Ms: outboxP95 } });
 }
 
-function resolveHealthStatus({ financialBroken, health, snapshot }) {
-  if (financialBroken || snapshot.backupCorruption > 0 || snapshot.restoreFailure > 0) return 'INCIDENT';
+function resolveHealthStatus({ financialBroken, paymentState, health, snapshot }) {
+  if (financialBroken || paymentState.redeemedStuck > 0 || snapshot.backupCorruption > 0 || snapshot.restoreFailure > 0) return 'INCIDENT';
   if (!health.ready) return 'NOT_READY';
-  if (snapshot.queue.stuck || snapshot.outbox.stuck || Number(snapshot.scheduler.lag_ms) > 5_000) return 'DEGRADED';
+  if (paymentState.queueStuck > 0 || snapshot.queue.stuck || snapshot.outbox.stuck || Number(snapshot.scheduler.lag_ms) > 5_000) return 'DEGRADED';
   if (!snapshot.counts.store_open) return 'MAINTENANCE';
   return 'HEALTHY';
 }
 
 export async function evaluateAlerts({ pool, health, env = { BACKUP_ENABLED: true }, eventLoopMonitor = null }) {
   const runtime = await collectRuntimeMetrics(pool, eventLoopMonitor);
+  const escalated = await escalateStuckRedeemedTopups({ olderThanSeconds: 120, limit: 20 },
+    alertContext('redeemed-settlement'), { pool });
   const snapshot = await collectAlertSnapshot(pool, { applicationBackupEnabled: usesApplicationBackup(env) });
   await protectVersionCompatibility(pool, snapshot);
   const financialBroken = await applyFinancialAlerts(pool, snapshot.invariant);
+  const paymentState = await applyPaymentAlerts(pool, snapshot.payment, escalated.length);
   await applyOperationalAlerts(pool, snapshot, health, runtime);
   health.overview = { ...snapshot.counts, queueSoftLimit: 400, queueHardLimit: 500,
+    payment: { ...snapshot.payment, escalatedRedeemed: escalated.length },
     gates: Object.fromEntries(snapshot.gates.map((row) => [row.gate, { enabled: row.enabled, version: Number(row.version) }])),
     backupMode: snapshot.applicationBackupEnabled ? 'LOCAL_S3' : 'AIVEN_MANAGED',
     backupAgeMs: snapshot.backupAgeMs,
@@ -242,6 +272,6 @@ export async function evaluateAlerts({ pool, health, env = { BACKUP_ENABLED: tru
       topupP99Ms: Number(snapshot.slo.topup_p99 ?? 0),
       outboxP95Ms: Number(snapshot.slo.outbox_p95 ?? 0),
     } };
-  health.status = resolveHealthStatus({ financialBroken, health, snapshot });
+  health.status = resolveHealthStatus({ financialBroken, paymentState, health, snapshot });
   return false;
 }

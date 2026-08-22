@@ -4,7 +4,7 @@ import {
   LabelBuilder, MessageFlags, ModalBuilder, TextInputBuilder, TextInputStyle,
 } from 'discord.js';
 import {
-  ACKNOWLEDGEMENT, acknowledgementOf, installResponseController,
+  ACKNOWLEDGEMENT, acknowledgementOf, acknowledgeByContract, installResponseController,
 } from '../../src/discord/interactions/response-controller.js';
 
 test('response controller converts deprecated ephemeral options and owns one acknowledgement', async () => {
@@ -20,6 +20,25 @@ test('response controller converts deprecated ephemeral options and owns one ack
   assert.equal(await interaction.deferReply({ ephemeral: true }), null);
   await assert.rejects(() => interaction.reply({ content: 'late' }),
     (error) => error.code === 'INTERACTION_ALREADY_ACKNOWLEDGED');
+});
+
+test('Token submit sends an immediate ephemeral progress reply and legacy defer becomes a no-op', async () => {
+  const calls = [];
+  const interaction = {
+    customId: 'qs:v1:token_submit:00000000-0000-0000-0000-000000000000',
+    reply: async (options) => { calls.push(['reply', options]); },
+    deferReply: async (options) => { calls.push(['deferReply', options]); },
+  };
+  installResponseController(interaction);
+  await acknowledgeByContract(interaction, 'REPLY');
+  assert.equal(acknowledgementOf(interaction), ACKNOWLEDGEMENT.REPLY);
+  assert.deepEqual(calls, [['reply', {
+    content: 'กำลังตรวจบัญชีและค้นหา Quest ที่ยังใช้งานได้…',
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  }]]);
+  assert.equal(await interaction.deferReply({ ephemeral: true }), null);
+  assert.equal(calls.length, 1);
 });
 
 test('response controller preserves a real ModalBuilder as a terminal acknowledgement', async () => {

@@ -1,4 +1,6 @@
-import { questPriceCategoryForTaskType } from './categories.js';
+import { QUEST_PRICE_CATEGORIES, questPriceCategoryForTaskType } from './categories.js';
+
+const QUEST_TASK_TYPES = Object.freeze(Object.values(QUEST_PRICE_CATEGORIES).flat());
 
 export async function resolvePrice(client, { taskType }) {
   if (!questPriceCategoryForTaskType(taskType)) return null;
@@ -11,6 +13,22 @@ export async function resolvePrice(client, { taskType }) {
     LIMIT 1
   `, [taskType]);
   return result.rows[0] ?? null;
+}
+
+export async function configuredQuestPriceRange(client) {
+  const result = await client.query(`
+    SELECT min(amount_cents)::bigint AS min_cents,
+      max(amount_cents)::bigint AS max_cents,
+      count(DISTINCT task_type)::integer AS task_type_count
+    FROM price_rules
+    WHERE enabled = true
+      AND rule_type = 'TYPE'
+      AND task_type = ANY($1::text[])
+  `, [QUEST_TASK_TYPES]);
+  const row = result.rows[0];
+  if (row?.min_cents == null || row?.max_cents == null
+    || Number(row.task_type_count) !== QUEST_TASK_TYPES.length) return null;
+  return { minCents: BigInt(row.min_cents), maxCents: BigInt(row.max_cents) };
 }
 
 export async function minimumSellablePrice(client) {

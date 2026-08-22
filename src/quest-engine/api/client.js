@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { QuestshopError } from '../../shared/errors.js';
 import { secureJitter } from '../../shared/random.js';
 import { extractQuestArray, QuestCompatibilityError } from '../schema/compatibility.js';
 import { normalizeQuestPayload } from '../schema/normalizer.js';
@@ -8,6 +9,8 @@ import { FATAL_FORBIDDEN_PATHS, QUEST_ENDPOINT, QUEST_LIST_PATHS } from './endpo
 
 export { QUEST_API_VERSION } from './endpoints.js';
 const DEFAULT_TIMEOUT_MS = 15_000;
+const INTERACTIVE_TIMEOUT_MS = 6_000;
+const BACKGROUND_SAFE_READ_ATTEMPTS = 5;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export class DiscordApiError extends Error {
@@ -214,13 +217,53 @@ async function resolveTransportError({ attempt, error, maxAttempts, path, safeRe
   throw markMutationTransportUncertainty(error, { safeRead, dispatched });
 }
 
+function safeReadPolicy(signal, configuredTimeoutMs) {
+  if (signal) return { maxAttempts: BACKGROUND_SAFE_READ_ATTEMPTS, timeoutMs: configuredTimeoutMs };
+  return { maxAttempts: 1, timeoutMs: Math.min(configuredTimeoutMs, INTERACTIVE_TIMEOUT_MS) };
+}
+
+function customerReadError(error, signal) {
+  if (signal || error instanceof QuestshopError || error?.name === 'AbortError') return error;
+  if (error instanceof DiscordApiError) {
+    if (error.fatalAuth || error.status === 401 || error.status === 403) {
+      return new QuestshopError('TOKEN_INVALID', 'Discord Token ใช้ไม่ได้หรือหมดอายุ กรุณาตรวจสอบ Token แล้วลองใหม่', {
+        category: 'CUSTOMER_INPUT', cause: error,
+      });
+    }
+    if (error.status === 429) {
+      return new QuestshopError('RATE_LIMITED', 'Discord จำกัดการตรวจบัญชีชั่วคราว กรุณารอสักครู่แล้วลองใหม่', {
+        category: 'EXTERNAL', retryable: true, cause: error,
+      });
+    }
+    if (error.status >= 500) {
+      return new QuestshopError('RUNTIME_NOT_ACTIVE', 'Discord Quest ยังไม่พร้อมตอบตอนนี้ กรุณาลองใหม่อีกครั้ง', {
+        category: 'EXTERNAL', retryable: true, cause: error,
+      });
+    }
+  }
+  if (error instanceof DiscordApiTimeoutError || error instanceof DiscordApiTransportError
+    || error instanceof QuestCompatibilityError) {
+    return new QuestshopError('RUNTIME_NOT_ACTIVE', 'Discord Quest ตอบช้าหรือไม่พร้อมชั่วคราว กรุณาลองใหม่อีกครั้ง', {
+      category: 'EXTERNAL', retryable: true, cause: error,
+    });
+  }
+  return error;
+}
+
+function questNotExpired(quest, now = Date.now()) {
+  if (!quest?.expiresAt) return true;
+  const expiresAt = Date.parse(quest.expiresAt);
+  return !Number.isFinite(expiresAt) || expiresAt > now;
+}
+
 export function createQuestApiClient({ token, profile, coordinator = discordRateLimitCoordinator,
   timeoutMs = DEFAULT_TIMEOUT_MS, transport = fixedDiscordTransport }) {
   async function request(path, options = {}, { safeRead = false, maxAttempts = safeRead ? 5 : 1 } = {}) {
     const method = String(options.method ?? 'GET').toUpperCase();
+    const requestTimeoutMs = options.timeoutMs ?? timeoutMs;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const outcome = await makeQuestRequestAttempt({
-        coordinator, method, options, path, profile, safeRead, timeoutMs, token, transport,
+        coordinator, method, options, path, profile, safeRead, timeoutMs: requestTimeoutMs, token, transport,
       });
       if (outcome.kind === 'SUCCESS') return outcome.value;
       const retry = outcome.kind === 'RESPONSE_ERROR'
@@ -236,9 +279,11 @@ export function createQuestApiClient({ token, profile, coordinator = discordRate
   async function fetchQuestPayload(signal) {
     let empty = null;
     let lastError;
+    const policy = safeReadPolicy(signal, timeoutMs);
     for (const path of QUEST_LIST_PATHS) {
       try {
-        const candidate = await request(path, { signal }, { safeRead: true });
+        const candidate = await request(path, { signal, timeoutMs: policy.timeoutMs },
+          { safeRead: true, maxAttempts: policy.maxAttempts });
         const payload = {
           path,
           quests: extractQuestArray(candidate, path),
@@ -255,13 +300,32 @@ export function createQuestApiClient({ token, profile, coordinator = discordRate
     throw new QuestCompatibilityError(`Quest endpoints unavailable: ${lastError?.message ?? 'unknown'}`);
   }
 
-  async function fetchQuests(signal) {
-    const payload = await fetchQuestPayload(signal);
-    return normalizeQuestPayload(payload.quests, payload.enrollmentBlockedUntil);
+  async function fetchQuests(signal, { includeExpired = false } = {}) {
+    try {
+      const payload = await fetchQuestPayload(signal);
+      // Checkout/catalog do not need Discord's historical Quest rows. Runner
+      // verification does: it must be able to prove a deadline outcome after
+      // a mutation instead of mistaking an expired Quest for a missing one.
+      const now = Date.now();
+      const quests = normalizeQuestPayload(payload.quests, payload.enrollmentBlockedUntil);
+      return includeExpired ? quests : quests.filter((quest) => questNotExpired(quest, now));
+    } catch (error) {
+      throw customerReadError(error, signal);
+    }
+  }
+
+  async function fetchCurrentUser(signal) {
+    const policy = safeReadPolicy(signal, timeoutMs);
+    try {
+      return await request(QUEST_ENDPOINT.me(), { signal, timeoutMs: policy.timeoutMs },
+        { safeRead: true, maxAttempts: policy.maxAttempts });
+    } catch (error) {
+      throw customerReadError(error, signal);
+    }
   }
 
   return Object.freeze({
-    fetchCurrentUser: (signal) => request(QUEST_ENDPOINT.me(), { signal }, { safeRead: true }),
+    fetchCurrentUser,
     fetchQuests,
     enroll: (questId, signal) => request(QUEST_ENDPOINT.enroll(questId), {
       method: 'POST', body: JSON.stringify({ location: 11, is_targeted: false, metadata_raw: null }), signal,
