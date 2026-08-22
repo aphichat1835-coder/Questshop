@@ -168,6 +168,14 @@ test('Quest list drops already-expired entries before checkout/catalog work', as
   assert.deepEqual(quests.map((quest) => quest.id), ['active']);
 });
 
+test('Runner can request expired Quest rows for post-mutation verification', async () => {
+  const expired = rawQuest('expired', new Date(Date.now() - 60_000).toISOString());
+  const active = rawQuest('active', new Date(Date.now() + 60 * 60 * 1000).toISOString());
+  const client = api({ transport: async () => response(JSON.stringify([expired, active]), 200) });
+  const quests = await client.fetchQuests(undefined, { includeExpired: true });
+  assert.deepEqual(quests.map((quest) => quest.id), ['expired', 'active']);
+});
+
 test('safe reads record non-global 429 route and account cooldowns', async () => {
   const blocked = [];
   const limitedCoordinator = coordinator({

@@ -38,6 +38,9 @@ import {
 import {
   forcePublishFailedMonitorTest, openOrderItemReview, setCircuitBreakerState,
 } from '../../domain/admin/operations-service.js';
+import {
+  loadCustomerQuestDiscovery, publishCustomerDiscoveredQuest, requestCustomerDiscoveryTest,
+} from '../../domain/catalog/customer-discovery-service.js';
 import { loadTestFailureAlert, retryFailedTestAlert } from '../../domain/catalog/test-gate.js';
 import { discardDeadLetter, replayDeadLetter } from '../../domain/outbox/dlq-service.js';
 import { loadRuntimeConfig } from '../../config/runtime-config.js';
@@ -194,6 +197,7 @@ const CUSTOMER_ERROR_CODES = new Set([
   'QUEST_INSUFFICIENT_TIME', 'QUEST_EXTERNALLY_COMPLETED', 'TOKEN_ACCOUNT_CHANGED',
   'TOPUP_DAILY_LIMIT', 'RECEIVER_UNAVAILABLE', 'RUNTIME_NOT_ACTIVE', 'STALE_STATE',
   'INSUFFICIENT_BALANCE', 'ADMIN_CATEGORY_INVALID', 'SURFACE_CHANNEL_INVALID',
+  'CUSTOMER_DISCOVERY_NOT_FOUND', 'CUSTOMER_DISCOVERY_DECIDED', 'QUEST_NOT_SALE_ELIGIBLE', 'QUEST_EXPIRED',
 ]);
 
 const INCIDENT_ERROR_CODES = new Set([
@@ -677,6 +681,41 @@ async function assertTestFailureAlertBinding(interaction, alertId, runtime) {
     throw new QuestshopError('TEST_ALERT_SURFACE_INVALID', 'ห้อง Log นี้ไม่ใช่ Surface ที่ใช้งานอยู่');
   }
   return alert;
+}
+
+async function assertCustomerQuestDiscoveryBinding(interaction, discoveryId, runtime) {
+  const discovery = await withTransaction({ pool: runtime.pool, isolation: 'READ COMMITTED', maxAttempts: 1 },
+    (client) => loadCustomerQuestDiscovery(client, discoveryId, { messageId: interaction.message?.id }));
+  if (discovery?.surface_key !== 'LOG_QUEST_OPERATIONS') {
+    throw new QuestshopError('CUSTOMER_DISCOVERY_NOT_FOUND', 'ข้อความแจ้ง Quest จากลูกค้านี้หมดอายุแล้ว');
+  }
+  const surface = (await runtime.pool.query(`SELECT * FROM surfaces
+    WHERE surface_key='LOG_QUEST_OPERATIONS' AND state='ACTIVE'`)).rows[0];
+  if (!surface || surface.guild_id !== interaction.guildId || surface.channel_id !== interaction.channelId) {
+    throw new QuestshopError('SURFACE_BINDING_INVALID', 'ห้อง Log นี้ไม่ใช่ Surface ที่ใช้งานอยู่');
+  }
+  return discovery;
+}
+
+async function handleCustomerQuestPublish({ interaction, route, runtime, gates: _gates }) {
+  if (route.route !== 'customer_quest_publish' || !interaction.isButton()) return;
+  await assertCustomerQuestDiscoveryBinding(interaction, route.sessionId, runtime);
+  const result = await publishCustomerDiscoveredQuest({ discoveryId: route.sessionId,
+    runnerConcurrency: runnerConcurrency(runtime) },
+  contextFor(interaction, 'customer_discovery_publish'), { pool: runtime.pool });
+  return interaction.editReply(result.idempotent
+    ? 'Quest นี้ถูกสั่งประกาศแล้ว'
+    : 'รับคำสั่งแล้ว Quest จะถูกประกาศในห้อง Quest ใหม่');
+}
+
+async function handleCustomerQuestTest({ interaction, route, runtime, gates: _gates }) {
+  if (route.route !== 'customer_quest_test' || !interaction.isButton()) return;
+  await assertCustomerQuestDiscoveryBinding(interaction, route.sessionId, runtime);
+  const result = await requestCustomerDiscoveryTest({ discoveryId: route.sessionId },
+    contextFor(interaction, 'customer_discovery_test'), { pool: runtime.pool });
+  return interaction.editReply(result.idempotent
+    ? 'Quest นี้ถูกส่งทดสอบแล้ว'
+    : 'รับคำสั่งแล้ว ระบบจะทดสอบ Quest ด้วย Monitor Token');
 }
 
 async function handleTestFailureSend({ interaction, route, runtime, gates: _gates }) {
@@ -1892,6 +1931,8 @@ export const ROUTE_HANDLERS = Object.freeze({
   "config_quest_role_submit": handleConfigSubmit,
   "breaker_prepare": handleBreakerPrepare,
   "breaker_submit": handleBreakerSubmit,
+  "customer_quest_publish": handleCustomerQuestPublish,
+  "customer_quest_test": handleCustomerQuestTest,
   "test_fail_send": handleTestFailureSend,
   "test_fail_retry": handleTestFailureRetry,
 });

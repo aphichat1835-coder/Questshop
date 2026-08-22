@@ -4,7 +4,7 @@ import { recordTransition } from '../shared/transition.js';
 
 const ACTIVE_BATCH_STATES = new Set(['QUEUED', 'RUNNING']);
 
-async function questDeadlinePassed(client, quest) {
+export async function questDeadlinePassed(client, quest) {
   if (!quest?.expires_at) return false;
   return (await client.query('SELECT $1::timestamptz<=clock_timestamp() AS expired',
     [quest.expires_at])).rows[0]?.expired === true;

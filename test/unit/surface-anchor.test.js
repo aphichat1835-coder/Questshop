@@ -7,7 +7,7 @@ import {
 } from '../../src/discord/surfaces/setup.js';
 import { normalizeDiscordPayload } from '../../src/discord/payload.js';
 import {
-  QUEST_AUTO_MEDIA_ATTACHMENT_URL, QUEST_AUTO_MEDIA_FILENAME, loadQuestAutoMedia,
+  QUEST_AUTO_MEDIA_ATTACHMENT_URL, QUEST_AUTO_MEDIA_FILENAME, QUEST_AUTO_MEDIA_SIZE, loadQuestAutoMedia,
 } from '../../src/discord/surfaces/quest-auto-media.js';
 
 function createChannel({ listedMessages = [], sentMessage = { id: 'new-anchor' } } = {}) {
@@ -38,6 +38,22 @@ function priceRangePool(minCents = 500, maxCents = 500) {
       }
       throw new Error(`unexpected query: ${sql}`);
     },
+  };
+}
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function questAutoMessage(expected) {
+  const attachmentUrl = 'https://cdn.example/quest-auto-demo.gif';
+  return {
+    content: '',
+    attachments: new Map([['gif', {
+      name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE, url: attachmentUrl,
+    }]]),
+    embeds: [{ ...cloneJson(expected.embeds[0]), image: { url: attachmentUrl } }],
+    components: cloneJson(expected.components),
   };
 }
 
@@ -124,7 +140,10 @@ test('Quest Auto recovers its invisible anchor by stable nonce instead of a visi
     id: 'quest-auto-anchor',
     nonce: surfaceNonce('QUEST_AUTO'),
     author: { id: 'bot' },
-    attachments: new Map([['gif', { name: QUEST_AUTO_MEDIA_FILENAME }]]),
+    attachments: new Map([['gif', {
+      name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE,
+      url: 'https://cdn.example/quest-auto-demo.gif',
+    }]]),
     embeds: [{ title: 'Discord Quest • Auto', image: { url: 'https://cdn.example/quest-auto-demo.gif' } }],
     edit: async () => marker,
   };
@@ -170,7 +189,10 @@ test('Quest Auto keeps its existing uploaded GIF instead of uploading a duplicat
   let editedBody;
   const existing = {
     id: 'quest-auto',
-    attachments: new Map([['gif', { name: QUEST_AUTO_MEDIA_FILENAME }]]),
+    attachments: new Map([['gif', {
+      name: QUEST_AUTO_MEDIA_FILENAME, size: QUEST_AUTO_MEDIA_SIZE,
+      url: 'https://cdn.example/quest-auto-demo.gif',
+    }]]),
     edit: async (body) => {
       editedBody = body;
       return existing;
@@ -185,19 +207,38 @@ test('Quest Auto keeps its existing uploaded GIF instead of uploading a duplicat
 
 test('Quest Auto reconciliation detects stale price and rejects the old visible technical footer', () => {
   const expected = normalizeDiscordPayload(renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 700n } }));
-  const message = {
-    attachments: new Map([['gif', { name: QUEST_AUTO_MEDIA_FILENAME }]]),
-    embeds: [{
-      title: 'Discord Quest • Auto',
-      description: expected.embeds[0].description.replace('5-7', '5'),
-      image: { url: 'https://cdn.example/quest-auto-demo.gif' },
-    }],
-  };
+  const message = questAutoMessage(expected);
+  message.embeds[0].description = expected.embeds[0].description.replace('5-7', '5');
   assert.equal(questAutoSurfaceMatches(message, expected), false);
   message.embeds[0].description = expected.embeds[0].description;
   assert.equal(questAutoSurfaceMatches(message, expected), true);
   message.embeds[0].footer = { text: 'Questshop Surface • QUEST_AUTO' };
   assert.equal(questAutoSurfaceMatches(message, expected), false);
+});
+
+test('Quest Auto reconciliation rejects stale embed and button structures', () => {
+  const expected = normalizeDiscordPayload(renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 500n } }));
+  assert.equal(questAutoSurfaceMatches(questAutoMessage(expected), expected), true);
+
+  const mutations = [
+    (message) => { message.content = 'ข้อความเก่าที่ยังค้างอยู่'; },
+    (message) => { message.components = []; },
+    (message) => { message.components[0].components.pop(); },
+    (message) => { message.components[0].components.push(cloneJson(message.components[0].components[0])); },
+    (message) => { message.components[0].components[0].label = 'ปุ่มเก่า'; },
+    (message) => { message.components[0].components[0].style = 4; },
+    (message) => { message.components[0].components[0].emoji = { name: '❌' }; },
+    (message) => { message.components[0].components[1].custom_id = message.components[0].components[0].custom_id; },
+    (message) => { message.embeds[0].color = 0; },
+    (message) => { message.embeds[0].fields = [{ name: 'ข้อมูลเก่า', value: 'ยังค้างอยู่' }]; },
+    (message) => { message.embeds[0].thumbnail = { url: 'https://cdn.example/old.png' }; },
+    (message) => { message.embeds.push({ title: 'Embed เก่า' }); },
+  ];
+  for (const mutate of mutations) {
+    const message = questAutoMessage(expected);
+    mutate(message);
+    assert.equal(questAutoSurfaceMatches(message, expected), false);
+  }
 });
 
 test('rate limiting and transient fetch failures never become a missing-message recreate', async () => {

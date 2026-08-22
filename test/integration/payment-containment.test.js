@@ -56,3 +56,24 @@ test('automatic settlement recovers a durable REDEEMED top-up without calling th
   assert.equal(BigInt((await pool.query("SELECT available_cents FROM wallets WHERE discord_user_id='recovery-user'")).rows[0].available_cents), 2500n);
   assert.equal(Number((await pool.query('SELECT count(*) AS count FROM payment_attempts WHERE topup_id=$1', [topup])).rows[0].count), 0);
 });
+
+test('an over-limit redeemed voucher credits the full amount and locks further top-ups for the day', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const receiver = (await pool.query("SELECT id FROM receiver_versions WHERE state='ACTIVE' LIMIT 1")).rows[0].id;
+  const topup = uuidv7();
+  const trace = uuidv7();
+  const user = `over-limit-${trace}`;
+  await pool.query(`INSERT INTO topups(id,discord_user_id,status,voucher_hmac_version,voucher_hmac,
+    receiver_version_id,receiver_phone_last4,provider_transaction_id,amount_cents,currency,trace_id,redeemed_at)
+    VALUES($1,$2,'REDEEMED',1,$3,$4,'1234',$5,100001,'THB',$6,clock_timestamp())`,
+  [topup, user, Buffer.alloc(32, 83), receiver, `provider-${topup}`, trace]);
+
+  const processed = await processPayment({ holder: uuidv7(), env: workerEnv(),
+    signal: new AbortController().signal, autoCredit: true, pool });
+  assert.equal(processed, true);
+  assert.equal((await pool.query('SELECT status FROM topups WHERE id=$1', [topup])).rows[0].status, 'CREDITED');
+  assert.equal(BigInt((await pool.query('SELECT available_cents FROM wallets WHERE discord_user_id=$1', [user])).rows[0].available_cents), 100_001n);
+  assert.equal((await pool.query('SELECT count(*)::integer AS count FROM topup_daily_locks WHERE discord_user_id=$1', [user])).rows[0].count, 1);
+  assert.equal((await pool.query(`SELECT count(*)::integer AS count FROM incidents
+    WHERE incident_code='TOPUP_AMOUNT_OVER_AUTOCREDIT_LIMIT' AND state<>'RESOLVED'`)).rows[0].count > 0, true);
+});

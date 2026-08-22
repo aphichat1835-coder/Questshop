@@ -173,12 +173,16 @@ export async function pauseQuestForRetest(client, quest, context) {
   return paused;
 }
 
-async function queueDiscoveryProjections(client, quest, revision, context, source) {
+async function queueDiscoveryProjections(client, quest, revision, context) {
   // Expired Quest records remain durable catalog/history evidence, but they
   // must never become a customer-facing QUEST_NEW notification. Monitor
   // discovery still writes the operational projection for diagnostics.
-  const shouldPublish = quest.sale_state !== 'EXPIRED' && (source === 'CUSTOMER_CHECKOUT'
-    || quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN');
+  // A customer discovery is intentionally private until an Admin explicitly
+  // publishes it or a Monitor test opens public sale.  The checkout account
+  // can still receive customer-account admission; public discovery and public
+  // sale are separate decisions.
+  const shouldPublish = quest.sale_state !== 'EXPIRED'
+    && (quest.announcement_state === 'ANNOUNCED' || quest.sale_state === 'OPEN');
   const announcementNotBefore = quest.announcement_state === 'ANNOUNCED'
     ? (await client.query("SELECT clock_timestamp()+interval '30 seconds' AS value")).rows[0].value
     : null;
@@ -221,7 +225,7 @@ export async function ingestDiscovery({
       await createMonitorTestBatch(client, { quest, context, force: needsRetest });
     }
     quest = needsRetest ? await pauseQuestForRetest(client, quest, context) : quest;
-    await queueDiscoveryProjections(client, quest, metadata.revision, context, source);
+    await queueDiscoveryProjections(client, quest, metadata.revision, context);
     return { quest, price: sale.price, expiry: sale.expiry, revision: metadata.revision };
   });
 }

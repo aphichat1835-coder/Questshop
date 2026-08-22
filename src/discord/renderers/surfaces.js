@@ -44,6 +44,7 @@ export function renderQuestAuto(config = {}) {
     .setDescription(truncateDiscordText(defaultDescription, DISCORD_LIMITS.embedDescription))
     .setImage(QUEST_AUTO_MEDIA_ATTACHMENT_URL);
   return {
+    content: null,
     embeds: [embed],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(customId('start')).setLabel('เริ่มทำเควส').setEmoji('🎮').setStyle(ButtonStyle.Primary),

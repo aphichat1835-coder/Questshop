@@ -208,19 +208,31 @@ async function renderCustomerQuestDiscovery(pool, projection) {
     FROM customer_quest_discoveries d JOIN quests q ON q.quest_id=d.quest_id WHERE d.id=$1`,
   [projection.aggregate_id])).rows[0];
   if (!found) return missingProjection('ไม่พบ Customer Quest Discovery');
+  const pending = found.state === 'PENDING';
+  const status = {
+    PENDING: 'รอ Admin ตัดสินใจว่าจะประกาศหรือส่งทดสอบ',
+    TEST_REQUESTED: 'ส่งให้ Monitor ทดสอบแล้ว — ผลจะจัดการตาม Flow ทดสอบ Quest',
+    PUBLISHED: 'ประกาศสาธารณะแล้วโดย Admin',
+  }[found.state] ?? 'กำลังตรวจสอบ';
   const description = [
     `**ผู้พบ Quest:** <@${found.discord_user_id}> (\`${found.discord_user_id}\`)`,
     `**บัญชี Quest:** ${escape(found.account_username)} (\`${escape(found.account_id)}\`)`,
     `**Quest:** ${escape(found.name)} (\`${escape(found.quest_id)}\`)`,
     `**ประเภท / Executor:** ${escape(found.task_type)} / ${escape(found.executor_id)}`,
-    `**เปิดขายสาธารณะ:** ${escape(found.sale_state)}`,
+    `**สถานะการตัดสินใจ:** ${escape(status)}`,
     '**Token:** ไม่บันทึกหรือแสดง — ใช้เฉพาะข้อมูลระบุตัวบัญชีที่ผ่านการตรวจ',
     `**Checkout session:** \`${found.checkout_session_id}\``, `**Trace:** \`${found.trace_id}\``,
   ].join('\n');
   const embed = new EmbedBuilder().setColor(color.pending).setTitle('🔎 พบ Quest ใหม่จาก Checkout ลูกค้า')
     .setDescription(boundedDescription(description)).setTimestamp(found.created_at);
   setSafeThumbnail(embed, found.account_avatar_url);
-  return { embeds: [embed], allowedMentions: { users: [found.discord_user_id], parse: [] } };
+  const components = pending ? [new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`qs:v1:customer_quest_publish:${found.id}`)
+      .setLabel('ส่งประกาศ').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`qs:v1:customer_quest_test:${found.id}`)
+      .setLabel('ทดสอบก่อน').setStyle(ButtonStyle.Primary),
+  )] : [];
+  return { embeds: [embed], components, allowedMentions: { users: [found.discord_user_id], parse: [] } };
 }
 
 async function renderQuestTestFailure(pool, projection) {

@@ -15,12 +15,13 @@ Detect → Contain → Preserve evidence → Recover → Verify → Reopen → R
 | Financial DLQ | keep evidence/reservation; never discard | Owner replays with parent reference |
 | Non-financial DLQ | preserve delivery evidence | Owner replay/discard with reason/audit |
 | Quest schema/executor failure | pause affected Quest | pin compatible engine/contract, retest, reopen sale |
+| Customer-discovered Quest | keep it private; preserve the discovery record | Admin chooses **ทดสอบก่อน** or audited **ส่งประกาศ** from `LOG_QUEST_OPERATIONS`; never identify the customer in `quest-new` |
 | Monitor token invalid | quarantine account | Owner rotates credential and runs **เช็คระบบ Token** |
 | Discord surface 403 | preserve authoritative pointer/outbox/incident | Owner fixes Discord permission manually |
 | Discord outage / 429 | retain outbox; obey Retry-After | resume coalesced delivery after health recovery |
 | Discord interaction timeout | preserve Support code and Git SHA | restart the current flow; never replay uncertain money action blindly |
 | Quest Auto stale price | keep current anchor; do not create a second panel | verify active `TYPE` prices; allow Maintenance reconciliation or rerun `/quest-auto` |
-| Quest Auto missing/old media | keep current anchor | verify source `quest-auto-demo.gif`, then rerun `/quest-auto` or allow reconciliation |
+| Quest Auto missing/old media | keep current anchor | verify source `quest-auto-demo.gif` and the remote attachment URL/size, then rerun `/quest-auto` or allow reconciliation |
 | Quest Auto media integrity failure | do not bypass hash/size check | restore exact approved GIF in deployed source and redeploy |
 | Quest Auto still shows standalone MP4/footer | keep current anchor | deploy current GIF-layout SHA, rerun `/quest-auto` or allow reconciliation |
 | Aiven recovery | keep store closed; preserve ledger/incident evidence | Owner recovers through Aiven Console and reconciles before reopening |
@@ -29,7 +30,8 @@ Detect → Contain → Preserve evidence → Recover → Verify → Reopen → R
 | Full voucher link exposure | Owner restricts channel and preserves audit | review viewers/access; no automated privacy guard exists |
 | Worker crash during mutation | stop stale fencing owner | verify durable checkpoint/provider state before retry |
 | Pre-launch closeout | keep store closed | compensate real financial tests; retain audit |
-| Receiver rotation | retain old snapshot for pending work | new work uses active receiver version |
+| Receiver rotation | retain old snapshot for pending work | new work uses active receiver version; a first install without a receiver remains backoffice-accessible but cannot accept vouchers |
+| Customer leaves Guild with an active order | preserve Order, Wallet, reservation and Runner state; never cancel automatically | continue durable work; final DM is best-effort only and a failed DM is not a settlement failure |
 
 ## Quest Auto recovery details
 
@@ -70,9 +72,9 @@ rewrite the embed on the **same durable message**.
 Quest Auto recovery uses the stable surface nonce as the primary invisible-anchor marker. The old footer lookup remains
 only so older messages can be migrated without creating a duplicate panel.
 
-If the message already has exactly one `quest-auto-demo.gif` attachment, runtime preserves it to avoid duplicate upload.
-Therefore, if the Owner intentionally changes GIF bytes in a future release, version/change the filename or add an
-explicit attachment migration; otherwise Discord-side filename matching can preserve older remote bytes.
+Runtime preserves the existing GIF only when it has the approved filename, exact byte size and the embed image points
+to that attachment's current Discord CDN/proxy URL. Any other attachment/image combination is refreshed. If the Owner
+intentionally changes GIF bytes in a future release, version/change the filename or add an explicit attachment migration.
 
 ## Mandatory execution template
 
@@ -87,6 +89,8 @@ explicit attachment migration; otherwise Discord-side filename matching can pres
 ## Special decision rules
 
 - A possibly-sent TrueMoney or Quest mutation is verified before retry.
+- A successful TrueMoney redemption over the configured maximum is credited in full, recorded as an operational warning
+  and locks further vouchers until the Bangkok-day boundary. It is not an automatic manual-review hold.
 - A proven Runner completion with durable provenance captures the reservation; contradictory/missing provenance remains Reserved for Review.
 - Monitor evidence is valid only for the exact execution-contract fingerprint.
 - Financial/Audit DLQ can be replayed but never discarded.

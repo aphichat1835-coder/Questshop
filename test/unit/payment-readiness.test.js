@@ -17,23 +17,23 @@ function fakePool({ topup = false, autoCredit = false, receiver = false } = {}) 
   };
 }
 
-test('payment readiness fails closed when payment is enabled without an active receiver', async () => {
+test('payment readiness keeps the backoffice available when a new store has no receiver', async () => {
   const health = { checks: {} };
-  await assert.rejects(() => validatePaymentReadiness(fakePool({ topup: true }), health),
-    (error) => error.code === 'TRUEMONEY_RECEIVER_REQUIRED');
+  const result = await validatePaymentReadiness(fakePool({ topup: true }), health);
+  assert.deepEqual(result, { paymentEnabled: true, hasReceiver: false, ready: false });
   assert.equal(health.checks.payments, 'MISSING_RECEIVER');
 });
 
 test('payment readiness permits maintenance startup when payment gates are disabled', async () => {
   const health = { checks: {} };
   const result = await validatePaymentReadiness(fakePool(), health);
-  assert.deepEqual(result, { paymentEnabled: false, hasReceiver: false });
+  assert.deepEqual(result, { paymentEnabled: false, hasReceiver: false, ready: true });
   assert.equal(health.checks.payments, 'DISABLED');
 });
 
 test('payment readiness records OK when an active receiver exists', async () => {
   const health = { checks: {} };
   const result = await validatePaymentReadiness(fakePool({ topup: true, autoCredit: true, receiver: true }), health);
-  assert.deepEqual(result, { paymentEnabled: true, hasReceiver: true });
+  assert.deepEqual(result, { paymentEnabled: true, hasReceiver: true, ready: true });
   assert.equal(health.checks.payments, 'OK');
 });

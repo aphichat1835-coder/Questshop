@@ -12,8 +12,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - `DATABASE_DIRECT_URL` = Migrator role; `DATABASE_POOL_URL` = Runtime role; both production URLs use
   `sslmode=verify-full`.
 - `BACKUP_MODE=AIVEN_MANAGED` is the default provider boundary for Aiven.
-- `LOG_PAYMENTS` may render a full voucher link by Owner policy only on a channel that is hidden from `@everyone`,
-  non-Administrator roles and arbitrary member overwrites; privacy drift quarantines the durable surface.
+- `LOG_PAYMENTS` may render a full voucher link by Owner policy. Backoffice human visibility is Owner-managed;
+  runtime neither performs a privacy preflight nor changes Discord permissions.
 - No Automatic Claim; successful Quest work ends at `READY_TO_CLAIM` with customer-side claim URL.
 - Release state remains **implemented-but-unverified** until live UAT passes on one exact Git SHA.
 
@@ -50,8 +50,11 @@ There is no production release/tag evidence yet; current work remains under `[Un
   redeemed-stuck incidents, and idempotent credit recovery without another provider call.
 - Payment-attempt forensic lineage using `parent_attempt_id`, normalized `error_class` / `error_code`, and regression
   coverage for retry ancestry.
-- Payment-specific channel privacy enforcement for `LOG_PAYMENTS`; a later permission drift disables that surface so
-  financial Outbox delivery cannot continue through the unsafe durable anchor.
+- Durable Admin decision flow for Quest first discovered during customer checkout. These Quest remain private by default,
+  while the authenticated customer account may still receive checkout admission; `LOG_QUEST_OPERATIONS` offers
+  **ส่งประกาศ** (audited test-gate override) or **ทดสอบก่อน**.
+- Customer-discovery operational records now survive temporary checkout-session retention, retaining account/discovery
+  evidence and the Administrator decision without retaining the customer Token.
 
 ### Changed
 
@@ -61,7 +64,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Quest Auto no longer exposes `Questshop Surface • QUEST_AUTO` to customers. Recovery uses the stable surface nonce,
   with the old footer lookup retained only as a migration fallback for older messages.
 - Quest Auto surface reconciliation detects presentation drift independently of runtime config version and edits the
-  existing durable message when title/description, price text, expected GIF attachment, embed image or legacy footer is stale.
+  existing durable message when content, title/description, color, fields, button routes/labels/styles/emojis,
+  price text, expected GIF attachment, embed image or legacy footer is stale.
 - A missing or legacy Quest Auto attachment is cleared and replaced with `quest-auto-demo.gif` on the same surface.
 - Admin GAME/VIDEO price changes now trigger immediate background reconciliation after the database commit instead of
   waiting for the next ~60-second Maintenance pass. Maintenance remains the fallback if immediate Discord delivery fails.
@@ -73,6 +77,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
   retry/backoff are durably suppressed without pinging a role or marking the Quest as `ANNOUNCED`.
 - Quest-new customer announcements now show Discord Quest **เริ่ม Quest** (`starts_at`) and **หมดอายุ** (`expires_at`)
   instead of scanner **ตรวจพบ** / mutable **อัปเดต** timestamps.
+- Customer checkout discovery no longer automatically creates public `QUEST_NEW`; public delivery now requires a passed
+  Monitor test or the explicit audited Admin publication decision.
 - `QUEST_NEW` now has one customer-facing renderer source: generic projection rendering and Outbox delivery both route
   to `renderQuestNewProjection()`.
 - Quest presentation metadata is read from the exact current durable revision; an older non-null thumbnail is no longer
@@ -91,17 +97,26 @@ There is no production release/tag evidence yet; current work remains under `[Un
   one pending top-up per customer and re-checks the Bangkok daily lock before a queued voucher can be claimed.
 - TrueMoney success now requires successful HTTP status, positive amount, consistent single-recipient evidence and a
   safe transaction identifier. Response aborts and inconsistent transport/provider evidence remain ambiguous.
-- Automatic credit accepts the established 10–1,000 baht range; successful redemptions outside that range move to
-  Owner-only Manual Review rather than being credited automatically.
-- Owner manual credit now requires a matching second confirmation within five minutes, and duplicate provider transaction
+- Owner manual credit requires a matching second confirmation within five minutes, and duplicate provider transaction
   identifiers return a business-safe conflict instead of a generic database failure.
-- Runtime payment readiness fails closed when payment gates are enabled without an active TrueMoney receiver.
+- Startup remains available for first installation without a TrueMoney receiver: payment health is `MISSING_RECEIVER`,
+  voucher intake remains unavailable until an active receiver exists, and the Owner can finish setup in the Admin panel.
+- A successfully redeemed voucher above the configured automatic-credit maximum is credited in full, creates an
+  operational warning and locks further top-ups until the Bangkok-day boundary; it is never silently held as money owed.
+- Runner verification may request expired Quest rows after execution so deadline outcomes are not misclassified as a
+  missing Quest. A missing post-mutation Quest now remains an ambiguous provenance case instead of an automatic release.
+- A Quest Manual Review retry checks expiry before requeueing and resolves an expired review without creating a test run.
+- Maintenance commits runner, monitor, payment, lock and notification recovery in bounded independent transactions;
+  24-hour reminders record evidence without changing an Admin review into an Owner-only review.
+- PostgreSQL pool idle-client errors are caught, redacted and projected into health as `DEGRADED` instead of becoming
+  an unhandled process-level error.
+- Quest Auto reconciliation now requires the exact approved GIF filename, byte size and matching remote attachment URL
+  before preserving an existing Discord upload.
 
 ### Removed
 
 - Automatic Quest reward claim / claim retry paths.
-- Runtime-wide Permission Drift detector and automatic Discord permission repair; only the narrow `LOG_PAYMENTS`
-  confidentiality invariant is enforced.
+- Runtime-wide Permission Drift detector, human-visibility/privacy preflight and automatic Discord permission repair.
 - Legacy generic branding overrides for the fixed Quest Auto title/description.
 - Legacy Base64/re-encoded Quest Auto demo derivative and standalone MP4 storefront presentation.
 - The legacy duplicated Quest-new renderer that could still format `ตรวจพบ` / `อัปเดต` independently of Outbox delivery.
@@ -112,8 +127,8 @@ There is no production release/tag evidence yet; current work remains under `[Un
 - Money remains integer satang; Wallet/Ledger settlement paths retain serializable/idempotent/fencing protections.
 - Logger/Discord boundaries retain secret redaction and deny-by-default mentions; TrueMoney voucher URLs are redacted
   from structured application logs.
-- Full TrueMoney voucher-link rendering remains the narrow `LOG_PAYMENTS` exception and is constrained to a private
-  Administrator/Owner operational channel.
+- Full TrueMoney voucher-link rendering remains the narrow `LOG_PAYMENTS` exception; channel visibility is an
+  Owner-managed operational responsibility.
 - Quest reward parsing ignores explicitly non-Orb reward quantities instead of mislabelling them as Discord Orbs.
 
 ### Automated evidence

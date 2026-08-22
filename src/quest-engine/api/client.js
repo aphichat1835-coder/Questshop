@@ -300,15 +300,15 @@ export function createQuestApiClient({ token, profile, coordinator = discordRate
     throw new QuestCompatibilityError(`Quest endpoints unavailable: ${lastError?.message ?? 'unknown'}`);
   }
 
-  async function fetchQuests(signal) {
+  async function fetchQuests(signal, { includeExpired = false } = {}) {
     try {
       const payload = await fetchQuestPayload(signal);
-      // Discord can return a long historical Quest list. Drop already-ended
-      // entries before catalog/checkout work so first-use Token validation
-      // does not spend time ingesting dozens of impossible Quest records.
+      // Checkout/catalog do not need Discord's historical Quest rows. Runner
+      // verification does: it must be able to prove a deadline outcome after
+      // a mutation instead of mistaking an expired Quest for a missing one.
       const now = Date.now();
-      return normalizeQuestPayload(payload.quests, payload.enrollmentBlockedUntil)
-        .filter((quest) => questNotExpired(quest, now));
+      const quests = normalizeQuestPayload(payload.quests, payload.enrollmentBlockedUntil);
+      return includeExpired ? quests : quests.filter((quest) => questNotExpired(quest, now));
     } catch (error) {
       throw customerReadError(error, signal);
     }

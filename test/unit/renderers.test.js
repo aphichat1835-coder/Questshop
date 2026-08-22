@@ -29,6 +29,26 @@ test('quest-new projection does not expose internal sale state', async () => {
   assert.match(body.embeds[0].data.description, /ดู Quest ได้ที่นี่/);
 });
 
+test('customer Quest discovery stays in the backoffice until an Admin chooses its path', async () => {
+  const found = {
+    id: '019fc886-ffcd-70e3-bd14-fb61772e84c7', state: 'PENDING', discord_user_id: '123456789012345678',
+    account_id: 'quest-account', account_username: 'Quest account', account_avatar_url: null,
+    quest_id: 'customer-quest', name: 'Customer Quest', task_type: 'WATCH_VIDEO', executor_id: 'video',
+    sale_state: 'CLOSED', checkout_session_id: 'session', trace_id: '019fc886-ffcd-70e3-bd14-fb61772e84c7', created_at: new Date(),
+  };
+  const pool = { query: async () => ({ rows: [found] }) };
+  const body = await renderProjection(pool, { projection_type: 'CUSTOMER_QUEST_DISCOVERY', aggregate_id: found.id });
+  assert.match(body.embeds[0].data.description, /รอ Admin ตัดสินใจ/);
+  assert.doesNotMatch(body.embeds[0].data.description, /เปิดขายสาธารณะ/);
+  assert.deepEqual(body.components[0].components.map((button) => button.data.label), ['ส่งประกาศ', 'ทดสอบก่อน']);
+  assert.deepEqual(body.allowedMentions, { users: [found.discord_user_id], parse: [] });
+
+  const terminal = await renderProjection({ query: async () => ({ rows: [{ ...found, state: 'PUBLISHED' }] }) },
+    { projection_type: 'CUSTOMER_QUEST_DISCOVERY', aggregate_id: found.id });
+  assert.deepEqual(terminal.components, []);
+  assert.match(terminal.embeds[0].data.description, /ประกาศสาธารณะแล้ว/);
+});
+
 test('dynamic projection metadata stays inside Discord embed limits', async () => {
   const long = `ชื่อ Quest ที่ยาวมาก ${'x'.repeat(10_000)}`;
   const pool = { query: async () => ({ rows: [{ quest_id: 'q', task_type: 'WATCH_VIDEO', task_target: 60,

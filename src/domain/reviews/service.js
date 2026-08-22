@@ -11,7 +11,7 @@ import { ORDER_ITEM_TRANSITIONS } from '../orders/states.js';
 import { RUNNER_JOB_TRANSITIONS } from '../runner/states.js';
 import { TOPUP_TRANSITIONS } from '../payments/states.js';
 import { TEST_TRANSITIONS } from '../catalog/states.js';
-import { createMonitorTestBatch, hasCurrentTestPass } from '../catalog/test-gate.js';
+import { createMonitorTestBatch, hasCurrentTestPass, questDeadlinePassed } from '../catalog/test-gate.js';
 import { appendLedger } from '../wallet/ledger.js';
 import {
   captureReservationInTransaction,
@@ -423,6 +423,9 @@ async function applyQuestDecision(client, review, decision, context) {
     throw new TypeError('Quest Manual Review รองรับเฉพาะ RETRY; ใช้ Catalog action หากต้องการเปลี่ยนสถานะขาย');
   }
   const { quest, active, manual, batch, targetMonitorReady } = await loadQuestReviewContext(client, review);
+  if (await questDeadlinePassed(client, quest)) {
+    return { questId: quest.quest_id, status: 'QUEST_EXPIRED' };
+  }
   if (await hasCurrentTestPass(client, quest)) return { questId: quest.quest_id, status: 'TEST_ALREADY_PASSED' };
   if (active) return { questId: quest.quest_id, status: 'TEST_ALREADY_SCHEDULED', testRunId: active.id };
 
@@ -435,8 +438,9 @@ async function applyQuestDecision(client, review, decision, context) {
   await retireQuestTestBatch(client, batch, review, context);
   const seeded = await createMonitorTestBatch(client, { quest, context,
     requestedBy: context.actorId, force: true });
-  return { questId: quest.quest_id, status: seeded.queued ? 'TEST_QUEUED' : 'NO_ACTIVE_MONITOR',
-    batchId: seeded.batch.id, testRunId: seeded.queued?.id ?? null };
+  return { questId: quest.quest_id,
+    status: seeded.skipped === 'QUEST_EXPIRED' ? 'QUEST_EXPIRED' : seeded.queued ? 'TEST_QUEUED' : 'NO_ACTIVE_MONITOR',
+    batchId: seeded.batch?.id ?? null, testRunId: seeded.queued?.id ?? null };
 }
 
 function topupCreditFingerprint({ reviewId, reason, amountCents, providerTransactionId }) {

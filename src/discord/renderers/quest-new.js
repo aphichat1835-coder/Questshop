@@ -8,7 +8,11 @@ const noMentions = { parse: [] };
 const escape = (value) => safeDiscordText(value, { maximum: 1_000 });
 const title = (value) => truncateDiscordText(value, DISCORD_LIMITS.embedTitle);
 const boundedDescription = (value) => truncateDiscordText(value, DISCORD_LIMITS.embedDescription);
-const timestamp = (value) => value ? `<t:${Math.floor(new Date(value).getTime() / 1000)}:F>` : 'ไม่ระบุ';
+function timestamp(value) {
+  if (!value) return 'ไม่ระบุ';
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) ? `<t:${Math.floor(milliseconds / 1000)}:F>` : 'ไม่ระบุ';
+}
 
 function safeHttpsUrl(value) {
   try {

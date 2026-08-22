@@ -5,6 +5,7 @@ import { questAutoPriceRangeLabel, renderQuestAuto } from '../../src/discord/ren
 import {
   QUEST_AUTO_MEDIA_ATTACHMENT_URL,
   QUEST_AUTO_MEDIA_FILENAME,
+  QUEST_AUTO_MEDIA_SIZE,
   loadQuestAutoMedia,
 } from '../../src/discord/surfaces/quest-auto-media.js';
 import { questAutoSurfaceMatches } from '../../src/discord/surfaces/setup.js';
@@ -63,14 +64,28 @@ test('Quest Auto bundled GIF is the exact uploaded asset and missing media marks
   assert.equal(media.subarray(0, 6).toString('ascii'), 'GIF89a');
   assert.equal(QUEST_AUTO_MEDIA_FILENAME, 'quest-auto-demo.gif');
 
-  const payload = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy', image: { url: QUEST_AUTO_MEDIA_ATTACHMENT_URL } }] };
-  const withoutMedia = { embeds: [{ title: 'Discord Quest • Auto', description: 'copy', image: { url: 'https://cdn.example/demo.gif' } }], attachments: new Map() };
+  const payload = renderQuestAuto({ priceRange: { minCents: 500n, maxCents: 500n } });
+  const actualEmbed = { ...payload.embeds[0].data, image: { url: 'https://cdn.example/demo.gif' } };
+  const withoutMedia = { content: '', embeds: [actualEmbed], components: payload.components, attachments: new Map() };
   assert.equal(questAutoSurfaceMatches(withoutMedia, payload), false);
   const withMedia = {
-    embeds: [{ title: 'Discord Quest • Auto', description: 'copy', image: { url: 'https://cdn.example/demo.gif' } }],
-    attachments: new Map([['attachment', { name: QUEST_AUTO_MEDIA_FILENAME }]]),
+    content: '', embeds: [actualEmbed], components: payload.components,
+    attachments: new Map([['attachment', {
+      name: QUEST_AUTO_MEDIA_FILENAME,
+      size: QUEST_AUTO_MEDIA_SIZE,
+      url: 'https://cdn.example/demo.gif',
+    }]]),
   };
   assert.equal(questAutoSurfaceMatches(withMedia, payload), true);
+  withMedia.embeds[0].image.url = 'https://cdn.example/wrong-remote-image.gif';
+  assert.equal(questAutoSurfaceMatches(withMedia, payload), false);
+  withMedia.embeds[0].image.url = 'https://cdn.example/demo.gif';
+  withMedia.attachments = new Map([['attachment', {
+    name: QUEST_AUTO_MEDIA_FILENAME,
+    size: QUEST_AUTO_MEDIA_SIZE - 1,
+    url: 'https://cdn.example/demo.gif',
+  }]]);
+  assert.equal(questAutoSurfaceMatches(withMedia, payload), false);
   withMedia.embeds[0].footer = { text: 'Questshop Surface • QUEST_AUTO' };
   assert.equal(questAutoSurfaceMatches(withMedia, payload), false);
 });

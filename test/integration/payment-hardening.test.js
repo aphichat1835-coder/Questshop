@@ -9,7 +9,7 @@ import {
 } from '../../src/domain/payments/service.js';
 import {
   paymentPolicyFromConfigValues,
-  reconcileDailyTopupLock,
+  reconcileDailyTopupLock, topupAmountExceedsAutoCreditMaximum,
 } from '../../src/domain/payments/policy.js';
 
 let pool;
@@ -32,12 +32,14 @@ function context(traceId, key = 'payment-hardening') {
     guildId: '10000000000000002', idempotencyKey: key });
 }
 
-test('automatic credit range is fail-safe outside 10 to 1000 baht', () => {
+test('redeemed vouchers below the minimum require review, while over-limit vouchers credit in full', () => {
   assert.equal(topupAmountNeedsReview(null), true);
   assert.equal(topupAmountNeedsReview(999n), true);
   assert.equal(topupAmountNeedsReview(1_000n), false);
   assert.equal(topupAmountNeedsReview(100_000n), false);
-  assert.equal(topupAmountNeedsReview(100_001n), true);
+  assert.equal(topupAmountNeedsReview(100_001n), false);
+  assert.equal(topupAmountExceedsAutoCreditMaximum(100_000n), false);
+  assert.equal(topupAmountExceedsAutoCreditMaximum(100_001n), true);
 });
 
 test('payment limits are configurable and upper/daily caps can be disabled', () => {

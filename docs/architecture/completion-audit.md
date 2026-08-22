@@ -67,6 +67,11 @@ MP4/video block. A stale or legacy attachment is cleared and replaced on the sam
 Quest Auto recovery prefers the stable surface nonce so the technical footer can remain hidden. Legacy footer lookup is
 retained only as a migration fallback for older storefront messages.
 
+The reconciliation contract compares the complete customer-visible structure: empty message content, one Embed with the
+approved title/copy/color and no legacy fields, one Action Row containing only the **เริ่มทำเควส** / **เติมเงิน** button
+contracts, and the expected GIF attachment/image. Opaque component UUIDs may rotate; their routes and visible semantics
+must remain exact. Drift edits the existing anchor instead of creating a second storefront.
+
 Important future-change rule: Discord-side drift detection identifies the expected GIF by filename. If the GIF bytes
 intentionally change later, version/change the filename or add an explicit attachment migration.
 
@@ -82,6 +87,10 @@ Source: `src/quest-engine/schema/normalizer.js`, `src/domain/catalog/service.js`
 
 - Customer-facing Quest announcements display Quest **start** (`starts_at`) and **expiry** (`expires_at`) times. They do
   not expose the scanner detection time or the mutable PostgreSQL `updated_at` value as customer copy.
+- A customer-discovered Quest remains private even when that customer's authenticated account may buy it. The durable
+  `CUSTOMER_QUEST_DISCOVERY` backoffice projection presents **ส่งประกาศ** and **ทดสอบก่อน** to an Administrator;
+  only the former creates public `QUEST_NEW` through an audited test-gate override. Its checkout-session foreign key is
+  cleared, not cascaded, during retention so the operational decision evidence remains available.
 - A Quest whose `expires_at` is already past remains valid catalog/history evidence but is terminal for active delivery:
   Monitor discovery marks it `EXPIRED` before creating a test batch, does not consume a Monitor Token, and does not
   enqueue `QUEST_NEW`.
@@ -89,7 +98,8 @@ Source: `src/quest-engine/schema/normalizer.js`, `src/domain/catalog/service.js`
   valid but expires during Outbox retry/backoff is suppressed before Discord channel fetch/send and is not marked
   `ANNOUNCED`. This is the final race-condition guard against historical notification floods.
 - If a Monitor test batch becomes stale at the Quest deadline, the batch closes without switching to another Monitor or
-  creating a misleading exhausted-monitor alert. Admin retry likewise does not restart testing for an expired Quest.
+  creating a misleading exhausted-monitor alert. Admin retry checks that deadline before any requeue and resolves an
+  expired review without creating a new test run.
 - Discord Orb rewards are read from virtual-currency reward entries (`type = 4`, `orb_quantity`). `ALL` reward sets sum
   their Orb entries. `TIERED` reward sets with different values are represented as a range instead of pretending one
   exact amount applies to every tier. Non-Orb `quantity` values are never re-labelled as Orbs.

@@ -79,7 +79,9 @@ Confirm Order
 - TrueMoney หลัง request อาจส่งสำเร็จแล้วห้าม blind retry
 - หนึ่ง Quest account มี active job ได้ไม่เกินหนึ่งงานทั่วระบบ
 - Monitor ทุกบัญชีทำ Scan + Test; Monitor-discovered Quest ยัง private จน test ผ่านหรือ Admin ใช้ audited **ส่งเลย**
-- customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy และ public announcement ห้ามระบุตัวลูกค้า
+- customer-discovered Quest อาจถูกเสนอเฉพาะ account นั้นตาม policy แต่ไม่ประกาศ `quest-new` อัตโนมัติ:
+  Admin ตัดสินใจจาก `LOG_QUEST_OPERATIONS` ว่า **ส่งประกาศ** (audited override) หรือ **ทดสอบก่อน**;
+  public announcement ห้ามระบุตัวลูกค้า
 
 ## Discord และสิทธิ์หลังบ้าน
 
@@ -88,6 +90,10 @@ Owner ใช้ `OWNER_ID`; Admin คนอื่นต้องมี Discord `
 
 ตาม Owner policy บอทไม่ตรวจ human visibility/privacy ของห้องหลังบ้าน. `LOG_PAYMENTS` อาจมี full TrueMoney voucher link;
 Owner ต้องตั้ง channel visibility เอง. Discord 403 ถูกบันทึกเป็น incident แต่บอทไม่เปลี่ยน permission ให้เอง.
+
+การติดตั้งครั้งแรกยังเปิดบอทและแผง Owner ได้แม้ยังไม่มี TrueMoney receiver: Health จะแสดง
+`MISSING_RECEIVER` และระบบรับซองจะปฏิเสธอย่างปลอดภัยจนกว่าจะเพิ่ม receiver ที่ Active. หาก Provider รับซองสำเร็จ
+แล้วพบยอดเกินเพดานต่อซอง ระบบจะเครดิตยอดเต็ม สร้างคำเตือนหลังบ้าน และล็อกการเติมเพิ่มจนสิ้นรอบวัน Bangkok.
 
 ## Environment Variables หลัก
 

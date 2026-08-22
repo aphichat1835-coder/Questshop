@@ -11,7 +11,7 @@ Current status remains **implemented-but-unverified**.
 | Wallet / immutable ledger | wallet domain, reservations, retention | debit/settlement/refund/checkpoint tests | Owner compensation sign-off |
 | TrueMoney / voucher identity | TrueMoney adapter, payment service/worker | URL/schema/HMAC/ambiguity/replay/crash tests | real low-value + ambiguous UAT |
 | Pricing / promotion | pricing resolver, Admin config service | exact-satang + category/promotion tests | Owner Admin pricing UAT |
-| Quest Auto dynamic price | `configuredQuestPriceRange`, price-change event, surface renderer/reconcile | equal/range/incomplete/stale-price/immediate-refresh tests | visible live price refresh |
+| Quest Auto dynamic price / UI recovery | `configuredQuestPriceRange`, price-change event, surface renderer/reconcile | equal/range/incomplete/stale-price, stale embed/button and immediate-refresh tests | visible live price and component refresh |
 | Quest Auto embedded GIF | `src/discord/assets/quest-auto-demo.gif`, `quest-auto-media.js` | exact size/GIF/hash + stale attachment/embed tests | desktop/mobile in-embed animation |
 | Quest new reward/lifetime/media | normalizer, catalog revision merge, expiry/outbox guards, `quest-new.js` | Orb/tier/media/current-revision/expired-filter tests | real Quest reward/time/artwork + historical-scan fidelity |
 | Catalog / Monitor gate | catalog, discovery/test workers, contract pinning | Monitor-gate + expiry-stop + retest + fingerprint tests | real metadata drift / Monitor UAT |
@@ -22,6 +22,8 @@ Current status remains **implemented-but-unverified**.
 | Customer/Admin surfaces | commands/router/renderers/surfaces | route/session/payload/setup tests | Guild layout + mobile UI |
 | Admin / Manual Review | Admin/review services | auth/review/adjustment tests | Owner workflow UAT |
 | Backoffice privacy policy | startup/surface/outbox policy | no runtime human-visibility guard; Administrator startup test | Owner channel configuration |
+| First-install payments / over-limit redemption | startup readiness, payment policy and payment worker | receiver-readiness, payment-hardening and payment-containment PostgreSQL tests | add active receiver; verify a redeemed over-limit voucher credits fully and locks intake through Bangkok midnight |
+| Runner/review expiry recovery | Quest API client, Runner service, test gate and review service | expired Quest client/review PostgreSQL tests | verify a real deadline race keeps ambiguous work Reserved and never reseeds an expired Monitor test |
 | Health / alerts | health server, worker manager, alerts | `/statusz`, invariant/SLO tests | external alert delivery |
 | Aiven backup policy | env/deployment policy | Aiven-managed skip/audit tests | Aiven Console recovery evidence |
 | Deployment / rollback / CI | Dockerfile, workflow, deploy scripts | check/lint/coverage/load/audit/Docker | same-SHA deploy + rollback |
@@ -96,6 +98,8 @@ filename or include an explicit attachment migration.
 - stores Discord Quest `starts_at` and `expires_at` as the customer-visible lifetime source;
 - Monitor discovery reconciles expiry before creating a test batch, so an already-expired Quest can remain in durable
   history but consumes no Monitor test attempt and creates no public `QUEST_NEW` projection;
+- customer checkout discovery may admit the Quest only for the authenticated account, but does not enqueue public
+  `QUEST_NEW`; its durable backoffice record requires an Administrator to choose audited publication or Monitor testing;
 - active test batches re-check the Quest deadline before choosing another Monitor, and an expired batch closes without
   cycling credentials or generating an exhausted-monitor alert;
 - the common Outbox enqueue boundary refuses `QUEST_NEW` for an expired Quest regardless of whether the caller is

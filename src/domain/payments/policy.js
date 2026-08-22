@@ -40,8 +40,15 @@ export async function loadPaymentPolicy(source) {
 export function topupAmountNeedsReview(amountCents, policy = DEFAULT_PAYMENT_POLICY) {
   if (amountCents == null) return true;
   const amount = BigInt(amountCents);
-  return amount < policy.autoCreditMinCents
-    || (policy.autoCreditMaxCents != null && amount > policy.autoCreditMaxCents);
+  // This policy is evaluated after the provider has redeemed the voucher.
+  // A high amount must be credited in full; the daily admission lock prevents
+  // another top-up. Only a missing/below-minimum amount remains ambiguous.
+  return amount < policy.autoCreditMinCents;
+}
+
+export function topupAmountExceedsAutoCreditMaximum(amountCents, policy = DEFAULT_PAYMENT_POLICY) {
+  if (amountCents == null || policy.autoCreditMaxCents == null) return false;
+  return BigInt(amountCents) > policy.autoCreditMaxCents;
 }
 
 async function redeemedPrincipalForDay(client, discordUserId, bounds) {
@@ -50,6 +57,15 @@ async function redeemedPrincipalForDay(client, discordUserId, bounds) {
       AND redeemed_at >= $2 AND redeemed_at < $3`,
   [discordUserId, bounds.starts_at, bounds.ends_at])).rows[0];
   return BigInt(row.total ?? 0);
+}
+
+async function hasOverLimitRedemptionForDay(client, discordUserId, bounds, policy) {
+  if (policy.autoCreditMaxCents == null) return false;
+  const row = (await client.query(`SELECT EXISTS(
+    SELECT 1 FROM topups WHERE discord_user_id=$1 AND redeemed_at IS NOT NULL
+      AND redeemed_at >= $2 AND redeemed_at < $3 AND amount_cents > $4
+  ) AS over_limit`, [discordUserId, bounds.starts_at, bounds.ends_at, policy.autoCreditMaxCents])).rows[0];
+  return row?.over_limit === true;
 }
 
 async function currentDailyLock(client, discordUserId) {
@@ -74,12 +90,22 @@ export async function reconcileDailyTopupLockInTransaction(client, {
   const effectivePolicy = policy ?? await loadPaymentPolicy(client);
   const existing = await currentDailyLock(client, discordUserId);
   if (effectivePolicy.dailyRedeemedLimitCents == null) {
+    const bounds = await bangkokDayBounds(client, redeemedAt);
+    const overLimitVoucher = await hasOverLimitRedemptionForDay(client, discordUserId, bounds, effectivePolicy);
+    if (overLimitVoucher) {
+      const lock = (await client.query(`INSERT INTO topup_daily_locks(discord_user_id,expires_at,trace_id)
+        VALUES($1,$2,$3) ON CONFLICT(discord_user_id) DO UPDATE SET
+          expires_at=EXCLUDED.expires_at,trace_id=EXCLUDED.trace_id,updated_at=clock_timestamp()
+        RETURNING *`, [discordUserId, bounds.ends_at, context.traceId])).rows[0];
+      return { locked: true, totalCents: 0n, limitCents: null, overLimitVoucher, bounds, lock };
+    }
     await removeDailyLock(client, existing, context, 'DAILY_TOPUP_LIMIT_DISABLED');
     return { locked: false, totalCents: 0n, limitCents: null };
   }
   const bounds = await bangkokDayBounds(client, redeemedAt);
   const totalCents = await redeemedPrincipalForDay(client, discordUserId, bounds);
-  const shouldLock = totalCents >= effectivePolicy.dailyRedeemedLimitCents;
+  const overLimitVoucher = await hasOverLimitRedemptionForDay(client, discordUserId, bounds, effectivePolicy);
+  const shouldLock = totalCents >= effectivePolicy.dailyRedeemedLimitCents || overLimitVoucher;
   if (!shouldLock) {
     await removeDailyLock(client, existing, context, 'DAILY_TOPUP_LIMIT_BELOW_THRESHOLD');
     return { locked: false, totalCents, limitCents: effectivePolicy.dailyRedeemedLimitCents, bounds };
@@ -92,10 +118,12 @@ export async function reconcileDailyTopupLockInTransaction(client, {
     await appendAdminAudit(client, { action: 'TOPUP_DAILY_LOCK_CREATED', targetType: 'DISCORD_USER',
       targetId: discordUserId, actorId: context.actorId,
       after: { expiresAt: lock.expires_at, totalCents: String(totalCents),
-        limitCents: String(effectivePolicy.dailyRedeemedLimitCents), redeemedDay: bounds.bangkok_day },
-      reason: 'DAILY_REDEEMED_TOPUP_LIMIT', context });
+        limitCents: String(effectivePolicy.dailyRedeemedLimitCents), redeemedDay: bounds.bangkok_day,
+        overLimitVoucher },
+      reason: overLimitVoucher ? 'TOPUP_AMOUNT_OVER_AUTOCREDIT_LIMIT' : 'DAILY_REDEEMED_TOPUP_LIMIT', context });
   }
-  return { locked: true, totalCents, limitCents: effectivePolicy.dailyRedeemedLimitCents, bounds, lock };
+  return { locked: true, totalCents, limitCents: effectivePolicy.dailyRedeemedLimitCents,
+    overLimitVoucher, bounds, lock };
 }
 
 export async function reconcileDailyTopupLock(input, context, options = {}) {
@@ -103,6 +131,28 @@ export async function reconcileDailyTopupLock(input, context, options = {}) {
     reconcileDailyTopupLockInTransaction(client, { ...input,
       policy: input.policy ?? await loadPaymentPolicy(client) }, context)
   ));
+}
+
+// A voucher can only reveal its amount after a successful direct redemption.
+// If it exceeds the configured per-voucher maximum, preserve the full credit
+// but close further intake until the Bangkok business day rolls over.
+export async function lockTopupIntakeUntilBangkokDayEnds({ discordUserId, redeemedAt = null, reason }, context, options = {}) {
+  return withTransaction({ ...options, isolation: 'SERIALIZABLE' }, async (client) => {
+    const bounds = await bangkokDayBounds(client, redeemedAt);
+    const existing = await currentDailyLock(client, discordUserId);
+    const lock = (await client.query(`INSERT INTO topup_daily_locks(discord_user_id,expires_at,trace_id)
+      VALUES($1,$2,$3) ON CONFLICT(discord_user_id) DO UPDATE SET
+        expires_at=GREATEST(topup_daily_locks.expires_at,EXCLUDED.expires_at),
+        trace_id=EXCLUDED.trace_id,updated_at=clock_timestamp()
+      RETURNING *`, [discordUserId, bounds.ends_at, context.traceId])).rows[0];
+    if (!existing) {
+      await appendAdminAudit(client, { action: 'TOPUP_DAILY_LOCK_CREATED', targetType: 'DISCORD_USER',
+        targetId: discordUserId, actorId: context.actorId,
+        after: { expiresAt: lock.expires_at, reason, redeemedDay: bounds.bangkok_day },
+        reason, context });
+    }
+    return { ...lock, bounds };
+  });
 }
 
 export async function assertDailyTopupAdmissionInTransaction(client, discordUserId, context, policy = null) {

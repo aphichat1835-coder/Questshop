@@ -7,7 +7,8 @@ import {
   recordProviderResult, renewPaymentLease,
 } from '../domain/payments/service.js';
 import {
-  loadPaymentPolicy, reconcileCurrentDailyTopupLocks, reconcileDailyTopupLock, topupAmountNeedsReview,
+  loadPaymentPolicy, reconcileCurrentDailyTopupLocks, reconcileDailyTopupLock,
+  lockTopupIntakeUntilBangkokDayEnds, topupAmountExceedsAutoCreditMaximum, topupAmountNeedsReview,
 } from '../domain/payments/policy.js';
 import { creditRedeemedTopup } from '../domain/wallet/service.js';
 import { reconcileIncident } from '../domain/incidents/service.js';
@@ -50,6 +51,7 @@ async function creditPendingRedemption({ holder, env, pool, policy }) {
     guildId: env.DISCORD_GUILD_ID, idempotencyKey: `credit-recovery:${topup.id}` });
   await reconcileDailyTopupLock({ discordUserId: topup.discord_user_id,
     redeemedAt: topup.redeemed_at, policy }, context, { pool });
+  await lockOverLimitTopupIntake({ topup, policy, context, pool });
   if (topupAmountNeedsReview(topup.amount_cents, policy)) {
     await moveRedeemedTopupToReview({ topupId: topup.id, reason: 'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE' },
       context, { pool });
@@ -57,12 +59,34 @@ async function creditPendingRedemption({ holder, env, pool, policy }) {
   }
   try {
     await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
+    await recordOverLimitTopupWarning({ topup, policy, context, pool });
   } catch (error) {
     await reconcileIncident({ code: 'TOPUP_REDEEMED_STUCK', scope: 'TRUEMONEY', active: true,
       severity: 'CRITICAL', evidence: { topupId: topup.id, errorCode: error.code ?? error.name } }, context, { pool });
     throw error;
   }
   return true;
+}
+
+async function recordOverLimitTopupWarning({ topup, policy, context, pool }) {
+  if (!topupAmountExceedsAutoCreditMaximum(topup.amount_cents, policy)) return;
+  await reconcileIncident({ code: 'TOPUP_AMOUNT_OVER_AUTOCREDIT_LIMIT', scope: 'TRUEMONEY', active: true,
+    severity: 'WARNING', evidence: {
+      topupId: topup.id,
+      discordUserId: topup.discord_user_id,
+      amountCents: String(topup.amount_cents),
+      configuredMaximumCents: String(policy.autoCreditMaxCents),
+      creditedInFull: true,
+    } }, context, { pool });
+}
+
+async function lockOverLimitTopupIntake({ topup, policy, context, pool }) {
+  if (!topupAmountExceedsAutoCreditMaximum(topup.amount_cents, policy)) return;
+  await lockTopupIntakeUntilBangkokDayEnds({
+    discordUserId: topup.discord_user_id,
+    redeemedAt: topup.redeemed_at,
+    reason: 'TOPUP_AMOUNT_OVER_AUTOCREDIT_LIMIT',
+  }, context, { pool });
 }
 
 async function stopTopupIntakeWhenSettlementDisabled(pool) {
@@ -200,12 +224,14 @@ async function processClaimedPayment({ topup, breaker, holder, env, signal, auto
     if (updated.status === 'REDEEMED') {
       await reconcileDailyTopupLock({ discordUserId: updated.discord_user_id,
         redeemedAt: updated.redeemed_at, policy }, context, { pool });
+      await lockOverLimitTopupIntake({ topup: updated, policy, context, pool });
     }
     if (updated.status === 'REDEEMED' && topupAmountNeedsReview(updated.amount_cents, policy)) {
       await moveRedeemedTopupToReview({ topupId: topup.id, reason: 'AMOUNT_OUTSIDE_AUTOCREDIT_RANGE' },
         context, { pool });
     } else if (updated.status === 'REDEEMED' && (autoCredit || recoveryProbe)) {
       await creditRedeemedTopup({ topupId: topup.id }, context, { pool });
+      await recordOverLimitTopupWarning({ topup: updated, policy, context, pool });
     }
     await closeSuccessfulProbe(pool, breaker, context);
   } finally {

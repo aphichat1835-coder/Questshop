@@ -120,6 +120,33 @@ test('Admin retry resolves a Quest Manual Review by seeding a fresh test batch',
   [result.applied.batchId])).rows[0].count, 1);
 });
 
+test('Admin retry closes an expired Quest review without creating a new test batch', async (t) => {
+  if (!pool) return t.skip('TEST_DATABASE_URL not set');
+  const traceId = uuidv7();
+  const context = createContext({ traceId, actorType: 'ADMIN', actorId: 'admin', guildId: 'guild',
+    idempotencyKey: 'expired-quest-review-retry' });
+  const manualRun = uuidv7();
+  await pool.query(`INSERT INTO quests(quest_id,analysis_state,name,task_type,task_target,url,expires_at,
+    executor_id,engine_version,executor_version,contract_version)
+    VALUES('expired-quest-review','SUPPORTED','Expired review','WATCH_VIDEO',60,
+      'https://discord.com/quests/expired-quest-review',clock_timestamp()-interval '1 second','video','1','1','1')`);
+  await pool.query(`INSERT INTO quest_test_runs(id,quest_id,state,engine_version,executor_version,
+    contract_version,attempt_in_monitor,trace_id,error_class,completed_at)
+    VALUES($1,'expired-quest-review','MANUAL_REVIEW','1','1','1',1,$2,'TEST_WORKER_CRASH',clock_timestamp())`,
+  [manualRun, traceId]);
+  const review = await withTransaction({ pool, isolation: 'SERIALIZABLE' }, (client) => openReview(client, {
+    subjectType: 'QUEST', subjectId: 'expired-quest-review', reason: 'old uncertain test', context,
+  }));
+  const result = await resolveSubjectReview({ reviewId: review.id, decision: 'RETRY',
+    reason: 'operator clicked retry after expiry', isOwner: false, expectedVersion: review.state_version }, context, { pool });
+  assert.equal(result.review.state, 'RESOLVED');
+  assert.equal(result.applied.status, 'QUEST_EXPIRED');
+  assert.equal((await pool.query(`SELECT count(*)::integer AS count FROM quest_test_batches
+    WHERE quest_id='expired-quest-review'`)).rows[0].count, 0);
+  assert.equal((await pool.query(`SELECT count(*)::integer AS count FROM quest_test_runs
+    WHERE quest_id='expired-quest-review' AND state='TEST_QUEUED'`)).rows[0].count, 0);
+});
+
 test('maintenance derives a passed monitor batch after a crash between test-run and batch transitions', async (t) => {
   if (!pool) return t.skip('TEST_DATABASE_URL not set');
   const traceId = uuidv7(); const monitor = uuidv7(); const batch = uuidv7(); const run = uuidv7();

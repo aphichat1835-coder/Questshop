@@ -9,7 +9,8 @@ import {
   fetchDiscordMessage, findDiscordMessage, findDiscordMessageByNonce, isMissingDiscordMessage,
 } from '../transport.js';
 import { normalizeDiscordPayload } from '../payload.js';
-import { QUEST_AUTO_MEDIA_FILENAME, loadQuestAutoMedia } from './quest-auto-media.js';
+import { parseCustomId } from '../components/custom-id.js';
+import { QUEST_AUTO_MEDIA_FILENAME, QUEST_AUTO_MEDIA_SIZE, loadQuestAutoMedia } from './quest-auto-media.js';
 
 const surfaceSetupLocks = new Map();
 
@@ -58,7 +59,8 @@ function messageAttachments(message) {
 
 function questAutoMediaAttachments(message) {
   return messageAttachments(message).filter((attachment) => (
-    attachment?.name === QUEST_AUTO_MEDIA_FILENAME || attachment?.filename === QUEST_AUTO_MEDIA_FILENAME
+    (attachment?.name === QUEST_AUTO_MEDIA_FILENAME || attachment?.filename === QUEST_AUTO_MEDIA_FILENAME)
+      && Number(attachment?.size) === QUEST_AUTO_MEDIA_SIZE
   ));
 }
 
@@ -85,14 +87,120 @@ function firstEmbedData(value) {
   return typeof embed.toJSON === 'function' ? embed.toJSON() : embed;
 }
 
+function componentData(value) {
+  if (!value || typeof value !== 'object') return {};
+  return typeof value.toJSON === 'function' ? value.toJSON() : value;
+}
+
+function normalizedEmoji(value) {
+  if (!value) return null;
+  return {
+    id: value.id ?? null,
+    name: value.name ?? null,
+    animated: value.animated === true,
+  };
+}
+
+function buttonContract(value) {
+  const button = componentData(value);
+  const route = parseCustomId(button.custom_id ?? button.customId)?.route ?? null;
+  return {
+    type: Number(button.type),
+    style: Number(button.style),
+    route,
+    label: button.label ?? null,
+    emoji: normalizedEmoji(button.emoji),
+    disabled: button.disabled === true,
+    url: button.url ?? null,
+    skuId: button.sku_id ?? button.skuId ?? null,
+  };
+}
+
+function actionRowButtons(value) {
+  const rows = Array.isArray(value?.components) ? value.components : [];
+  if (rows.length !== 1) return null;
+  const row = componentData(rows[0]);
+  if (Number(row.type) !== 1 || !Array.isArray(row.components) || row.components.length !== 2) return null;
+  return row.components.map(buttonContract);
+}
+
+function questAutoComponentsMatch(message, expectedBody) {
+  const actual = actionRowButtons(message);
+  const expected = actionRowButtons(expectedBody);
+  return actual !== null && expected !== null && JSON.stringify(actual) === JSON.stringify(expected);
+}
+
+function normalizedEmbedContract(embed) {
+  return {
+    title: embed.title ?? null,
+    description: embed.description ?? null,
+    color: embed.color ?? null,
+    url: embed.url ?? null,
+    timestamp: embed.timestamp ?? null,
+    author: embed.author ? {
+      name: embed.author.name ?? null,
+      url: embed.author.url ?? null,
+      iconUrl: embed.author.icon_url ?? embed.author.iconURL ?? null,
+    } : null,
+    footer: embed.footer ? {
+      text: embed.footer.text ?? null,
+      iconUrl: embed.footer.icon_url ?? embed.footer.iconURL ?? null,
+    } : null,
+    thumbnail: embed.thumbnail ? comparableImageUrl(embed.thumbnail.url) : null,
+    fields: Array.isArray(embed.fields) ? embed.fields.map((field) => ({
+      name: field.name ?? null,
+      value: field.value ?? null,
+      inline: field.inline === true,
+    })) : [],
+  };
+}
+
+function questAutoEmbedMatches(message, expectedBody) {
+  if (!Array.isArray(message?.embeds) || message.embeds.length !== 1
+    || !Array.isArray(expectedBody?.embeds) || expectedBody.embeds.length !== 1) return false;
+  const actual = firstEmbedData(message);
+  const expected = firstEmbedData(expectedBody);
+  return JSON.stringify(normalizedEmbedContract(actual)) === JSON.stringify(normalizedEmbedContract(expected));
+}
+
+function comparableAttachmentUrls(attachment) {
+  return [attachment?.url, attachment?.proxyURL, attachment?.proxy_url]
+    .filter((url) => typeof url === 'string' && url.length > 0)
+    .map((url) => {
+      try {
+        const parsed = new URL(url);
+        return `${parsed.origin}${parsed.pathname}`;
+      } catch {
+        return url;
+      }
+    });
+}
+
+function comparableImageUrl(url) {
+  if (typeof url !== 'string' || !url) return null;
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return url;
+  }
+}
+
+function questAutoImageMatchesAttachment(message, imageUrl) {
+  const actual = comparableImageUrl(imageUrl);
+  if (!actual) return false;
+  return questAutoMediaAttachments(message).some((attachment) => (
+    comparableAttachmentUrls(attachment).includes(actual)
+  ));
+}
+
 export function questAutoSurfaceMatches(message, expectedBody) {
   if (!message || !hasOnlyQuestAutoMedia(message)) return false;
   const actual = firstEmbedData(message);
-  const expected = firstEmbedData(expectedBody);
-  return actual.title === expected.title
-    && actual.description === expected.description
-    && !actual.footer?.text
-    && Boolean(actual.image?.url);
+  return String(message.content ?? '') === String(expectedBody.content ?? '')
+    && questAutoEmbedMatches(message, expectedBody)
+    && questAutoImageMatchesAttachment(message, actual.image?.url)
+    && questAutoComponentsMatch(message, expectedBody);
 }
 
 export function assertSensitiveSurfacePrivacy(_channel, _surfaceKey) {
